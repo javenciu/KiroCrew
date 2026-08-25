@@ -959,6 +959,100 @@ def _restore_log_record_factory():
         logging.setLogRecordFactory(before)
 
 
+# ── logger levels and handlers go back after every test ─────────────
+
+
+#: What a logger nobody has configured looks like. ``logging.getLogger(name)`` builds
+#: exactly this, so a name MISSING from the "before" snapshot restores to it rather than
+#: being passed over -- otherwise a test that creates a logger and configures it leaks
+#: through the one gap a snapshot cannot see.
+_PRISTINE_LOGGER: tuple[int, bool, tuple[logging.Handler, ...]] = (logging.NOTSET, False, ())
+
+
+def _logger_configuration() -> dict[str, tuple[int, bool, tuple[logging.Handler, ...]]]:
+    """``(level, disabled, handlers)`` for the root logger and every logger by name.
+
+    ``loggerDict`` also holds ``PlaceHolder`` entries for the un-instantiated middle of a
+    dotted name; those carry no configuration and are skipped. The root logger is not in
+    it at all, so it is added under ``""`` -- the name ``logging.getLogger`` maps back to
+    it.
+    """
+    snapshot: dict[str, tuple[int, bool, tuple[logging.Handler, ...]]] = {
+        name: (obj.level, obj.disabled, tuple(obj.handlers))
+        for name, obj in list(logging.Logger.manager.loggerDict.items())
+        if isinstance(obj, logging.Logger)
+    }
+    root = logging.getLogger()
+    snapshot[""] = (root.level, root.disabled, tuple(root.handlers))
+    return snapshot
+
+
+@pytest.fixture(autouse=True)
+def _restore_logger_configuration():
+    """Put every logger's level, ``disabled`` flag and handlers back after each test.
+
+    A logger's configuration is PROCESS-GLOBAL and hierarchical, which is what makes a
+    leak here so hard to attribute: ``Logger.debug`` checks the EFFECTIVE level, so an
+    explicit level left on ``kiro_crew`` decides what every ``kiro_crew.*`` logger in the
+    worker may emit, and it outranks the root level ``caplog.at_level()`` sets. The victim
+    then sees ``caplog.text == ""`` -- not the wrong text, NOTHING -- from a test that
+    passes alone, in a file that has nothing to do with the cause.
+
+    Measured: ``test_slack_gateway_more_coverage.py::TestDeliverCronResponse::
+    test_options_post_failure_still_delivers_text`` asserts on a ``logger.debug`` line and
+    reds whenever ``test_cli.py::TestCronCli::test_cli_argparse_cron_add_agent_flag``
+    shares its worker -- an ARGPARSE test, in a file with no connection to Slack. It
+    drives the real ``cli.main()``, whose ``_setup_cli_logging`` pins ``kiro_crew`` at
+    WARNING and attaches a ``RotatingFileHandler`` to it, exactly as production does once
+    per process and never undoes. Test modules across the suite drive ``main()`` that way,
+    and the handlers ACCUMULATE: each call adds another, still open on a ``gateway.log``
+    under a ``tmp_path`` the next test deletes.
+
+    Restoring rather than blaming, for the same reason as ``_restore_log_record_factory``
+    above: configuring logging is what the entry point under test is FOR, so demanding
+    per-module bookkeeping from every test that reaches it buys no coverage and is one
+    forgotten fixture away from reappearing. The damage is to OTHER tests, so stopping it
+    propagating is the whole job.
+
+    The restore target is what the test INHERITED, so a class- or module-scoped fixture
+    that installs a handler keeps it (this fixture is inside its window), and only what
+    the test itself added is removed -- and CLOSED, because an open handler holds the log
+    file's descriptor and on Windows that blocks the ``tmp_path`` cleanup.
+
+    **The root logger's HANDLER list is deliberately left alone** (its level and
+    ``disabled`` flag are not). That list belongs to pytest's own capture: ``catching_logs``
+    adds a handler per phase and removes it at the phase boundary, so the list this
+    fixture snapshots during SETUP and the one it would write back during TEARDOWN hold
+    different pytest handlers -- restoring it would re-attach the setup phase's and drop
+    the one the teardown phase is capturing through. Excluding it costs nothing measurable:
+    ``_setup_cli_logging`` attaches to root only in detached mode, which only
+    ``test_cli_logging.py`` simulates and whose own ``_pristine_logging`` fixture restores,
+    and ``basicConfig`` is a no-op once root has any handler, which under pytest it always
+    does.
+
+    Measured cost: ~37us per snapshot at ~450 live loggers, so ~75us per test.
+    """
+    before_disable = logging.Logger.manager.disable
+    before = _logger_configuration()
+    yield
+    for name, after in _logger_configuration().items():
+        inherited = before.get(name, _PRISTINE_LOGGER)
+        if after == inherited:
+            continue
+        level, disabled, handlers = inherited
+        logger = logging.getLogger(name)
+        logger.setLevel(level)
+        logger.disabled = disabled
+        if name:
+            added = [handler for handler in after[2] if handler not in handlers]
+            logger.handlers[:] = list(handlers)
+            for handler in added:
+                with contextlib.suppress(Exception):
+                    handler.close()
+    if logging.Logger.manager.disable != before_disable:
+        logging.disable(before_disable)
+
+
 # ── the sandbox probe cache is warm for every test, in every testpath ──
 
 

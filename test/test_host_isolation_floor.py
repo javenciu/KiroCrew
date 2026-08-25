@@ -833,6 +833,73 @@ class TestTheLogRecordFactoryIsRestored:
         )
 
 
+# ── logger levels and handlers ─────────────────────────────────────────────
+
+
+#: Written by the leaking test and read by the one after it, for the same reason as
+#: ``_FACTORY_ORDER``: the restore this pins runs in teardown, after every finalizer the
+#: leaking test itself could own.
+_LOGGER_ORDER: dict[str, object] = {}
+
+
+@pytest.mark.xdist_group(name="logger_configuration_floor")
+class TestLoggerConfigurationIsRestored:
+    """A logger's level and handler list are PROCESS-GLOBAL, per worker.
+
+    The level is also HIERARCHICAL, which is what makes this leak class so hard to
+    attribute. ``Logger.debug`` gates on the EFFECTIVE level, so an explicit level left on
+    ``kiro_crew`` decides what every ``kiro_crew.*`` logger in the worker may emit, and it
+    outranks the root level ``caplog.at_level()`` sets -- the victim gets
+    ``caplog.text == ""``, nothing at all rather than the wrong text, from a test that
+    passes alone. The suite reaches this through ``cli._setup_cli_logging``, which pins
+    ``kiro_crew`` at WARNING and attaches a rotating file handler, and which test modules
+    across the suite run for real by driving ``cli.main()`` in process.
+
+    ``conftest._restore_logger_configuration`` is what removes the class; without a test,
+    an edit to it reverts silently and the failures reappear in files that have nothing to
+    do with the cause.
+
+    Grouped with ``xdist_group`` so the leaker and the observer stay on ONE worker:
+    ``--dist loadgroup`` honours that, and without it the two are distributed
+    independently and the observation passes vacuously.
+    """
+
+    def test_this_test_starts_with_an_unconfigured_kiro_crew_logger(self) -> None:
+        """Which is only true if no earlier test on this worker left a level on it."""
+        assert logging.getLogger("kiro_crew").level == logging.NOTSET
+
+    def test_a_leaked_level_and_handler_do_not_reach_the_next_test(self, tmp_path) -> None:
+        """Leaks both and deliberately restores neither -- the floor's job, not ours."""
+        logger = logging.getLogger("kiro_crew")
+        handler = logging.FileHandler(tmp_path / "gateway.log", encoding="utf-8")
+        logger.setLevel(logging.WARNING)
+        logger.addHandler(handler)
+        _LOGGER_ORDER["handler"] = handler
+        assert logger.level == logging.WARNING
+
+    def test_the_next_test_sees_the_level_and_the_handler_gone(self) -> None:
+        """Reads what the previous test recorded. Ordered by definition order in the file."""
+        handler = _LOGGER_ORDER.get("handler")
+        assert handler is not None, (
+            "the leaking test did not run on this worker, so this assertion proves "
+            "nothing -- the xdist_group mark on the class is what keeps them together"
+        )
+        logger = logging.getLogger("kiro_crew")
+        assert logger.level == logging.NOTSET, (
+            f"kiro_crew is still pinned at {logging.getLevelName(logger.level)} -- every "
+            "kiro_crew.* record below that level is now dropped before it reaches the "
+            "root handler caplog captures through"
+        )
+        assert handler not in logger.handlers, (
+            "a handler left attached by an earlier test still receives every kiro_crew "
+            "record on this worker, and writes them to a directory that test deleted"
+        )
+        assert handler.stream is None, (
+            "the handler was detached but not closed, so it still holds the log file's "
+            "descriptor -- on Windows that is what blocks the tmp_path cleanup"
+        )
+
+
 # ── the worker budget ─────────────────────────────────────────────────────
 
 
