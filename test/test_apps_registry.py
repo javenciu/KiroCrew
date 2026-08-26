@@ -1358,6 +1358,73 @@ class TestApplyTrustFields:
         assert out["provenance"] == "external"
         assert out["verified"] is False
 
+    def test_clone_target_is_server_overwritten_and_prefers_git_url(self):
+        """The modal must show what install will clone, not the legacy alias.
+
+        External rows legitimately carry both fields with different values;
+        ``_entry_git_url`` makes ``gitUrl`` authoritative. An index-supplied
+        ``trustRepository`` is ignored rather than becoming consent authority.
+        """
+        entry = {
+            "name": "external-app",
+            "_registry": "labs",
+            "repo": "https://example.test/display/alias",
+            "gitUrl": "HTTPS://Clone.Example.test/Owner/App.git/",
+            "trustRepository": "https://evil.example/spoof",
+        }
+        (out,) = registry._apply_trust_fields([entry])
+        assert out["trustRepository"] == "https://clone.example.test/Owner/App"
+
+    def test_clone_target_spoof_is_removed_when_no_repository_resolves(self):
+        entry = {
+            "name": "local-app",
+            "trustRepository": "https://evil.example/spoof",
+        }
+        (out,) = registry._apply_trust_fields([entry])
+        assert "trustRepository" not in out
+
+    def test_legacy_installed_row_uses_current_authoritative_clone_target(self):
+        entry = {
+            "name": "legacy-app",
+            "repo": "https://example.test/display/alias",
+            "gitUrl": "https://clone.example.test/Owner/current-app.git",
+        }
+        installed = {
+            "legacy-app": {
+                "name": "legacy-app",
+                "source": "registry:legacy-app",
+            }
+        }
+
+        bindings = registry._trust_repository_bindings([entry], installed)
+        [out] = registry._apply_trust_fields(
+            [entry], trust_repositories=bindings
+        )
+
+        assert out["trustRepository"] == (
+            "https://clone.example.test/Owner/current-app"
+        )
+
+    def test_local_installed_row_does_not_inherit_same_named_registry_target(self):
+        entry = {
+            "name": "local-app",
+            "gitUrl": "https://clone.example.test/Owner/registry-app.git",
+        }
+        installed = {
+            "local-app": {
+                "name": "local-app",
+                "source": "C:/operator/local-app",
+                "origin": "local",
+            }
+        }
+
+        bindings = registry._trust_repository_bindings([entry], installed)
+        [out] = registry._apply_trust_fields(
+            [entry], trust_repositories=bindings
+        )
+
+        assert "trustRepository" not in out
+
     def test_core_kirocrew_index_author_is_verified(self):
         """``verified`` derives from the INDEX-declared author snapshot
         (``_index_author``, taken by ``list_registry`` pre-merge)."""
@@ -1718,6 +1785,9 @@ class TestCatalogAppsIncludesExternalRegistries:
         # the first-party badge from a document trusted only as far as TLS.
         assert rows["pinned-app"]["provenance"] != "external"
         assert rows["pinned-app"]["verified"] is False
+        assert rows["pinned-app"]["trustRepository"] == (
+            "https://github.com/org/pinned-app"
+        )
         assert "keep-app" in rows
 
     @pytest.mark.asyncio
@@ -1807,7 +1877,15 @@ class TestCatalogAppsIncludesExternalRegistries:
             registry.official_catalog, "list_catalog_rows", lambda: catalog_rows
         )
         monkeypatch.setattr(
-            registry, "_load_registry_file", lambda: [{"name": "seeded-app"}]
+            registry,
+            "_load_registry_file",
+            lambda: [
+                {
+                    "name": "seeded-app",
+                    "repo": "https://example.test/display/alias",
+                    "gitUrl": "https://clone.example.test/owner/seeded-app.git",
+                }
+            ],
         )
         monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
 
@@ -1833,6 +1911,9 @@ class TestCatalogAppsIncludesExternalRegistries:
         rows = {r["name"]: r for r in await registry.list_catalog_apps()}
         assert calls == [], "the seed already answers, so no fetch may be paid"
         assert "seeded-app" in rows
+        assert rows["seeded-app"]["trustRepository"] == (
+            "https://clone.example.test/owner/seeded-app"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -100,6 +100,7 @@ from kiro_crew.apps.registry import (
     list_registry,
     minimal_env,
     registry_name_from_source,
+    resolve_installed_trust_repository,
 )
 from kiro_crew.apps.spawn_sdk import build_spawn_impl
 from kiro_crew.apps.teardown import teardown_app_runtime
@@ -241,12 +242,37 @@ async def _notify_builtin_service(request: web.Request, name: str) -> str | None
         return f"restart failed: {exc}"
 
 
+def _stamp_installed_trust_repository(app: dict[str, Any]) -> dict[str, Any]:
+    """Overwrite the consent target from server-resolved provenance."""
+    app.pop("trustRepository", None)
+    try:
+        resolved, repository = resolve_installed_trust_repository(app)
+    except Exception:
+        # Catalog failure or corrupt registry state must not make the app list
+        # fail. Omitting the proof leaves the grant handler fail-closed.
+        logger.warning(
+            "could not resolve trust repository for installed app %r",
+            app.get("name", ""),
+            exc_info=True,
+        )
+        resolved, repository = False, ""
+    if resolved and repository:
+        app["trustRepository"] = repository
+    return app
+
+
 async def handle_list_apps(request: web.Request) -> web.Response:
     """GET /api/apps — list all installed apps."""
     # list_apps() walks the apps dir and reads two files per installed app, and
     # this endpoint re-runs it on every dashboard refresh — so the walk goes off
     # the loop (its cost scales with installed app count).
-    apps = await asyncio.to_thread(list_apps)
+    def _listed_apps_with_trust() -> list[dict[str, Any]]:
+        installed = list_apps()
+        for app in installed:
+            _stamp_installed_trust_repository(app)
+        return installed
+
+    apps = await asyncio.to_thread(_listed_apps_with_trust)
     # Enrich with backend process status
     procs = {p["app_name"]: p for p in list_app_processes()}
     for app in apps:
@@ -469,7 +495,9 @@ async def handle_get_app(request: web.Request) -> web.Response:
         if name == "deploy-web":
             raise web.HTTPTemporaryRedirect(location="/api/deploy/list")
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
-    return web.json_response(info)
+    return web.json_response(
+        await asyncio.to_thread(_stamp_installed_trust_repository, info)
+    )
 
 
 async def handle_get_manifest(request: web.Request) -> web.Response:

@@ -811,14 +811,22 @@ independently load-bearing:
   collision keeps the seed, so a republished document cannot silently re-home
   an app to a new repository under a familiar name.
 
-**Execution consent is repository-bound for new grants.** The trust dialog
-shows the registry row's repository, so `POST /api/security/trusted-apps/{name}`
-records that resolved clone target in `agent.apps_trusted_repositories` beside
-the name in `agent.apps_trusted`. The stored value uses the same normalization
-as catalog supersession (scheme/host case-folded, trailing slash and `.git`
-removed, path case preserved). `install_from_registry` compares its freshly
-resolved row against that value before manifest fetch, credential selection,
-clone, build, or setup code; a mismatch returns
+**Execution consent is repository-bound for new grants.** Registry and installed
+app responses carry a server-overwritten `trustRepository`: the normalized clone
+target the grant handler itself would resolve, never an index/manifest assertion.
+This field is deliberately separate from the legacy/display `repo` alias because
+an entry may legitimately carry a different `gitUrl`, and `_entry_git_url`
+prefers `gitUrl` for the actual clone. The trust dialog displays
+`trustRepository` and posts it back as consent proof.
+`POST /api/security/trusted-apps/{name}` freshly resolves the target and requires
+the normalized proof to match before it records that target in
+`agent.apps_trusted_repositories` beside the name in `agent.apps_trusted`.
+Missing or stale proof for a repository-backed app is refused; a local installed
+app with no repository remains grantable with no proof. The stored value uses the
+same normalization as catalog supersession (scheme/host case-folded, trailing
+slash and `.git` removed, path case preserved). `install_from_registry` compares
+its freshly resolved row against that value before manifest fetch, credential
+selection, clone, build, or setup code; a mismatch returns
 `app_trust_repository_mismatch`, names both repositories, and requires revoke +
 fresh consent. A grant written before the binding map existed has no recorded
 repository and keeps working, so the change requires no migration. The commit
@@ -835,7 +843,8 @@ Writers: `apps/official_catalog.py` (`list_catalog_rows`, `inventory`,
 (`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`,
 `_append_external_registry_apps`, `_detect_installed_probe`),
 `dashboard/handlers/security.py` (`api_trusted_app_grant`),
-`apps/routes.py` (`handle_registry`).
+`apps/routes.py` (`handle_registry`, `handle_list_apps`, `handle_get_app`), and
+`website/src/components/appstore/TrustAppModal.tsx`.
 
 ## 15. A registry's credential posture follows its index's change control
 

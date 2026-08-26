@@ -1539,6 +1539,8 @@ async def test_refused_builtin_grant_is_not_inherited_by_a_later_takeover(
 # ── 5. a registry name that is not installed yet is grantable ──
 
 _REG_ONLY = "registry-only-app"
+_REG_ONLY_REPO_ALIAS = "https://example.test/display/registry-only-app"
+_REG_ONLY_CLONE_TARGET = "https://clone.example.test/Owner/registry-only-app"
 
 
 @pytest.fixture
@@ -1549,7 +1551,14 @@ def seeded_registry(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         registry,
         "_load_registry_file",
-        lambda: [{"name": _REG_ONLY, "repo": "acme/registry-only-app", "branch": "main"}],
+        lambda: [
+            {
+                "name": _REG_ONLY,
+                "repo": _REG_ONLY_REPO_ALIAS,
+                "gitUrl": f"{_REG_ONLY_CLONE_TARGET}.git",
+                "branch": "main",
+            }
+        ],
     )
     # "Never touches the network" needs the catalog pinned too: resolution
     # consults the official catalog BEFORE the seed row, with a fresh uncached
@@ -1576,18 +1585,85 @@ async def test_grant_accepts_a_registry_name_that_is_not_installed(
     assert get_app(_REG_ONLY) is None, "fixture must NOT install the app"
 
     async with _client() as client:
-        resp = await client.post(f"/api/security/trusted-apps/{_REG_ONLY}")
+        resp = await client.post(
+            f"/api/security/trusted-apps/{_REG_ONLY}",
+            json={"repository": _REG_ONLY_CLONE_TARGET},
+        )
         assert resp.status == 200
         assert (await resp.json())["apps"] == [_REG_ONLY]
 
     # Persisted AND effective, so the install that follows is admitted.
     assert _stored(home)["apps_trusted"] == [_REG_ONLY]
     assert _stored(home)["apps_trusted_repositories"] == {
-        _REG_ONLY: "acme/registry-only-app"
+        _REG_ONLY: _REG_ONLY_CLONE_TARGET
     }
     from kiro_crew.apps.execution import app_execution_denied
 
     assert app_execution_denied(_REG_ONLY, action="install") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {"repository": _REG_ONLY_REPO_ALIAS},
+        {"repository": "https://clone.example.test/Owner/different-app"},
+    ],
+)
+async def test_repository_grant_requires_matching_consent_proof(
+    home: Path, mock_sel, seeded_registry: str, body: dict[str, str] | None
+):
+    async with _client() as client:
+        if body is None:
+            resp = await client.post(f"/api/security/trusted-apps/{_REG_ONLY}")
+        else:
+            resp = await client.post(
+                f"/api/security/trusted-apps/{_REG_ONLY}", json=body
+            )
+
+        assert resp.status == 409
+        assert (await resp.json())["code"] == "app_trust_repository_mismatch"
+
+    assert _stored(home).get("apps_trusted", []) == []
+    assert _stored(home).get("apps_trusted_repositories", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_legacy_registry_install_binds_grant_to_current_repository(
+    home: Path, tmp_path: Path, mock_sel, monkeypatch: pytest.MonkeyPatch
+):
+    """A legacy bare-name source cannot degrade into a name-only grant."""
+    _install(tmp_path, _APP)
+    meta = _read_installed(_APP)
+    assert meta is not None
+    meta.source = f"registry:{_APP}"
+    meta.sourceUrl = ""
+    _write_installed(_APP, meta)
+
+    current_repository = "https://clone.example.test/Owner/current-app"
+    monkeypatch.setattr(
+        "kiro_crew.apps.registry.get_registry_app",
+        lambda name: {"name": name, "gitUrl": f"{current_repository}.git"},
+    )
+
+    async with _client() as client:
+        stale = await client.post(
+            f"/api/security/trusted-apps/{_APP}",
+            json={"repository": "https://clone.example.test/Owner/replaced-app"},
+        )
+        assert stale.status == 409
+        assert (await stale.json())["code"] == "app_trust_repository_mismatch"
+
+        granted = await client.post(
+            f"/api/security/trusted-apps/{_APP}",
+            json={"repository": current_repository},
+        )
+        assert granted.status == 200
+
+    assert _stored(home)["apps_trusted_repositories"] == {
+        _APP: current_repository
+    }
 
 
 @pytest.mark.asyncio

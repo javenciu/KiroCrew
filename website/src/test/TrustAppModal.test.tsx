@@ -106,7 +106,10 @@ const THIRD_PARTY = {
   description: 'Feature flags in your agentic workspace.',
   version: '1.0.0',
   author: 'launchdarkly',
-  repo: 'https://github.com/launchdarkly-labs/launchdarkly-kiro-crew-app',
+  // `repo` is the legacy/display alias. The server-resolved clone target is
+  // deliberately different so the modal cannot accidentally authorize this.
+  repo: 'https://github.com/launchdarkly-labs/catalog-alias',
+  trustRepository: 'https://git.example.test/launchdarkly/kiro-crew-app',
   tags: ['feature-flags'],
   featured: 1,
   installed: true,
@@ -178,6 +181,7 @@ beforeEach(() => {
     {
       name: THIRD_PARTY.name, displayName: THIRD_PARTY.displayName, version: '1.0.0',
       enabled: false, installedAt: '2026-08-03T00:00:00Z', origin: 'registry',
+      trustRepository: THIRD_PARTY.trustRepository,
       manifest: {
         name: THIRD_PARTY.name, version: '1.0.0', displayName: THIRD_PARTY.displayName,
         description: THIRD_PARTY.description, author: THIRD_PARTY.author, repo: THIRD_PARTY.repo,
@@ -224,12 +228,16 @@ describe('AppsPage trust gate', () => {
 
     await waitFor(() => expect(modalTitle()).toBeTruthy())
     // Scope disclosure, the three capabilities, and the provenance line.
-    expect(screen.getByText(`${K}.scope`)).toBeTruthy()
+    // Both copy lines interpolate the app identity. Missing these vars renders
+    // the raw `{{app}}` token in the real catalog-backed UI.
+    expect(screen.getByText(`${K}.scope LaunchDarkly`)).toBeTruthy()
+    expect(screen.getByText(`${K}.intro LaunchDarkly`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_python`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_backend`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_shell`)).toBeTruthy()
     expect(screen.getByText(`${K}.source`)).toBeTruthy()
-    expect(screen.getByText(THIRD_PARTY.repo)).toBeTruthy()
+    expect(screen.getByText(THIRD_PARTY.trustRepository)).toBeTruthy()
+    expect(screen.queryByText(THIRD_PARTY.repo)).toBeNull()
     // The raw backend string never reaches the user.
     expect(screen.queryByText(/is not trusted to run its own code/)).toBeNull()
   })
@@ -242,7 +250,10 @@ describe('AppsPage trust gate', () => {
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
+    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(
+      THIRD_PARTY.name,
+      THIRD_PARTY.trustRepository,
+    ))
     await waitFor(() => expect(enableApp).toHaveBeenCalledTimes(2))
     expect(trustApp).toHaveBeenCalledTimes(1)
     // Grant landed and the retry succeeded → the modal closes.
@@ -323,7 +334,10 @@ describe('registry install trust gate', () => {
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
+    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(
+      THIRD_PARTY.name,
+      THIRD_PARTY.trustRepository,
+    ))
     // The retry is the install, re-run once for the same app.
     await waitFor(() => expect(installFromRegistryStream).toHaveBeenCalledTimes(2))
     expect(installFromRegistryStream.mock.calls[1][0]).toBe(THIRD_PARTY.name)
@@ -472,7 +486,7 @@ describe('registry install trust gate', () => {
 })
 
 describe('safeHref — the provenance link is not a script sink', () => {
-  // REGRESSION: `app.repo` is registry-index content. Rendering it straight into
+  // REGRESSION: repository text is remote content. Rendering it straight into
   // `href` made `javascript:...` a one-click script-execution vector in the
   // dashboard's own origin — on the very dialog whose job is to gate code
   // execution. The link was added to satisfy a usability finding and opened this.

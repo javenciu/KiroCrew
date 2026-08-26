@@ -1979,10 +1979,14 @@ def _fold_author(value: object) -> str:
     return " ".join(folded.split()).lower()
 
 
-def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Stamp server-computed ``provenance`` and ``verified`` on every row.
+def _apply_trust_fields(
+    entries: list[dict[str, Any]],
+    *,
+    trust_repositories: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Stamp server-computed trust fields on every row.
 
-    SECURITY CONTRACT: these two fields are the API trust boundary for
+    SECURITY CONTRACT: these fields are the API trust boundary for
     ``GET /api/apps/registry``. They are computed here — where the
     server-attached ``_registry`` tag is authoritative — and OVERWRITE any
     value an index entry may have published, so an external registry can
@@ -2031,8 +2035,24 @@ def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
       ``"external"`` is dropped, so the wire never carries an ``origin`` that
       contradicts ``provenance: "external"`` — neither an index-published one
       nor one cross-stamped from an installed same-named app.
+    - ``trustRepository``: the normalized clone target the server resolved for
+      the app. It is OVERWRITTEN here, never copied from index or manifest
+      content, because the consent modal sends it back as proof of what the
+      operator reviewed. ``trust_repositories`` lets the catalog storefront
+      supply coordinates resolved separately from its display-only rows.
     """
     for entry in entries:
+        entry.pop("trustRepository", None)
+        name = entry.get("name")
+        if trust_repositories is None:
+            trust_repository = _normalize_git_target(_entry_git_url(entry))
+        elif isinstance(name, str):
+            trust_repository = _normalize_git_target(trust_repositories.get(name, ""))
+        else:
+            trust_repository = ""
+        if trust_repository:
+            entry["trustRepository"] = trust_repository
+
         index_author = entry.pop("_index_author", None)
         folded_author = _fold_author(index_author)
         if entry.get("_registry"):
@@ -2071,6 +2091,47 @@ def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             else:
                 entry["verified"] = builtin or folded_author in FIRST_PARTY_AUTHORS
     return entries
+
+
+def _trust_repository_bindings(
+    entries: list[dict[str, Any]],
+    installed_map: dict[str, dict[str, Any]],
+    resolved: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Authoritative consent target for each storefront row.
+
+    An installed app is bound to the source URL recorded at install time; that
+    is also what the grant handler resolves first. A not-yet-installed catalog
+    row may have display and install coordinates from separate documents, so its
+    caller supplies the freshly resolved target in *resolved*. Every remaining
+    row (seed and external registries) resolves through ``_entry_git_url`` so a
+    legitimate ``gitUrl``/``repo`` difference follows the same precedence as
+    clone/install rather than treating the display alias as authority.
+    """
+    bindings: dict[str, str] = {}
+    resolved = resolved or {}
+    for entry in entries:
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        installed = installed_map.get(name)
+        if installed is not None:
+            # The listing row was resolved from the same authoritative source
+            # as install. Supply it to the shared legacy fallback so storefront
+            # proof and the grant handler cannot disagree, without performing a
+            # second blocking catalog lookup on the event loop.
+            coordinate = resolved.get(name)
+            authoritative_entry = (
+                {"gitUrl": coordinate} if coordinate is not None else entry
+            )
+            _, bindings[name] = resolve_installed_trust_repository(
+                installed, registry_entry=authoritative_entry
+            )
+        elif name in resolved:
+            bindings[name] = resolved[name]
+        else:
+            bindings[name] = _entry_git_url(entry)
+    return bindings
 
 
 def _version_newer(registry_ver: str, installed_ver: str) -> bool:
@@ -2875,13 +2936,15 @@ async def list_registry() -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001 - degrade, never 500 the store
             logger.warning("ignoring curated catalog copy after a failure", exc_info=True)
 
+    trust_repositories = _trust_repository_bindings(entries, installed_map)
     return _apply_trust_fields(
-        _enrich_with_install_status(entries, installed_map, detected)
+        _enrich_with_install_status(entries, installed_map, detected),
+        trust_repositories=trust_repositories,
     )
 
 
-def _catalog_installable_names() -> set[Any]:
-    """Names the catalog can install, from a FRESH fetch -- never the local cache.
+def _catalog_installable_rows() -> dict[str, dict[str, Any]]:
+    """Catalog install rows by name, from a FRESH fetch -- never the cache.
 
     ``list_catalog_rows`` reads the cache under the data home, which is
     agent-writable. That is harmless while a cached row only re-dresses a row that
@@ -2897,16 +2960,22 @@ def _catalog_installable_names() -> set[Any]:
     failure memory, so an outage costs a refusal rather than a fresh timeout on
     every listing.
 
-    Returns an empty set on ANY failure, which degrades the storefront to the seed's
-    names -- the listing this path produced before the catalog could supply
-    coordinates. A store listing must never fail because the catalog is unreachable.
+    Returns an empty mapping on ANY failure, which degrades the storefront to the
+    seed's names -- the listing this path produced before the catalog could supply
+    coordinates. Keeping the rows (rather than only their names) also lets the
+    server show the exact resolved clone target in the consent dialog without a
+    second network fetch.
     """
     try:
         entries = official_catalog.fetch_inventory_entries()
-        return {row.get("name") for row in official_catalog.inventory(entries)}
+        return {
+            row["name"]: row
+            for row in official_catalog.inventory(entries)
+            if isinstance(row.get("name"), str)
+        }
     except Exception:  # noqa: BLE001 - degrade to the seed, never 500 the store
         logger.warning("cannot confirm the catalog's install coordinates", exc_info=True)
-        return set()
+        return {}
 
 
 async def list_catalog_apps() -> list[dict[str, Any]]:
@@ -2944,7 +3013,12 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     if not rows:
         return []
     installable = await asyncio.to_thread(_load_registry_file)
-    installable_names = {e.get("name") for e in installable if isinstance(e, dict)}
+    seed_by_name = {
+        e["name"]: e
+        for e in installable
+        if isinstance(e, dict) and isinstance(e.get("name"), str)
+    }
+    installable_names = set(seed_by_name)
     # Reserve every catalog name BEFORE the git filter, plus every seed name, so
     # an external row can never shadow a catalog/seed name — including a catalog
     # `git` row filtered out here for not being installable yet, whose name
@@ -2960,21 +3034,45 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     # Only paid when it can change the answer. With every `git` row already seeded
     # the fetch cannot unlock anything, so the storefront's hot path keeps costing
     # one cached read.
+    fresh_installable: dict[str, dict[str, Any]] = {}
     if any(
         row.get("source", {}).get("type") == "git" and row.get("name") not in installable_names
         for row in rows
     ):
-        installable_names |= await asyncio.to_thread(_catalog_installable_names)
+        fresh_installable = await asyncio.to_thread(_catalog_installable_rows)
+        installable_names |= set(fresh_installable)
     rows = [
         row
         for row in rows
         if row.get("source", {}).get("type") != "git" or row.get("name") in installable_names
     ]
 
+    # Catalog display rows intentionally carry no clone URL. Resolve the
+    # consent target from the same install coordinates name-only install uses:
+    # a bundled seed wins a different-repository catalog collision, while a
+    # catalog-only row uses the freshly fetched pin row above.
+    resolved_repositories: dict[str, str] = {}
+    for row in rows:
+        if row.get("source", {}).get("type") != "git":
+            continue
+        name = row.get("name")
+        if not isinstance(name, str):
+            continue
+        install_row = seed_by_name.get(name) or fresh_installable.get(name)
+        resolved_repositories[name] = (
+            _entry_git_url(install_row) if install_row is not None else ""
+        )
+
     installed = await asyncio.to_thread(list_installed_apps)
     installed_map = {a["name"]: a for a in installed}
     rows, detected = await _append_external_registry_apps(rows, reserved_names, installed_map)
-    return _apply_trust_fields(_enrich_with_install_status(rows, installed_map, detected))
+    trust_repositories = _trust_repository_bindings(
+        rows, installed_map, resolved_repositories
+    )
+    return _apply_trust_fields(
+        _enrich_with_install_status(rows, installed_map, detected),
+        trust_repositories=trust_repositories,
+    )
 
 
 def get_server_platform() -> dict[str, str]:
@@ -3077,6 +3175,47 @@ def get_registry_app(name: str) -> dict[str, Any] | None:
     if refusal:
         raise official_catalog.CatalogUnavailable(refusal)
     return row
+
+
+def resolve_installed_trust_repository(
+    app: dict[str, Any], *, registry_entry: dict[str, Any] | None = None
+) -> tuple[bool, str]:
+    """Resolve the repository an installed app's trust prompt must bind to.
+
+    New registry installs persist ``sourceUrl`` and are bound directly to that
+    immutable install provenance.  Older installs predate that field, but retain
+    the ``registry:<name>`` source marker; for those records, resolve the same
+    current authoritative row a legacy update would use.  A genuinely local or
+    self-registered app has neither form of registry provenance and remains a
+    valid repository-less app.
+
+    The boolean distinguishes that legitimate local case from a legacy registry
+    record whose current source cannot be resolved.  Callers that grant execution
+    trust must refuse the latter rather than silently creating a name-only grant.
+    A caller that already resolved an authoritative storefront row can pass it as
+    *registry_entry*, avoiding duplicate blocking catalog I/O while keeping the
+    same coordinate precedence. ``CatalogUnavailable`` intentionally propagates
+    when this function must perform the lookup itself, so a caller can fail closed.
+    """
+    source_url = app.get("sourceUrl", "")
+    repository = _normalize_git_target(
+        source_url if isinstance(source_url, str) else ""
+    )
+    if repository:
+        return True, repository
+
+    source = app.get("source", "")
+    if not isinstance(source, str) or not is_registry_source(source):
+        return True, ""
+
+    name = app.get("name", "")
+    if not isinstance(name, str) or not name:
+        return False, ""
+    entry = registry_entry if registry_entry is not None else get_registry_app(name)
+    if entry is None:
+        return False, ""
+    repository = _normalize_git_target(_entry_git_url(entry))
+    return bool(repository), repository
 
 
 def _external_registry_row(name: str) -> dict[str, Any] | None:

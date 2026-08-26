@@ -54,6 +54,7 @@ from kiro_crew.apps.registry import (
     _entry_git_url,
     _normalize_git_target,
     get_registry_app,
+    resolve_installed_trust_repository,
 )
 from kiro_crew.apps.routes import app_lifecycle_lock
 from kiro_crew.apps.teardown import teardown_app_runtime
@@ -1041,6 +1042,37 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # The repository is a consent proof, not authority: the server resolves the
+    # current target independently below. An empty body keeps local installed
+    # apps (which have no repository binding) compatible, while a malformed
+    # proof is refused before any config mutation.
+    body: object = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            _audit(request, operation=op, outcome="denied", resources=f"{name}=invalid_json")
+            return web.json_response(
+                {
+                    "error": "repository consent proof must be valid JSON",
+                    "code": "invalid_repository_consent",
+                },
+                status=400,
+            )
+    if not isinstance(body, dict):
+        body = {}
+    consent_raw = body.get("repository")
+    if consent_raw is not None and not isinstance(consent_raw, str):
+        _audit(request, operation=op, outcome="denied", resources=f"{name}=bad_repository")
+        return web.json_response(
+            {
+                "error": "repository consent proof must be a string",
+                "code": "invalid_repository_consent",
+            },
+            status=400,
+        )
+    consent_repository = _normalize_git_target(consent_raw or "")
+
     # Validation and the write must be ONE critical section, held against the
     # same per-app lock every other lifecycle transition takes. Uninstall's
     # grant-removal precondition and this handler's existence check are both
@@ -1062,13 +1094,12 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
         def _known_app_repository() -> tuple[bool, str]:
             installed = get_app(name)
             if installed is not None:
-                # Registry installs persist the exact source URL they came from.
-                # Local/external installs may have no repository coordinate; those
-                # remain grantable but receive no install-time binding.
-                source_url = installed.get("sourceUrl", "")
-                return True, _normalize_git_target(
-                    source_url if isinstance(source_url, str) else ""
-                )
+                try:
+                    return resolve_installed_trust_repository(installed)
+                except CatalogUnavailable:
+                    # A legacy registry install cannot safely degrade to a
+                    # name-only grant when its current source is unavailable.
+                    return False, ""
             try:
                 entry = get_registry_app(name)
             except CatalogUnavailable:
@@ -1096,6 +1127,28 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
                     "code": "app_not_installed",
                 },
                 status=404,
+            )
+
+        # Bind the click to what the modal actually showed. The registry may
+        # legitimately publish both ``repo`` (display/legacy alias) and
+        # ``gitUrl`` (the effective clone URL); only the latter wins through
+        # ``_entry_git_url`` above. A stale or compromised client cannot replace
+        # that server-side result — it can only prove it displayed the same one.
+        # Compare even when one side is empty: an app changing between a local
+        # install and a repository-backed source is also a changed consent scope.
+        if consent_repository != repository:
+            reason = "missing_repository" if repository and not consent_repository else "repository_changed"
+            _audit(request, operation=op, outcome="denied", resources=f"{name}={reason}")
+            return web.json_response(
+                {
+                    "error": (
+                        "repository consent proof is required; refresh the app listing and review it"
+                        if reason == "missing_repository"
+                        else "app repository changed since the consent dialog was opened; refresh and review it"
+                    ),
+                    "code": "app_trust_repository_mismatch",
+                },
+                status=409,
             )
 
         # A builtin needs no grant (shipped package code is exempt at the gate), and

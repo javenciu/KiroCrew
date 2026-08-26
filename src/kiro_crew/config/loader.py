@@ -7186,9 +7186,7 @@ class KiroCrewConfig:
                         and repository
                     }
                     if isinstance(
-                        _trusted_repositories := agent_data.get(
-                            "apps_trusted_repositories"
-                        ),
+                        _trusted_repositories := agent_data.get("apps_trusted_repositories"),
                         dict,
                     )
                     else {}

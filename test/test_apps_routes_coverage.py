@@ -325,6 +325,117 @@ async def test_list_apps_enriches_running_backend(
     }
 
 
+@pytest.mark.asyncio
+async def test_list_apps_overwrites_the_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "sourceUrl": "HTTPS://Clone.Example.test/Owner/App.git/",
+                "trustRepository": "https://evil.example/spoof",
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        [entry] = await resp.json()
+
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_get_app_overwrites_the_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "get_app",
+        lambda name: {
+            "name": name,
+            "sourceUrl": "https://clone.example.test/Owner/App.git",
+            "trustRepository": "https://evil.example/spoof",
+        },
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"/api/apps/{APP}")
+        assert resp.status == 200
+        entry = await resp.json()
+
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_list_apps_resolves_legacy_registry_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-provenance registry install must show the current clone target."""
+    _setup_env(tmp_path, monkeypatch)
+    clone_target = "https://clone.example.test/Owner/legacy-app"
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "source": f"registry:{APP}",
+                "trustRepository": "https://evil.example/spoof",
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+    monkeypatch.setattr(
+        "kiro_crew.apps.registry.get_registry_app",
+        lambda name: {"name": name, "gitUrl": f"{clone_target}.git"},
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        [entry] = await resp.json()
+
+    assert entry["trustRepository"] == clone_target
+
+
+@pytest.mark.asyncio
+async def test_get_app_keeps_genuinely_local_app_repositoryless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-named registry row must not be attached to a local install."""
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "get_app",
+        lambda name: {
+            "name": name,
+            "source": str(tmp_path / "local-source"),
+            "origin": "local",
+            "trustRepository": "https://evil.example/spoof",
+        },
+    )
+
+    def _must_not_resolve(_name: str):
+        pytest.fail("a local install must not fall through to the registry")
+
+    monkeypatch.setattr("kiro_crew.apps.registry.get_registry_app", _must_not_resolve)
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"/api/apps/{APP}")
+        assert resp.status == 200
+        entry = await resp.json()
+
+    assert "trustRepository" not in entry
+
+
 # ---------------------------------------------------------------------------
 # Migrated deploy-web compatibility redirects
 # ---------------------------------------------------------------------------
