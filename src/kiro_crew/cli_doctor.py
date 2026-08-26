@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
-from kiro_crew import agent_state, diagnostics, platform_compat, sandbox
+from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox
 from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.acp import kas_assets, kas_auth
 from kiro_crew.acp.client import KIRO_CLI_BIN
@@ -33,7 +33,9 @@ from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
+    CRED_DISCORD_BOT_TOKEN,
     config_dir,
+    env_path,
     normalize_agent_model,
     resolve_agent_bindings,
     resolve_effective_model,
@@ -41,9 +43,11 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.paths import (
     LEGACY_CONFIG_DIR_NAME,
     _valid_override_home,
+    data_home,
     kiro_agents_dir,
     project_agents_dir,
 )
+from kiro_crew.config.superseded_defaults import render_doctor_section
 from kiro_crew.constants import MIN_NODE_MAJOR
 from kiro_crew.dashboard.crash_dump_store import (
     dump_age_seconds,
@@ -56,6 +60,7 @@ from kiro_crew.dashboard.origin import (
     machine_hostname,
     parse_dashboard_url,
 )
+from kiro_crew.discord import install_url, intent_probe
 from kiro_crew.doctor_deadpath import doctor_dead_paths
 from kiro_crew.embeddings import (
     _LIB_PATH_ENV,
@@ -87,6 +92,7 @@ from kiro_crew.service import common as common_service
 from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
 from kiro_crew.session_pid_sig import signing_health
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.transcribe import _find_parakeet_mlx, _find_whisper, ensure_ffmpeg_in_path
 from kiro_crew.validation import _AGENT_NAME_RE
 
@@ -486,10 +492,21 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
        the error head plus any captured stderr tail from the child — which
        usually contains the real cause (FindupException, ImportError, etc.)
        that would otherwise only exist in kiro-cli's per-session log.
+
+    A spec that cannot be read as a JSON object — unreadable, unparseable,
+    or valid JSON that is not an object — degrades to an empty config: every
+    managed server then reports as missing and the file is never rewritten.
     """
     try:
         agent_data = json.loads(agent_path.read_text(encoding="utf-8"))
     except Exception:
+        agent_data = {}
+    if not isinstance(agent_data, dict):
+        # Valid JSON that is not an object (a list, a scalar) parses fine but
+        # every .get() below would raise. Doctor exists to diagnose a broken
+        # config, not die on one — treat it like the unparseable case, but say
+        # what is actually wrong so the missing-server lines below make sense.
+        print("  ❌ agent spec is not a JSON object — re-run `kirocrew setup`")
         agent_data = {}
 
     tools = agent_data.get("tools", [])
@@ -897,15 +914,67 @@ def _doctor_trust_root() -> None:
         print(f"  trust root:  ⏹ {key_path} not created yet (the gateway writes it on first start)")
         return
     print(f"  ⚠ trust root: {key_path} is unreadable or shorter than 32 bytes.")
-    print(
-        "               Session identities go out unsigned, so sub-agent "
-        "dispatch and memory"
-    )
-    print(
-        "               writes are refused in sandboxed sessions. Restore the "
-        "key file, or"
-    )
+    print("               Session identities go out unsigned, so sub-agent " "dispatch and memory")
+    print("               writes are refused in sandboxed sessions. Restore the " "key file, or")
     print("               restart the gateway if another process relocated it.")
+
+
+#: MCP servers that host strict-identity tools — the reflexive verbs
+#: (``monitor_start``, ``session_ledger_*``, ``set_project``, ``ask_question``)
+#: and the authorization-subject ones (session control, ``chat_folder_*``).
+#: Mirrors ``mcp_core._STRICT_IDENTITY_SERVERS``; ``kirocrew-dashboard`` is
+#: opt-in per agent, so it is reported only when an agent actually references it.
+_STRICT_IDENTITY_SERVERS = ("kirocrew-core", "kirocrew-dashboard")
+
+
+def _doctor_strict_identity(cfg: KiroCrewConfig) -> None:
+    """Report whether strict-identity tools have a working identity channel.
+
+    On the kiro backend a session's process is an ``AcpRuntime``, which is
+    session-UNBOUND by design (one process multiplexes N sessions, so it cannot
+    carry one session's key in its environment — ``acp/runtime.py`` injects
+    none). The gateway's per-call caller injection is therefore the ONLY
+    identity channel for that backend, and it exists only for servers listed in
+    ``mcp_gateway.stub_servers``. An unrouted server means every strict tool on
+    it is refused — silently, once per call, with no hint that the cause is
+    topology rather than the calling session.
+
+    Reports only, and deliberately appends NO entry to doctor's ``issues``:
+    ``mcp_gateway.stub_servers`` is empty by default because routing starts a
+    broker plus a stub per server, so a hard issue here would make
+    ``kirocrew doctor`` exit 1 on every stock install — the same failure the
+    speech-to-text section is written to avoid. Parity with
+    :func:`_doctor_trust_root`, which also only prints.
+
+    Skipped where the env sources exist by construction: on Linux the sandbox
+    launcher exports ``KIROCREW_HOST_PID``, so routing is not what decides
+    whether strict identity resolves.
+    """
+    if _plat.system() not in ("Darwin", "Windows"):
+        return
+    try:
+        routed = set(cfg.mcp_gateway.stub_servers)
+    except Exception:
+        routed = set()
+    unrouted = [s for s in _STRICT_IDENTITY_SERVERS if s not in routed]
+    if not unrouted:
+        print("  strict identity: ✅ routed — the gateway injects a per-call caller")
+        return
+    names = ", ".join(unrouted)
+    print(f"  strict identity: ⏹ no identity channel for {names}")
+    _print_wrapped(
+        "Tools that must know which session is calling (monitor_start, "
+        "session_ledger_*, set_project, ask_question, session control, "
+        "chat_folder_*) are refused while a server is unrouted: on the kiro "
+        "backend the session's AcpRuntime carries no session key in its "
+        "environment by design, so the gateway's per-call caller injection is "
+        "the only channel, and it covers routed servers only. Route them from "
+        "MCP Management (or add them to mcp_gateway.stub_servers and restart) "
+        "if you use those tools. Leaving them unrouted is a valid choice — "
+        "routing starts a broker and one stub process per server — so this is "
+        "a note, not a problem to fix; the tools' own refusal now names the "
+        "same cause."
+    )
 
 
 _INDENT = "               "
@@ -1113,33 +1182,6 @@ def _linger_enabled(user: str) -> bool | None:
     return None
 
 
-# Git for Windows never lives in the system directories the trusted resolver
-# pins Windows lookups to — it installs under Program Files. Fixed literal
-# roots, not ``%ProgramFiles%``: doctor runs with operator privileges, and
-# reading the environment would let a poisoned variable redirect the lookup to
-# an agent-writable directory — the exact hole the pin exists to close.
-_WINDOWS_GIT_DIRS = (
-    r"C:\Program Files\Git\cmd",
-    r"C:\Program Files (x86)\Git\cmd",
-)
-
-
-def _windows_git_bin() -> str | None:
-    """``git.exe`` from the fixed Git for Windows install roots, else ``None``.
-
-    Without this, every supported Windows source install reports "could not
-    check" — :func:`platform_compat.trusted_system_bin` only probes the system
-    directories, where git never is. A non-default-drive install still misses
-    and degrades to "could not check", which is honest: this fallback widens
-    the pin only to paths an unprivileged attacker cannot write.
-    """
-    for directory in _WINDOWS_GIT_DIRS:
-        candidate = os.path.join(directory, "git.exe")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
 def _git_line(repo: Path, *args: str) -> str | None:
     """First stdout line of ``git -C repo *args``, ``None`` on any failure.
 
@@ -1148,16 +1190,13 @@ def _git_line(repo: Path, *args: str) -> str | None:
     install has no ``.git``, a fresh clone may lack ``origin/HEAD`` — so every
     error collapses to ``None`` and the caller renders "could not check".
 
-    ``git`` is resolved through :func:`platform_compat.trusted_system_bin`
-    rather than a bare ``PATH`` lookup: doctor runs with operator privileges,
-    and an agent-writable directory leading ``PATH`` could plant a ``git``
-    shim. On Windows a resolver miss falls back to the fixed Git for Windows
-    install roots (:func:`_windows_git_bin`); any remaining miss collapses to
+    ``git`` is resolved through :func:`platform_compat.trusted_git_bin` rather
+    than a bare ``PATH`` lookup: doctor runs with operator privileges, and an
+    agent-writable directory leading ``PATH`` could plant a ``git`` shim. That
+    helper carries the Windows install-root fallback; a miss collapses to
     ``None`` like every other failure here — no spawn at all.
     """
-    git = platform_compat.trusted_system_bin("git")
-    if git is None and platform_compat.IS_WINDOWS:
-        git = _windows_git_bin()
+    git = platform_compat.trusted_git_bin()
     if git is None:
         return None
     try:
@@ -1165,6 +1204,7 @@ def _git_line(repo: Path, *args: str) -> str | None:
             [git, "-C", str(repo), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             errors="replace",
             timeout=10,
         )
@@ -1230,7 +1270,9 @@ def _doctor_source_checkout(repo: Path) -> None:
             print(f"  branch:      ⚠️  {default_branch} (could not count commits behind origin)")
             return
         if int(behind) > 0:
-            print(f"  branch:      ⚠️  {default_branch}, {behind} commit(s) behind origin (as of last fetch)")
+            print(
+                f"  branch:      ⚠️  {default_branch}, {behind} commit(s) behind origin (as of last fetch)"
+            )
             print("               The running gateway predates those commits until an")
             print("               update + restart.")
         else:
@@ -1644,47 +1686,23 @@ def _doctor_kas(issues: list[str]) -> None:
 
 
 def _report_kas_backend(issues: list[str]) -> None:
-    """Print the KAS diagnostic block for whichever spawn path is selected.
+    """Print the KAS diagnostic block (assets + bundle version + token probe).
 
     Split from :func:`_doctor_kas` so the backend-selection check there stays a
     positive ``== ACP_BACKEND_KAS`` rather than an early-return on inequality.
-    Default path: KAS is fronted by ``kiro-cli acp --agent-engine v3``, so
-    readiness is kiro-cli being present and its ``acp`` subcommand knowing the
-    engine flag. Override path (either ``KIROCREW_KAS_*`` env set): the legacy
-    direct spawn, so readiness is the extracted assets. The token probe runs on
-    both — the ``_kiro/auth/getAccessToken`` callback is forwarded to Crew on
-    both paths. It prints only the expiry, never the token bytes.
     """
     print("\nKAS backend")
-    if kas_assets.kas_override_active():
-        node = kas_assets.find_kas_node()
-        script = kas_assets.find_kas_server_script()
-        print("  spawn:       direct (KIROCREW_KAS_* override active)")
-        print(f"  node:        {'✅ ' + str(node) if node else '❌ not found'}")
-        if script:
-            print(f"  bundle:      ✅ {_kas_version_label(script)}")
-        else:
-            print("  bundle:      ❌ KAS server script not found")
-        if not (node and script):
-            print("               Fix: point KIROCREW_KAS_NODE / KIROCREW_KAS_SCRIPT at a")
-            print("               local KAS build, or unset both to use kiro-cli's own")
-            print("               ACP surface instead.")
-            issues.append("KAS backend selected but assets missing")
+    node = kas_assets.find_kas_node()
+    script = kas_assets.find_kas_server_script()
+    print(f"  node:        {'✅ ' + str(node) if node else '❌ not found'}")
+    if script:
+        print(f"  bundle:      ✅ {_kas_version_label(script)}")
     else:
-        kiro_bin = shutil.which(KIRO_CLI_BIN)
-        print("  spawn:       kiro-cli acp --agent-engine v3")
-        print(f"  kiro-cli:    {'✅ ' + kiro_bin if kiro_bin else '❌ not found in PATH'}")
-        if kiro_bin:
-            engine_ok = _kas_engine_flag_supported(kiro_bin)
-            if engine_ok:
-                print(f"  engine flag: ✅ {kas_assets.KAS_ENGINE_FLAG} supported")
-            else:
-                print(f"  engine flag: ❌ this kiro-cli lacks {kas_assets.KAS_ENGINE_FLAG}")
-                print("               Fix: update kiro-cli (`kiro-cli update`).")
-                issues.append("KAS backend selected but kiro-cli lacks the engine flag")
-        else:
-            print("               Fix: install kiro-cli and sign in with `kiro-cli login`.")
-            issues.append("KAS backend selected but kiro-cli not found")
+        print("  bundle:      ❌ KAS server script not found")
+    if not (node and script):
+        print("               Fix: install kiro-cli and run it once so it unpacks its")
+        print("               KAS bundle (or set KIROCREW_KAS_NODE / KIROCREW_KAS_SCRIPT).")
+        issues.append("KAS backend selected but assets missing")
 
     # Token status — a bounded live probe through kiro-cli. Advisory: an
     # unobtainable token is usually a transient login state, not a broken
@@ -1699,26 +1717,6 @@ def _report_kas_backend(issues: list[str]) -> None:
     else:
         expires = resp.get("expiresAt")
         print(f"  token:       ✅ obtained via kiro-cli (expires {expires})")
-
-
-def _kas_engine_flag_supported(kiro_bin: str) -> bool:
-    """Bounded probe: does this kiro-cli's ``acp`` subcommand take the engine flag?
-
-    Reads ``acp --help`` rather than comparing versions, so the check keeps
-    working across version schemes and never encodes a floor that goes stale.
-    Any spawn/timeout failure reports unsupported — this is a diagnostic, and a
-    kiro-cli whose ``--help`` cannot run will not serve sessions either.
-    """
-    try:
-        proc = subprocess.run(
-            [kiro_bin, kas_assets.KAS_CLI_SUBCMD, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return kas_assets.KAS_ENGINE_FLAG in (proc.stdout or "") + (proc.stderr or "")
 
 
 def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
@@ -1755,6 +1753,282 @@ def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
             print(f"{_INDENT}- {name!r}")
     else:
         print("  janitor:     ✅ no stale temp/backup files to reclaim")
+
+
+def _discord_intent_grants(token: str) -> intent_probe.IntentGrants:
+    """Read Discord's privileged-intent grants on a throwaway event loop.
+
+    ``asyncio.run`` gives the probe its own loop: the doctor is a separate
+    process from the gateway, so the probe never shares a loop with live
+    message traffic. Every failure is already folded into the result by
+    :func:`~kiro_crew.discord.intent_probe.probe_intent_grants`; the guard here
+    covers the loop itself failing to start, because a diagnostic that raises
+    prints no report at all.
+    """
+    try:
+        return asyncio.run(intent_probe.probe_intent_grants(token))
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must always answer
+        return intent_probe.IntentGrants(error=type(exc).__name__)
+
+
+def _discord_live_state(port: int | None) -> dict[str, object] | None:
+    """Read the gateway's live Discord state, or ``None`` when unreachable.
+
+    Loopback only, and only the two liveness fields are ever consumed: the same
+    endpoint also returns a masked token preview, which has no business in a
+    report an operator pastes into an issue. Unreachable covers every reason
+    (gateway down, token auth on this interface, a stale port) because none of
+    them is a Discord fault, so all of them read the same to the reader.
+    """
+    if not port:
+        return None
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/discord/config")
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- loopback host literal plus a fixed internal path; the only interpolated value is the gateway port from config/env, so no scheme or host is reachable from input  # noqa: E501
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _discord_msg_content_line(
+    grants: intent_probe.IntentGrants, *, needs_content: bool, issues: list[str]
+) -> None:
+    """Report the Message Content intent against what this install needs.
+
+    Severity is decided by the allow-lists, not by the grant alone: Discord
+    delivers DM content without the privileged intent, so a DM-only install
+    with the intent off is correct, while a thread or channel allow-list with
+    the intent off is a channel that silently reads nothing.
+    """
+    state = grants.message_content
+    if not needs_content:
+        detail = (
+            "on, and unused by a DM-only install"
+            if state in intent_probe.GRANTED_STATES
+            else "not needed (DMs deliver content without it)"
+        )
+        print(f"  msg content: ⏭  {detail}")
+    elif state in intent_probe.GRANTED_STATES:
+        limited = state == intent_probe.INTENT_LIMITED
+        extra = " (capped at 100 servers until the app is verified)" if limited else ""
+        print(f"  msg content: ✅ granted{extra}")
+    elif state == intent_probe.INTENT_DISABLED:
+        print("  msg content: ❌ OFF, so thread and channel messages arrive empty")
+        print(f"{_INDENT}and Discord can close the connection with code 4014.")
+        print(f"{_INDENT}Fix: Developer Portal → Bot → Message Content Intent,")
+        print(f"{_INDENT}then `kirocrew restart`.")
+        issues.append("discord: Message Content Intent off with threads allow-listed")
+    else:
+        print(f"  msg content: ⚠️  cannot verify ({grants.error or 'no answer'})")
+        print(f"{_INDENT}If thread messages arrive empty, enable Message Content")
+        print(f"{_INDENT}Intent in the Developer Portal → Bot.")
+
+
+def _discord_unused_intent_line(label: str, name: str, state: str) -> None:
+    """Flag a privileged intent nothing in Kiro Crew reads, if it is granted.
+
+    Silent when the intent is off (the wanted state) or unknown (the probe
+    already reported that once), so this line only ever appears when there is
+    something to turn off.
+    """
+    if state in intent_probe.GRANTED_STATES:
+        print(f"  {label + ':':<13}⚠️  {name} Intent is on but unused")
+        print(f"{_INDENT}Turn it off in the Developer Portal → Bot: nothing in Kiro")
+        print(f"{_INDENT}Crew reads it, and it widens what Discord sends this bot.")
+
+
+def _discord_install_line(application_id: str, *, dm_only: bool) -> None:
+    """Print the install URL matching this configuration, when it can be built.
+
+    Discord has no app manifest to publish, so the authorize URL IS the install
+    surface. The app id comes from the live probe; without it (no token, or
+    offline) the doc keeps the fallback, since a URL with a placeholder id is
+    not something an operator can click.
+    """
+    shape = "DM-only" if dm_only else "thread-capable"
+    try:
+        url = install_url.build_install_url(application_id, dm_only=dm_only)
+    except ValueError:
+        print(f"  install URL: ⏭  needs the app id: the {shape} template is")
+        print(f"{_INDENT}in the Discord Integration doc")
+        return
+    print(f"  install URL: {url}")
+    print(f"{_INDENT}({shape}: re-run it to update scopes or permissions)")
+
+
+def _doctor_discord(
+    cfg: KiroCrewConfig, creds: dict[str, str], port: int | None, issues: list[str]
+) -> None:
+    """Report the Discord channel: config, grants, and the live connection.
+
+    Ordered the way a Discord install fails: the channel must be enabled, then
+    hold a token, then allow SOMEONE (an empty user allow-list is a fail-closed
+    transport that denies every message, and is the most common way a
+    fully-configured install stays mute), then hold the privileged intent its
+    allow-lists imply, and only then be connected. Every branch names the
+    action that fixes it, because the reader of this section is someone whose
+    bot is not answering.
+    """
+    print("\nDiscord Integration")
+    dc = cfg.discord
+    if not dc.enabled:
+        print("  status:      ⏭  not enabled (optional)")
+        print("  setup:       enable it in the dashboard → Settings → Discord, or set")
+        print(f"{_INDENT}discord.enabled in config.json and DISCORD_BOT_TOKEN in")
+        print(f"{_INDENT}{env_path()}, then `kirocrew restart`")
+        return
+
+    print("  status:      ✅ enabled")
+    # Same resolution order the gateway uses, so doctor and the running channel
+    # can never disagree about whether a token exists. The value itself is
+    # never printed, in whole or in part.
+    token = creds.get(CRED_DISCORD_BOT_TOKEN, "") or dc.bot_token
+    if token:
+        print("  token:       ✅ present")
+    else:
+        print("  token:       ❌ missing, so the channel never starts")
+        print(f"{_INDENT}Fix: paste the bot token in Settings → Discord, or add")
+        print(f"{_INDENT}DISCORD_BOT_TOKEN=<token> to {env_path()}, then `kirocrew restart`")
+        issues.append("discord: enabled without a bot token")
+
+    users = [str(u) for u in dc.allowed_user_ids]
+    threads = [str(t) for t in dc.allowed_thread_ids]
+    channels = [str(c) for c in dc.allowed_channel_ids]
+    if users:
+        print(f"  users:       ✅ {len(users)} allow-listed")
+    else:
+        print("  users:       ❌ allow-list empty, so EVERY message is denied")
+        print(f"{_INDENT}Fix: add your numeric user ID under Settings → Discord")
+        print(f"{_INDENT}(Discord → Settings → Advanced → Developer Mode, then")
+        print(f"{_INDENT}right-click your name → Copy User ID), then `kirocrew restart`")
+        issues.append("discord: empty user allow-list denies every message")
+
+    # A server allow-list of either kind is what makes the privileged intent
+    # mandatory, so the line that reports the allow-lists names that link: the
+    # operator who just added a thread ID is the one who has to go and grant it.
+    needs_content = bool(threads or channels)
+    if needs_content:
+        print(
+            f"  servers:     ✅ {len(threads)} thread(s), {len(channels)} channel(s)"
+            " (Message Content required)"
+        )
+    else:
+        print("  servers:     ⏹ none, DMs only (add thread or channel IDs to use one)")
+
+    grants = _discord_intent_grants(token)
+    _discord_msg_content_line(grants, needs_content=needs_content, issues=issues)
+    _discord_unused_intent_line("members", "Server Members", grants.server_members)
+    _discord_unused_intent_line("presence", "Presence", grants.presence)
+
+    live = _discord_live_state(port)
+    if live is None:
+        print("  connection:  ⏹ live state unavailable (gateway not running, or it")
+        print(f"{_INDENT}requires a dashboard token on this interface)")
+    elif live.get("connected"):
+        print("  connection:  ✅ connected to Discord's Gateway")
+    elif str(live.get("connect_error", "")):
+        # Foreign text on the way to a terminal: shown escaped, so a control
+        # sequence in a close reason cannot rewrite the lines around it.
+        reason = _safe_display(str(live.get("connect_error", ""))[:120])
+        print(f"  connection:  ❌ not connected: {reason}")
+        print(f"{_INDENT}Fix: 4014 = enable Message Content Intent (or clear the")
+        print(f"{_INDENT}thread and channel allow-lists); 4004 = reset the bot")
+        print(f"{_INDENT}token. Then `kirocrew restart`.")
+        issues.append("discord: channel not connected")
+    else:
+        print("  connection:  ⚠️  not connected, and no reason was recorded")
+        print(f"{_INDENT}Discord settings are read at startup: run `kirocrew")
+        print(f"{_INDENT}restart` after changing them.")
+
+    _discord_install_line(grants.application_id, dm_only=not needs_content)
+
+
+def _doctor_whatsapp(cfg: KiroCrewConfig, issues: list[str]) -> None:
+    """Report the WhatsApp channel's two invisible prerequisites.
+
+    WhatsApp is the only channel whose whole runtime hangs off an OPTIONAL wheel
+    plus a locally stored credential, so both halves can be absent on a machine
+    whose config says the channel is on. Neither absence produces an error the
+    operator sees: a message simply never arrives, which is exactly what a
+    preflight exists to answer.
+
+    Both probes are cheap and side-effect free by design. ``neonize_available()``
+    is a ``find_spec`` metadata lookup and the store check is one ``stat``; doctor
+    must never import neonize (a ~19 MB ``ctypes`` load plus protobuf descriptors)
+    or construct a client, because a health check that initializes the subsystem it
+    is checking is both slow and a side effect of asking a question.
+    """
+    # Function-local: this keeps the channel package out of the import graph of
+    # every `kirocrew` invocation, since cli.py imports this module at its own
+    # module scope for all subcommands.
+    from kiro_crew.whatsapp.client import (
+        MISSING_EXTRA_HINT,
+        default_db_path,
+        neonize_available,
+    )
+
+    print("\nWhatsApp Integration")
+    wa = cfg.whatsapp
+    if not wa.enabled:
+        print("  status:      ⏭  not enabled (optional)")
+        print("  setup:       run 'kirocrew setup --whatsapp', or enable it from")
+        print("               the dashboard (Settings → Channels → WhatsApp)")
+        return
+
+    if neonize_available():
+        print("  extra:       ✅ neonize importable")
+    else:
+        print("  extra:       ❌ not installed, so the enabled channel cannot start")
+        print(f"               Fix: {MISSING_EXTRA_HINT}")
+        issues.append("whatsapp extra missing")
+
+    # The SAME expression ``whatsapp/gateway.py`` builds the client from, so doctor
+    # can never report on a store the channel does not open. ``data_home()``
+    # rather than ``config_dir()``: this is a read, and it must not refresh the
+    # recovery breadcrumb as a side effect of reporting a path.
+    store = default_db_path(data_home())
+    if store.exists():
+        print(f"  session:     ✅ paired session store at {store}")
+    else:
+        # Deliberately NOT an issue. Pairing is a QR scan served BY the running
+        # gateway, so a freshly enabled channel legitimately has no store yet, and
+        # failing here would break the documented `kirocrew doctor && kirocrew
+        # gateway` chain at the one moment the operator must start the gateway to
+        # make progress.
+        print("  session:     ⚠️  not paired yet, so the channel starts unpaired")
+        print(f"               Expected store: {store}")
+        print("               Pair from the dashboard (Settings → Channels → WhatsApp)")
+
+    groups = [g for g in (wa.groups or []) if isinstance(g, dict) and str(g.get("jid", "")).strip()]
+    if groups:
+        # Membership is only knowable from a live connection, so the gateway checks
+        # it on connect and logs the unmatched JIDs; doctor reports the count.
+        print(f"  groups:      ✅ {len(groups)} configured")
+    else:
+        print("  groups:      ⏹ none configured (group messages are ignored)")
+    print(f"  dm policy:   {wa.dm_policy}")
+
+
+def _venv_deps_ok(venv_py: Path) -> bool:
+    """True when *venv_py* ITSELF can import the gateway's core dependencies.
+
+    Routed through :func:`dep_sync._probe_interpreter` (``-I -X utf8`` plus a
+    neutral ``cwd``) because the question is about the venv, not the process
+    asking: an unisolated ``python -c`` puts the doctor's CWD at
+    ``sys.path[0]`` and inherits ``PYTHONPATH``, so a decoy package on either
+    route makes the check answer for the caller -- reporting the modules
+    available in a venv that cannot actually serve them, a false-healthy from
+    the diagnostic whose job is to catch exactly that install.
+    """
+    try:
+        proc = dep_sync._probe_interpreter(
+            venv_py, "import websockets, slack_sdk, aiohttp", timeout=5
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
 
 
 def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
@@ -2023,10 +2297,14 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # necessarily what a new session gets.
     _doctor_effective_model(cfg, proj, issues)
 
+    # ── Stored defaults a release has since changed (#5244) ──
+    render_doctor_section(issues)
+
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
     _doctor_path_launcher()
     _doctor_trust_root()
+    _doctor_strict_identity(cfg)
 
     # ── Agents dir janitor (orphaned atomic-write temps + stale backups) ──
     _doctor_agents_janitor(issues, cfg.agent.sweep_agents_backups)
@@ -2076,7 +2354,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     if is_venv_install:
         try:
             py_result = subprocess.run(
-                [str(venv_py), "--version"], capture_output=True, text=True, timeout=5
+                [str(venv_py), "--version"],
+                capture_output=True,
+                timeout=5,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                **UTF8_TEXT,
             )
             py_result.check_returncode()
             ver = py_result.stdout.strip()
@@ -2085,14 +2367,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print(f"  python:      ❌ venv python broken: {exc}")
             issues.append("venv python")
         else:
-            try:
-                subprocess.run(
-                    [str(venv_py), "-c", "import websockets, slack_sdk, aiohttp"],
-                    capture_output=True,
-                    timeout=5,
-                ).check_returncode()
+            if _venv_deps_ok(venv_py):
                 print("  deps:        ✅ websockets, slack_sdk, aiohttp available")
-            except Exception:
+            else:
                 print("  deps:        ❌ missing modules (websockets/slack_sdk/aiohttp)")
                 issues.append("python deps")
     else:
@@ -2167,9 +2444,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         # tree would send them to reinstall a package they are deliberately not
         # loading from, while saying nothing about the dir that actually failed.
         _plat_dir = _platform_libs_dirname()
-        _absent = (
-            [] if _lib_path_override else verify_vendored_libs().get(_plat_dir or "", [])
-        )
+        _absent = [] if _lib_path_override else verify_vendored_libs().get(_plat_dir or "", [])
         if _absent:
             print(f"               Missing native libs for {_plat_dir}: {', '.join(_absent)}")
             print("               This install's vendored llama.cpp is incomplete (packaging")
@@ -2340,6 +2615,63 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         print("  setup:       run 'kirocrew setup --slack', or connect any channel")
         print("               (Slack, Discord, Telegram, …) from the dashboard")
 
+    # ── Discord (optional) ──
+    _doctor_discord(cfg, creds, _port, issues)
+
+    # ── WhatsApp (optional) ──
+    # Its own section rather than a line in the Slack one: WhatsApp's
+    # prerequisites are an optional wheel and a local credential store, neither of
+    # which any other channel has, and both of which fail silently.
+    _doctor_whatsapp(cfg, issues)
+
+    # ── Every other channel (optional) ──
+    # One loop over the roster rather than a section per channel: the doctor knows
+    # Slack and Discord by name, so without this an operator with
+    # `telegram.enabled: true` and no token gets a clean bill of health from the
+    # tool whose whole job is telling them what is wrong. Readiness is derived from
+    # descriptor data, so the next channel is covered by adding its descriptor.
+    print("\nOther Channels")
+    try:
+        from kiro_crew.channels import channel_readiness
+
+        # Slack, Discord and WhatsApp each have a dedicated section above reporting
+        # the same credential AND the live connection, so listing them again here
+        # would name one fault twice in the closing issue line.
+        rows = [
+            row
+            for row in channel_readiness(cfg, creds)
+            if row.channel_type not in ("slack", "discord", "whatsapp")
+        ]
+    except Exception:
+        rows = []
+        print("  status:      ⚠️  channel roster unavailable")
+    if rows and not any(row.enabled for row in rows):
+        print("  status:      ⏭  none enabled (optional)")
+        print("  setup:       connect one from the dashboard's Settings > Channels")
+    for row in rows:
+        if not row.enabled:
+            continue
+        name = row.channel_type
+        if row.ready:
+            print(f"  {name + ':':12} ✅ enabled, credentials present")
+        else:
+            # Credentials and required config are reported separately because they
+            # live in different places: a secret belongs in .env, a non-secret like
+            # an account id in config.json. One combined line would send the
+            # operator to the wrong file.
+            parts = []
+            if row.missing_credentials:
+                parts.append(", ".join(row.missing_credentials))
+            if row.missing_config:
+                parts.append(", ".join(f"{name}.{attr}" for attr in row.missing_config))
+            missing = " and ".join(parts)
+            print(f"  {name + ':':12} ❌ enabled but missing {missing}")
+            print(
+                "               The channel will not start. Set it in "
+                "Settings > Channels, or in ~/.kiro/crew/.env"
+            )
+            issues.append(f"{name}: missing {missing}")
+
     # ── Loop-stall crash dumps ──
     print("\nLoop-stall Crash Dumps")
     try:
@@ -2391,6 +2723,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     if _port:
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{_port}/api/status")
+            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- loopback host literal plus a fixed internal path; the only interpolated value is the gateway port from config/env, so no scheme or host is reachable from input  # noqa: E501
             with urllib.request.urlopen(req, timeout=2) as resp:
                 data = json.loads(resp.read())
             print(f"  gateway:     ✅ running (uptime {data.get('uptime', '?')})")
@@ -2420,6 +2753,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             try:
                 ext_req = urllib.request.Request(f"http://{_host}:{_port}/api/status")
                 try:
+                    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- reaching the operator's OWN configured dashboard host is the test: this asserts token auth is enforced off loopback. The scheme is a literal and the host comes from dashboard.url, not from input  # noqa: E501
                     with urllib.request.urlopen(ext_req, timeout=2) as resp:
                         # 200 without token = auth is NOT enforced
                         print("  auth check:  ❌ external access allowed without token!")

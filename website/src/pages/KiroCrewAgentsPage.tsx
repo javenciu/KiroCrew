@@ -5,7 +5,7 @@ import Clickable from '../components/Clickable'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
 import { createSlot } from '../store/chatSlice'
-import { api } from '../api/client'
+import { api, type WebhookTokenEntry } from '../api/client'
 import { useProvider } from '../providers'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { Btn, SendBtn, Input, Badge, SearchInput, PageHeader, EmptyState } from '../components/ui'
@@ -19,10 +19,11 @@ import { FOCUSABLE } from '../hooks/useDialogFocusTrap'
 import SimpleSelect from '../components/SimpleSelect'
 import CrewAvatar from '../components/CrewAvatar'
 import CrewWakeSection from '../components/CrewWakeSection'
+import CrewWebhookSection from '../components/CrewWebhookSection'
 import CrewEditorRail from '../components/crew/CrewEditorRail'
 import CrewOverviewPane from '../components/crew/CrewOverviewPane'
 import { useCrewEditorSections, type CrewPaneKey } from '../components/crew/crewEditorSections'
-import { wakesCrew, crewWakeQueryKey } from '../components/crew/wakesCrew'
+import { wakesCrew, crewWakeQueryKey, crewWebhooksQueryKey, webhookBoundToCrew, webhookCanCallIn } from '../components/crew/wakesCrew'
 import type { CronJob } from '../types'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import { SourceBadge } from '../components/SourceBadge'
@@ -821,6 +822,29 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [pane, setPane] = useState<CrewPaneKey>('overview')
   useEffect(() => { setPane('overview') }, [sheet])
 
+  /** Pane changes driven from INSIDE a pane (an overview diagram node) rather
+   *  than from the rail. The clicked node unmounts with its pane, which would
+   *  drop keyboard focus to the body — so focus moves to the arriving panel,
+   *  which carries `tabIndex={-1}` for exactly this hand-off. Rail clicks keep
+   *  focus on the rail row and never set this flag. */
+  const paneFocusPending = useRef(false)
+  const goToPane = useCallback((key: CrewPaneKey) => {
+    setPane(prev => {
+      // Arm only on a real change: a same-pane call never reruns the focus
+      // effect, so an armed flag would fire on the NEXT rail-driven change and
+      // steal focus the rail contract says stays on the rail row. The ref
+      // write is idempotent, so a double-invoked updater is harmless.
+      if (prev !== key) paneFocusPending.current = true
+      return key
+    })
+  }, [])
+  const panelId = `crew-editor-pane-${editing || 'new'}`
+  useEffect(() => {
+    if (!paneFocusPending.current) return
+    paneFocusPending.current = false
+    document.getElementById(`${panelId}-${pane}`)?.focus()
+  }, [pane, panelId])
+
   /** The rail's schedule count reads the SAME cached query the wake pane uses, so
    *  opening the editor costs one request rather than two. */
   const wakeQuery = useQuery({
@@ -833,6 +857,22 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
       (j: CronJob) => wakesCrew(j, editing, editing === defaultAgent)),
     [wakeQuery.data, editing, defaultAgent],
   )
+
+  /** Same one-fetch rule for webhooks: the rail badge, the overview node and
+   *  the webhook pane all read this single cached entry. */
+  const webhooksQuery = useQuery({
+    queryKey: crewWebhooksQueryKey,
+    queryFn: () => api.webhooks(),
+    enabled: !!editing,
+  })
+  const boundWebhookTokens = useMemo(
+    () => (webhooksQuery.data?.tokens || []).filter(
+      (t: WebhookTokenEntry) => webhookBoundToCrew(t, editing)),
+    [webhooksQuery.data, editing],
+  )
+  const boundWebhooks = boundWebhookTokens.length
+  const activeWebhooks = boundWebhookTokens.filter(
+    (t: WebhookTokenEntry) => webhookCanCallIn(t, webhooksQuery.data?.switch_on !== false)).length
 
   /** Keywords the orchestrator can match, counted the way the field is authored:
    *  comma-separated, blanks ignored, so a trailing comma is not a keyword. */
@@ -860,9 +900,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     sharesStorage: collidingCrews.length > 0,
     canDelete: !!editing && editing !== defaultAgent,
     schedulesUnknown: wakeQuery.isError,
+    webhookTokens: boundWebhooks,
+    webhookTokensActive: activeWebhooks,
+    webhooksUnknown: webhooksQuery.isError,
     dirtyPanes,
   })
-  const panelId = `crew-editor-pane-${editing || 'new'}`
 
   return (
     <>
@@ -1107,6 +1149,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 <div
                   id={`${panelId}-${pane}`}
                   role="tabpanel"
+                  aria-labelledby={`${panelId}-tab-${pane}`}
                   tabIndex={-1}
                   className="flex min-w-0 flex-1 flex-col gap-3.5 overflow-y-auto px-5 py-4"
                 >
@@ -1126,6 +1169,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                       sharingCrews={collidingCrews.length}
                       workspaceShared={sharingWorkspace.length > 0}
                       memoryShared={sharingMemoryStore.length > 0}
+                      webhookTokens={boundWebhooks}
+                      webhooksUnknown={webhooksQuery.isError}
+                      onNavigate={goToPane}
                     />
                   )}
 
@@ -1177,6 +1223,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   {pane === 'schedules' && (
                     <CrewWakeSection crew={editing} isDefaultCrew={editing === defaultAgent} />
                   )}
+
+                  {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
 
                   {pane === 'routing' && <TriggersField value={triggers} onChange={setTriggers} />}
 

@@ -191,12 +191,43 @@ def _is_safe_env_key(key: str) -> bool:
     return platform_compat.env_key_allowed(key, _SAFE_ENV_KEYS)
 
 
+#: Locale forced onto the INDEX-ORIGINATED clone (:func:`anonymous_git_env`) —
+# the only clone whose stderr feeds the credential-posture classifier
+# (:func:`_git_output_is_auth_shaped`). ``_SAFE_ENV_KEYS`` passes the operator's
+# ``LANG``/``LC_ALL`` through to the child, so git would localize its client-side
+# ``fatal: Authentication failed`` message on a non-English host — and the STRICT
+# English-only marker allowlist would then miss, silently dropping the
+# credential-posture hint for the exact credential-blocked owner it exists to
+# help. Pinning ``LC_ALL`` (which wins over ``LANG`` and any narrower ``LC_*``)
+# AFTER the ``os.environ`` copy makes that classifier's input deterministic
+# English regardless of the operator locale. The value is a platform-appropriate
+# UTF-8 locale — always English message text with UTF-8 decoding of any path
+# bytes — because there is no single name valid on both libcs: ``C.UTF-8`` is the
+# always-present UTF-8 locale on glibc/musl (Linux) but is NOT a valid BSD-libc
+# locale on macOS, where an explicitly-set invalid ``LC_ALL`` makes ``setlocale``
+# fall to C/ASCII AND suppresses CPython's PEP 538 coercion, so a child reading
+# non-ASCII git output raises ``UnicodeDecodeError``. macOS ships ``en_US.UTF-8``
+# in its base locale set, so Darwin uses that (mirroring
+# :func:`kiro_crew.service.common` for the same reason). This is a
+# location/format hint, never a credential, so it does not weaken any
+# suppression in :func:`anonymous_git_env`. It is pinned ONLY there, not in
+# :func:`minimal_env`, whose subprocesses never reach the classifier.
+_GIT_CLONE_LOCALE = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
+
+
 def minimal_env(**extra: str) -> dict[str, str]:
     """Build a minimal environment dict from the current process env.
 
     Only passes through safe keys (PATH, HOME, SSH_AUTH_SOCK, etc.)
     plus any explicit *extra* overrides.  Used by both registry install
     and route-level uninstall handlers.
+
+    The operator's ``LANG``/``LC_ALL`` are passed through unchanged: this env
+    is NOT read by the credential-posture classifier (that runs only on the
+    index-originated path, which uses :func:`anonymous_git_env`), so pinning a
+    locale here would only degrade the many other ``minimal_env`` subprocesses
+    (pip installs, app backends, lifecycle scripts, …) for no classifier
+    benefit — and ``C.UTF-8`` is invalid on macOS BSD libc.
     """
     env = {k: v for k, v in os.environ.items() if _is_safe_env_key(k)}
     env.update(extra)
@@ -271,6 +302,11 @@ def anonymous_git_env(**extra: str) -> dict[str, str]:
     # If a trusted-host remote is nonetheless SSH, force batch mode with no
     # identity/agent so it can't silently authenticate as the gateway.
     env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none"
+    # Pin the locale (over any operator LANG/LC_ALL from os.environ) so git's
+    # client-side failure text stays English for the credential-posture
+    # classifier — see :data:`_GIT_CLONE_LOCALE`. A benign format hint, not a
+    # credential, so it preserves every suppression above.
+    env["LC_ALL"] = _GIT_CLONE_LOCALE
     env.update(extra)
     return env
 
@@ -1764,6 +1800,8 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
         "author",
         "tags",
         "highlights",
+        "useCases",
+        "configuration",
         "license",
         "minKiroCrewVersion",
     ):
@@ -2839,6 +2877,35 @@ async def list_registry() -> list[dict[str, Any]]:
     )
 
 
+def _catalog_installable_names() -> set[Any]:
+    """Names the catalog can install, from a FRESH fetch -- never the local cache.
+
+    ``list_catalog_rows`` reads the cache under the data home, which is
+    agent-writable. That is harmless while a cached row only re-dresses a row that
+    exists anyway -- the posture ``annotate`` already documents -- and NOT harmless
+    if a cached row could CREATE a listed row: a planted name would render with
+    official provenance and deduplicate the real same-named external row out of the
+    listing, so a consent prompt would describe an official app while the name grant
+    it produces installs the external one.
+
+    So the decision to LIST a catalog-only ``git`` name is authorised from the
+    fetched document and never from the cache. ``fetch_inventory_entries`` is the
+    only source allowed to materialise inventory, and it honours the module's
+    failure memory, so an outage costs a refusal rather than a fresh timeout on
+    every listing.
+
+    Returns an empty set on ANY failure, which degrades the storefront to the seed's
+    names -- the listing this path produced before the catalog could supply
+    coordinates. A store listing must never fail because the catalog is unreachable.
+    """
+    try:
+        entries = official_catalog.fetch_inventory_entries()
+        return {row.get("name") for row in official_catalog.inventory(entries)}
+    except Exception:  # noqa: BLE001 - degrade to the seed, never 500 the store
+        logger.warning("cannot confirm the catalog's install coordinates", exc_info=True)
+        return set()
+
+
 async def list_catalog_apps() -> list[dict[str, Any]]:
     """Store rows built from the published catalog, enriched and trust-stamped.
 
@@ -2847,13 +2914,16 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     published document's list and display copy. An empty result means the catalog
     was unavailable, and the caller falls back to ``list_registry`` offline.
 
-    Install coordinates stay with the seed: the catalog is trusted only as far as
-    TLS, so a ``git`` row is kept only when the seed or an external registry also
-    names it, and it carries no clone URL of its own — install resolves the seed
-    entry by name. A catalog-only ``git`` name renders nothing until it is
-    installable. ``verified`` stays ``False`` for non-builtin rows until the
-    catalog signature is checked, so this path never mints the first-party badge
-    from a document trusted only as far as TLS.
+    Install coordinates are the CATALOG's when it pins them: a ``git`` row is kept
+    when the seed or an external registry names it, or when the catalog itself
+    supplies validated pinned coordinates for it -- the same resolution
+    ``inventory_for_install`` performs on the install path. Gating the listing on
+    the seed alone made the two disagree, so a published app stayed invisible in
+    the store until a release shipped a new seed -- the release-per-app cost
+    ``inventory`` exists to remove. The row still carries no clone URL of its own;
+    install resolves the coordinates by name. ``verified`` stays ``False`` for
+    non-builtin rows until the catalog signature is checked, so this path never
+    mints the first-party badge from a document trusted only as far as TLS.
 
     User-configured external registries (``config.registries``) are appended here
     too, through the same ``_append_external_registry_apps`` merge site
@@ -2877,6 +2947,21 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     # `git` row filtered out here for not being installable yet, whose name
     # install still resolves by.
     reserved_names: set[Any] = {row.get("name") for row in rows} | installable_names
+    # A `git` row the seed does not name is STILL installable when the catalog
+    # pins it -- that is exactly what `inventory_for_install` resolves on the
+    # install path. Asking only the seed made the two resolvers disagree: install
+    # accepted a catalog-only row while the storefront dropped it, so a published
+    # app was unlistable, and therefore undiscoverable, until a release shipped a
+    # new seed.
+    #
+    # Only paid when it can change the answer. With every `git` row already seeded
+    # the fetch cannot unlock anything, so the storefront's hot path keeps costing
+    # one cached read.
+    if any(
+        row.get("source", {}).get("type") == "git" and row.get("name") not in installable_names
+        for row in rows
+    ):
+        installable_names |= await asyncio.to_thread(_catalog_installable_names)
     rows = [
         row
         for row in rows
@@ -3756,8 +3841,10 @@ async def _git_fetch_commit(
             return {
                 "ok": False,
                 "name": dest.name,
-                "error": "destination_not_a_checkout",
-                "message": (
+                # Human sentence in `error`, machine slug in `code`: the install
+                # banner renders `result.error`, never `result.message`.
+                "code": "destination_not_a_checkout",
+                "error": (
                     "The destination exists but is not a git checkout. Remove or fix it "
                     "manually and retry the install."
                 ),
@@ -3833,6 +3920,97 @@ async def _git_fetch_commit(
             await asyncio.to_thread(platform_compat.rmtree_force, dest)
 
 
+# Auth/permission failure classes on the clone-failure surface. The clone
+# subprocess merges stderr into stdout (``stderr=STDOUT``), so this classifier
+# sees git's auth-failure text. Kept as a STRICT allowlist of known
+# auth-refusal phrasings so the credential-posture remedy ("private app repos
+# must live inside the registry repo") only fires when withheld credentials
+# are a plausible cause — an owner who hits a typo'd branch or a DNS blip must
+# NOT be told to restructure their repositories. Matched case-insensitively.
+_GIT_AUTH_FAILURE_MARKERS = (
+    # SSH credential refusal ONLY. The bare token "permission denied" also
+    # appears in a LOCAL filesystem error — an unwritable clone destination
+    # emits `fatal: could not create work tree dir '…': Permission denied` —
+    # so matching it mislabels a disk-permission failure as withheld remote
+    # credentials and shows the "move the repo inside the registry" hint on an
+    # error that has nothing to do with credentials. SSH's real auth-refusal
+    # wording always carries the method parenthetical (`git@host: Permission
+    # denied (publickey).`, also `(publickey,password)` /
+    # `(publickey,keyboard-interactive)`), which a local errno `Permission
+    # denied` never has — so anchor on `permission denied (publickey` (open
+    # paren, no close, to catch every comma-separated method list).
+    "permission denied (publickey",
+    "authentication failed",
+    "could not read username",
+    "could not read password",
+    "access denied",
+    "fatal: authentication",
+    "terminal prompts disabled",
+    "invalid username or password",
+)
+
+# Known NON-auth failure classes, mapped to a fixed derived label. This is an
+# allowlist emitting a CONSTANT string per class — never a slice of raw git
+# output — so no credential-bearing or path-bearing stderr can reach the
+# banner (PR-1418 lesson: free-text stderr passthrough cannot be closed by
+# shape enumeration). Matched case-insensitively; first match wins.
+_GIT_FAILURE_CLASS_LABELS: tuple[tuple[str, str], ...] = (
+    ("could not resolve", "host could not be resolved"),
+    ("connection timed out", "the connection timed out"),
+    ("connection refused", "the connection was refused"),
+    ("network is unreachable", "the network was unreachable"),
+    ("remote branch", "the requested branch does not exist"),
+    # Anchored on git's own ref-error phrasing ("couldn't find remote ref …",
+    # "remote ref … does not exist"), NOT the bare token "does not exist": that
+    # substring also appears in unrelated failures (e.g. a path/pathspec error),
+    # and matching it would mislabel them "the requested ref does not exist".
+    # "remote ref" occurs only in git's missing-ref messages, so it stays a
+    # precise ref-error signal.
+    ("remote ref", "the requested ref does not exist"),
+    # Anchored on git/curl/(open|gnu)tls TLS-error phrasing, NOT the bare token
+    # "ssl": that substring also appears in a repo URL (e.g. cloning
+    # github.com/openssl/openssl, whose stderr echoes the URL), and matching it
+    # would mislabel an ordinary auth/not-found failure "a TLS/SSL error
+    # occurred" — the exact false-positive class this table guards against.
+    # These phrases occur in genuine TLS handshake/verification errors
+    # ("SSL certificate problem …", "SSL routines:…", "gnutls_handshake()
+    # failed", "TLS handshake failed", "Unsupported SSL backend 'schannel'")
+    # and never in a normal repo URL path segment. Deliberately no bare "ssl_"
+    # anchor: a repo path like ".../ssl_utils" would match it. Likewise the
+    # gnutls anchor carries git's full symbol "gnutls_handshake" rather than the
+    # bare library name, so cloning github.com/gnutls/gnutls (whose stderr
+    # echoes the URL) is not mislabeled a TLS error.
+    ("ssl certificate", "a TLS/SSL error occurred"),
+    ("ssl routines", "a TLS/SSL error occurred"),
+    ("ssl backend", "a TLS/SSL error occurred"),
+    ("gnutls_handshake", "a TLS/SSL error occurred"),
+    ("tls handshake", "a TLS/SSL error occurred"),
+)
+
+
+def _git_output_is_auth_shaped(text: str) -> bool:
+    """Whether *text* matches a known auth/permission failure class.
+
+    Strict allowlist — see :data:`_GIT_AUTH_FAILURE_MARKERS`. Never echoes
+    *text*; returns only a boolean.
+    """
+    low = text.lower()
+    return any(marker in low for marker in _GIT_AUTH_FAILURE_MARKERS)
+
+
+def _redacted_git_failure_class(text: str) -> str:
+    """A fixed, derived label for a known non-auth failure class, or ``""``.
+
+    Returns a CONSTANT allowlisted phrase — never a slice of *text* — so no
+    credential-bearing or path-bearing subprocess output reaches the banner.
+    """
+    low = text.lower()
+    for marker, label in _GIT_FAILURE_CLASS_LABELS:
+        if marker in low:
+            return label
+    return ""
+
+
 async def _git_clone_or_pull(
     git_url: str,
     branch: str,
@@ -3882,8 +4060,13 @@ async def _git_clone_or_pull(
         log_lines.append(f"Refusing clone: host of {git_url!r} is not a trusted forge/registry")
         return {
             "ok": False,
-            "error": "untrusted_clone_host",
-            "message": "Refusing to clone from an untrusted host (not a public forge or configured registry).",
+            # Human sentence in `error`, machine slug in `code`: the install
+            # banner renders `result.error`, never `result.message`.
+            "code": "untrusted_clone_host",
+            "error": (
+                "Refusing to clone from an untrusted host "
+                "(not a public forge or configured registry)."
+            ),
         }
     # Track a moved-aside directory if we need to preserve the old checkout
     # during origin-mismatch re-clone (delete-after-success pattern).
@@ -4003,8 +4186,10 @@ async def _git_clone_or_pull(
                 return {
                     "ok": False,
                     "name": dest.name,
-                    "error": "stale_clone_not_removed",
-                    "message": (
+                    # Human sentence in `error`, machine slug in `code`: the
+                    # install banner renders `result.error`, never `.message`.
+                    "code": "stale_clone_not_removed",
+                    "error": (
                         "A checkout on the wrong branch is present and could not be "
                         "moved aside. Remove it manually and retry the install."
                     ),
@@ -4053,8 +4238,10 @@ async def _git_clone_or_pull(
                 return {
                     "ok": False,
                     "name": dest.name,
-                    "error": "existing_checkout_not_moved_aside",
-                    "message": (
+                    # Human sentence in `error`, machine slug in `code`: the
+                    # install banner renders `result.error`, never `.message`.
+                    "code": "existing_checkout_not_moved_aside",
+                    "error": (
                         "The existing app checkout could not be moved aside, so a "
                         "pinned install cannot be performed safely. Remove or move it "
                         "manually and retry the install."
@@ -4173,9 +4360,11 @@ async def _git_clone_or_pull(
         # the next install finds `dest/.git` present with a matching origin and
         # takes the fast-forward branch instead -- `git pull` in a repo the clone
         # never finished, which fails, so every retry of that install fails too.
+        clone_output = ""
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_CLONE_TIMEOUT)
-            log_lines.append(stdout.decode(errors="replace").strip())
+            clone_output = stdout.decode(errors="replace").strip()
+            log_lines.append(clone_output)
         except asyncio.TimeoutError:
             await _kill_process_group(proc)
             await asyncio.to_thread(platform_compat.rmtree_force, dest)
@@ -4190,24 +4379,70 @@ async def _git_clone_or_pull(
                 # The clone ran credential-free (anonymous_git_env + strict
                 # sandbox) because the repo URL came from an external registry
                 # index whose repo differs from the registry URL, so owner
-                # credentials were withheld (confused-deputy defense). A
-                # private sibling repo therefore fails to clone. Tell the owner
-                # the cause and the remedy instead of a bare "git clone failed".
-                # Human sentence in `error`, machine slug in `code`: the install
-                # banner renders `result.error`, never `result.message`.
+                # credentials were withheld (confused-deputy defense). A private
+                # sibling repo therefore fails to clone. BUT the credential-
+                # posture remedy ("private app repos must live inside the
+                # registry repo") is only honest when a withheld credential is a
+                # plausible cause: gate it on an auth-shaped failure class. A
+                # typo'd branch, a DNS blip, or a deleted public repo returns the
+                # bare honest failure instead — being told to restructure
+                # repositories for a transient error is the misleading-remedy
+                # defect this gate closes.
+                #
+                # No raw clone output ever reaches the banner: the classifiers
+                # return only booleans, and the appended failure class is a
+                # CONSTANT allowlisted label, so credential-bearing or path-
+                # bearing stderr cannot leak (PR-1418 lesson).
+                if _git_output_is_auth_shaped(clone_output):
+                    remedy_lead = "so owner credentials are withheld"
+                elif "repository not found" in clone_output.lower():
+                    # A private repo the caller cannot see reads as "repository
+                    # not found", so on this credential-free clone a withheld
+                    # credential is a *possible* (not certain) cause: keep the
+                    # hint, softened to "a likely cause". Deliberately NARROW —
+                    # a *branch* not found ("Remote branch X not found") is a
+                    # definite typo, not a posture signal, so the bare token
+                    # "not found" is excluded.
+                    remedy_lead = "so a likely cause is that owner credentials are withheld"
+                else:
+                    remedy_lead = ""
+                if remedy_lead:
+                    # Human sentence in `error`, machine slug in `code`: the
+                    # install banner renders `result.error`, never `.message`.
+                    return {
+                        "ok": False,
+                        "name": dest.name,
+                        "code": "git_clone_failed_no_credentials",
+                        "error": (
+                            "Git clone failed (cloned without credentials because "
+                            "this app's repo URL differs from the registry URL, "
+                            f"{remedy_lead}). Private app repos must live inside "
+                            "the registry repo — see the monorepo layout in "
+                            "docs/app-kit/publishing-guide.md."
+                        ),
+                    }
+                # Not auth-shaped: bare honest failure, with the redacted
+                # (allowlisted, constant) failure class when one is recognized.
+                failure_class = _redacted_git_failure_class(clone_output)
+                if failure_class:
+                    return {
+                        "ok": False,
+                        "name": dest.name,
+                        "code": "git_clone_failed",
+                        "error": f"Git clone failed: {failure_class}.",
+                    }
                 return {
                     "ok": False,
                     "name": dest.name,
-                    "code": "git_clone_failed_no_credentials",
-                    "error": (
-                        "Git clone failed (cloned without credentials because "
-                        "this app's repo URL differs from the registry URL, so "
-                        "owner credentials are withheld). Private app repos must "
-                        "live inside the registry repo — see the monorepo layout "
-                        "in docs/app-kit/publishing-guide.md."
-                    ),
+                    "code": "git_clone_failed",
+                    "error": "git clone failed",
                 }
-            return {"ok": False, "name": dest.name, "error": "git clone failed"}
+            return {
+                "ok": False,
+                "name": dest.name,
+                "code": "git_clone_failed",
+                "error": "git clone failed",
+            }
         clone_succeeded = True
         return None
     finally:
@@ -4987,6 +5222,31 @@ def _report_retained_stale_checkouts(
         logger.info("Retained stale checkout: %s", stale)
 
 
+async def _retained_startup_refusal(
+    name: str, log_lines: list[str]
+) -> dict[str, Any] | None:
+    """Return a retryable refusal while old-version startup code remains live."""
+    # Deferred to avoid registry -> hooks_integration -> manager import cycles at
+    # module load. The dispatcher exists only in the gateway process; without it
+    # there is no in-process retained startup task to own.
+    from kiro_crew.apps.hooks_integration import stop_retained_startup_hooks
+
+    if await stop_retained_startup_hooks(name, bounded=True):
+        return None
+    message = (
+        f"cannot reinstall {name!r} while its timed-out startup hook is still "
+        "running; retry after it exits"
+    )
+    log_lines.append(message)
+    return {
+        "ok": False,
+        "name": name,
+        "error": message,
+        "code": "startup_hook_still_running",
+        "retryable": True,
+    }
+
+
 async def install_from_registry(
     name: str,
     log_lines: list[str] | None = None,
@@ -5218,6 +5478,10 @@ async def install_from_registry(
     is_self_managed = entry.get("resources") == "app"
     if log_lines is None:
         log_lines = []
+
+    startup_refusal = await _retained_startup_refusal(name, log_lines)
+    if startup_refusal is not None:
+        return startup_refusal
 
     # Validate minKiroCrewVersion if declared
     min_version = (manifest or {}).get("minKiroCrewVersion", "")
@@ -5689,6 +5953,15 @@ async def install_from_registry(
                 )
             if dep_result.missing:
                 log_lines.append(f"Missing commands: {', '.join(dep_result.missing)}")
+
+        # A clone/build/install script can take minutes. Recheck at the shared
+        # replacement boundary so startup execution that became retained during
+        # that work cannot overlap either managed file replacement or
+        # self-managed metadata replacement.
+        startup_refusal = await _retained_startup_refusal(name, log_lines)
+        if startup_refusal is not None:
+            outcome = startup_refusal
+            return outcome
 
         # Step 4: Register with KiroCrew
         if is_self_managed:

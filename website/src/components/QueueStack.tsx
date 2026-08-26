@@ -7,6 +7,7 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { i18nT } from '../i18n/t'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
 import { hasSubagentCompletionPrefix } from '../pages/chat/subagentCompletion'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** System-injected sub-agent completion deliveries waiting for the busy slot.
  *  These are NOT user messages: they must not be editable/cancellable (either
  *  would silently lose a finished agent's result) and rendering each as a
@@ -126,10 +127,8 @@ function EditInput({ initial, onCommit, onCancel }: {
         onKeyDown={e => {
           e.stopPropagation()
           if (e.key === 'Enter' && !e.shiftKey) {
-            // Rule 1: single-line input — decline the IME's committing Enter,
-            // nothing else. The commit's own emptiness check stays in commit().
-            if (ime.isComposing(e)) return
-            e.preventDefault(); commit()
+            // The commit's own emptiness check stays in commit().
+            if (ime.claimEnter(e)) commit()
           } else if (e.key === 'Escape') { e.preventDefault(); ime.reset(); cancel() }
         }}
         {...ime.bindComposition({ onBlur: commit })}
@@ -168,6 +167,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
    *  of overlapping it. */
   fuseBelow?: boolean
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [_expanded, setExpanded] = useState(false)
   const expanded = _expanded && messages.length > 1
   const [editingId, setEditingId] = useState<string | null>(null)

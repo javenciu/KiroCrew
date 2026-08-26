@@ -29,6 +29,11 @@ from kiro_crew.config.loader import (
 from kiro_crew.dashboard.handlers._shared import read_capped_response
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_divergence import (
+    UNREADABLE_TIMEOUT,
+    DivergenceUnreadable,
+    count_divergence,
+)
 from kiro_crew.platform.update_capability import (
     CHECK_DEFERRED,
     CHECK_FAILED,
@@ -59,6 +64,7 @@ from kiro_crew.platform.update_layout import detect_install_layout
 from kiro_crew.platform.update_layout import release_channel as _release_channel
 from kiro_crew.platform.update_layout import set_release_channel, wheel_update_command
 from kiro_crew.platform.update_provider import CommandProvider, resolve_provider
+from kiro_crew.platform_compat import reexec_python_module
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -98,6 +104,15 @@ _update_info: dict[str, object] = {
     #: it only did so at a release. Requiring both keeps that path firing no more
     #: often than it did while the verdict was version-only.
     "version_newer": False,
+    #: Commit distance from the tracked upstream, BOTH directions. A DIVERGED
+    #: checkout (ahead and behind at once) reports ``update_available: False``
+    #: exactly like a current one — offering it an update would feed the
+    #: destructive ``git reset --hard`` apply path commits to discard — so
+    #: without the counts the two states are indistinguishable on the wire and
+    #: the panel can only say "up to date" to a user who actually needs to
+    #: rebase or merge. 0/0 everywhere except a successful git-checkout check.
+    "commits_ahead": 0,
+    "commits_behind": 0,
     "error_code": None,
     "unavailable_reason": None,
     "remediation": None,
@@ -202,16 +217,33 @@ def status_update_fields() -> dict[str, object]:
     "never checked reads as current" bug at the last step.
     """
     available = _update_info.get("update_available")
+    ahead = _update_info.get("commits_ahead")
+    behind = _update_info.get("commits_behind")
     return {
         "update_available": available if isinstance(available, bool) else None,
         "update_can_apply": bool(_update_info.get("can_apply")),
         "update_check_status": str(_update_info.get("check_status") or CHECK_UNCHECKED),
         "update_command": remediation_command(_update_info),
+        # The candidate release's version string, so the proactive update popup
+        # can key its per-version snooze/skip without calling the check
+        # endpoint (which runs a full check per request). Empty until a check
+        # has found a newer build. The changelog text stays OFF this hot-path
+        # subset — consumers fetch it on demand.
+        "update_latest_version": str(_update_info.get("latest_version") or ""),
         "update_channel": str(_update_info.get("channel") or ""),
         # The panel needs WHO manages the update to speak honestly: a
         # command-managed host must not render the self-managed installer
         # instructions its policy exists to bypass.
         "update_managed_by": str(_update_info.get("managed_by") or ""),
+        # Commit distance for a git checkout, both directions, so the About
+        # panel's badge can tell DIVERGED (ahead and behind at once — reported
+        # as ``update_available: False`` because the apply path must never be
+        # offered local commits) from genuinely current without waiting for a
+        # manual check. 0/0 everywhere except a successful git-checkout check.
+        "update_commits_ahead": ahead if isinstance(ahead, int) else 0,
+        "update_commits_behind": behind if isinstance(behind, int) else 0,
+        "update_last_checked_at": _last_update_check or None,
+        "update_check_interval_secs": _UPDATE_CHECK_INTERVAL,
     }
 
 
@@ -378,6 +410,8 @@ def _set_update_info(**fields: object) -> None:
             "check_status": CHECK_UNCHECKED,
             "update_available": None,
             "version_newer": False,
+            "commits_ahead": 0,
+            "commits_behind": 0,
             "error_code": None,
             "unavailable_reason": None,
             "remediation": None,
@@ -633,40 +667,14 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
     # and the second is precisely the case with commits to lose. Only a checkout
     # that is behind and NOT ahead can be fast-forwarded, so only that one is
     # offered an update.
-    ahead = behind = 0
-    count = await asyncio.create_subprocess_exec(
-        "git",
-        "rev-list",
-        "--count",
-        "--left-right",
-        "HEAD...@{u}",
-        cwd=proj,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        count_out, _ = await asyncio.wait_for(count.communicate(), timeout=10)
-    except asyncio.TimeoutError:
-        try:
-            count.kill()
-        except ProcessLookupError:
-            pass
-        await count.communicate()
+    counts = await count_divergence(proj, "@{u}")
+    if isinstance(counts, DivergenceUnreadable):
+        # A check that could not count must not answer "you are on the latest
+        # version" — the unattended auto-apply reads this verdict.
+        logger.warning("Could not count commits against upstream in %s (%s)", proj, counts.reason)
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
         return
-    if count.returncode != 0:
-        logger.warning("Could not count commits against upstream in %s", proj)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
-    # ``--left-right`` with the three-dot range prints "<ahead>\t<behind>": left
-    # is reachable from HEAD only, right from the upstream only.
-    try:
-        ahead_text, behind_text = count_out.decode(errors="replace").split()
-        ahead, behind = int(ahead_text), int(behind_text)
-    except ValueError:
-        logger.warning("Unparseable rev-list count in %s", proj)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
+    ahead, behind = counts.ahead, counts.behind
     # Fast-forwardable: behind, and carrying nothing of its own to lose.
     can_fast_forward = behind > 0 and ahead == 0
 
@@ -771,6 +779,11 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
         changes=changes,
         latest_version=remote_version,
         version_newer=bool(version_newer),
+        # The raw distance travels with the verdict so a consumer can tell the
+        # diverged ``available: False`` from the current one and render "rebase
+        # or merge" instead of "up to date".
+        commits_ahead=ahead,
+        commits_behind=behind,
         check_status=CHECK_SUCCEEDED,
     )
 
@@ -1151,41 +1164,55 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
     return rc == 0
 
 
-async def _restart_gateway(state: DashboardState) -> None:
-    """Save state, close sessions, and exec the same Python process."""
-    state.push_update_progress("restarting", "Restarting server…")
-    exe = sys.executable
-    if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
-        state.push_update_progress("error", "Cannot restart: invalid Python executable path")
-        return
-    # circular import: kiro_crew.dashboard.chat imports from
-    # kiro_crew.dashboard.handlers (which re-exports this module), so this
-    # must stay inline to avoid an import cycle at module load.
-    from kiro_crew.dashboard.chat import save_all_slots_to_history
-    from kiro_crew.executors import subprocess_executor
+async def _restart_gateway(state: DashboardState) -> bool:
+    """Save state, close sessions, and exec the same Python process once.
 
+    Restart is a process-wide transition.  Two callers must never both drain
+    sessions and race separate successors for the same listener/lock, so the
+    claim is made synchronously before the first await.  A successful exec does
+    not return; a refused, failed, or test-double exec releases the claim.
+    """
+    if state._gateway_restart_in_progress:
+        logger.info("Gateway restart already in progress; coalescing duplicate request")
+        return False
+    state._gateway_restart_in_progress = True
     try:
-        # Offload the synchronous per-slot save (per-session lock + disk I/O)
-        # to the bounded subprocess_executor with a deadline: on the event loop
-        # a contended session raises HistoryLockTimeout and a wedged disk would
-        # block the restart, so a slot's final save must run off-loop and be
-        # time-bounded rather than stall (or silently drop) here.
-        await asyncio.wait_for(
-            asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), save_all_slots_to_history, state
-            ),
-            timeout=5.0,
-        )
-    except Exception:
-        logger.debug("History save before restart failed", exc_info=True)
-    try:
-        await state.sessions.close_all()
-    except Exception:
-        logger.debug("Session cleanup before restart failed", exc_info=True)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    await asyncio.sleep(0.5)
-    os.execv(exe, [exe, "-m", "kiro_crew"] + sys.argv[1:])
+        state.push_update_progress("restarting", "Restarting server…")
+        exe = sys.executable
+        if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+            state.push_update_progress("error", "Cannot restart: invalid Python executable path")
+            return False
+        # circular import: kiro_crew.dashboard.chat imports from
+        # kiro_crew.dashboard.handlers (which re-exports this module), so this
+        # must stay inline to avoid an import cycle at module load.
+        from kiro_crew.dashboard.chat import save_all_slots_to_history
+        from kiro_crew.executors import subprocess_executor
+
+        try:
+            # Offload the synchronous per-slot save (per-session lock + disk I/O)
+            # to the bounded subprocess_executor with a deadline: on the event loop
+            # a contended session raises HistoryLockTimeout and a wedged disk would
+            # block the restart, so a slot's final save must run off-loop and be
+            # time-bounded rather than stall (or silently drop) here.
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(), save_all_slots_to_history, state
+                ),
+                timeout=5.0,
+            )
+        except Exception:
+            logger.debug("History save before restart failed", exc_info=True)
+        try:
+            await state.sessions.close_all()
+        except Exception:
+            logger.debug("Session cleanup before restart failed", exc_info=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        await asyncio.sleep(0.5)
+        reexec_python_module("kiro_crew", sys.argv[1:])
+        return True
+    finally:
+        state._gateway_restart_in_progress = False
 
 
 async def api_update_apply(request: web.Request) -> web.Response:
@@ -1272,12 +1299,90 @@ async def api_update_apply(request: web.Request) -> web.Response:
             status=409,
         )
 
+    # Diverged precondition, enforced at the layer that owns the destructive
+    # action. The dashboard's own render-site guards can only cover the clients
+    # that ran a fresh check; a stale client (an Update button armed before the
+    # checkout gained local commits, a cached-changelog modal whose pre-apply
+    # check never re-ran) still POSTs here. Fetch FIRST, fail closed: the
+    # counts below read the remote-tracking refs, and refs from an old fetch
+    # can report behind=0 for a checkout whose remote has since moved — which
+    # would wave through the very state this guard exists to refuse.
+    fetch = await asyncio.create_subprocess_exec(
+        "git",
+        "fetch",
+        "--quiet",
+        cwd=proj,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.wait_for(fetch.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        try:
+            fetch.kill()
+        except ProcessLookupError:
+            pass
+        await fetch.communicate()
+        return web.json_response(
+            {
+                "error": "Timed out refreshing the remote before updating",
+                "code": "git_fetch_failed",
+            },
+            status=500,
+        )
+    if fetch.returncode != 0:
+        logger.warning("Update refused: pre-apply git fetch failed (rc=%s)", fetch.returncode)
+        return web.json_response(
+            {
+                "error": "Could not reach the remote to verify the update",
+                "code": "git_fetch_failed",
+            },
+            status=409,
+        )
+    counts = await count_divergence(proj, "@{u}")
+    if isinstance(counts, DivergenceUnreadable):
+        if counts.reason == UNREADABLE_TIMEOUT:
+            return web.json_response(
+                {"error": "Timed out checking upstream distance", "code": "git_read_failed"},
+                status=500,
+            )
+        # A failed or unparseable count alike: the guard cannot read the
+        # distance, so it refuses rather than waving the pull through.
+        logger.warning("Update refused: could not count commits against upstream in %s", proj)
+        return web.json_response(
+            {
+                "error": "Could not compare against upstream — check the tracked remote",
+                "code": "git_read_failed",
+            },
+            status=409,
+        )
+    ahead, behind = counts.ahead, counts.behind
+    if ahead > 0 and behind > 0:
+        logger.warning(
+            "Update refused: checkout diverged from upstream (%d ahead, %d behind)", ahead, behind
+        )
+        return web.json_response(
+            {
+                "error": "Checkout has diverged from its upstream — rebase or merge in a terminal",
+                "code": "checkout_diverged",
+                "commits_ahead": ahead,
+                "commits_behind": behind,
+            },
+            status=409,
+        )
+
     async def _apply() -> None:
         try:
             state.push_update_progress("pulling", "Pulling latest changes…")
+            # --ff-only makes the non-fast-forward classes unreachable at the
+            # action primitive itself, not just at the precondition above: a
+            # remote that moves in the window between the guard's fetch and
+            # this pull fails the pull instead of minting an unrequested merge
+            # commit into the user's branch.
             pull = await asyncio.create_subprocess_exec(
                 "git",
                 "pull",
+                "--ff-only",
                 cwd=proj,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1814,6 +1919,15 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
     """
     state: DashboardState = request.app["state"]
 
+    # Coalesce repeat clicks/requests BEFORE the response-flush sleep below.
+    # Without this latch, every POST creates a restart task and they all reach
+    # session drain together.  _restart_gateway has its own process-wide claim
+    # for callers from other routes; this task-level latch also avoids needless
+    # duplicate work on this public endpoint.
+    existing = state._gateway_restart_task
+    if existing is not None and not existing.done():
+        return web.json_response({"ok": True, "status": "restarting", "already_in_progress": True})
+
     # Reply BEFORE restarting. os.execv replaces the process image, so a restart
     # kicked off inline would tear down the connection mid-response and the
     # client could not distinguish "restarting" from "the request failed".
@@ -1827,6 +1941,13 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
             state.push_update_progress("failed", "Restart failed — check logs")
 
     task = asyncio.create_task(_restart())
+    state._gateway_restart_task = task
     state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
+
+    def _restart_done(done: asyncio.Task[None]) -> None:
+        state._background_tasks.discard(done)
+        if state._gateway_restart_task is done:
+            state._gateway_restart_task = None
+
+    task.add_done_callback(_restart_done)
     return web.json_response({"ok": True, "status": "restarting"})

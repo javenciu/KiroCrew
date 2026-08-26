@@ -293,7 +293,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # recorded, rendered through ``str()``. Nothing here is agent-influenced.
         "platform_compat.py::process_start_time",
         "apps/backend.py::_resolve_nvm_path",
-        "apps/backend.py::stop_app_backend",
         # py-spy attach for `kirocrew perf sample --pid`: fixed list-argv (no
         # shell=True), binary resolved via shutil.which rather than from input,
         # and every value is either a range-validated int (pid/seconds/rate) or a
@@ -546,6 +545,30 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # completion. No child process, and every payload is a literal in the test
         # file.
         "apps/builtins/issue_radar/tests/test_assignees.py::_await",
+        # NOT subprocess spawns: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``). These four TEST functions drive Code Review
+        # Sage's ``_save_runs`` coroutine to completion without a running loop --
+        # the registry write is a coroutine because its owner-only lockdown spawns
+        # ``icacls`` on Windows and so must be offloaded off the event loop (that
+        # real spawn is ``platform_compat.py::restrict_to_owner``, allowlisted
+        # below). No child process is created here and nothing is
+        # agent-influenced: every run record in these tests is a literal dict.
+        # Same classification as the other ``asyncio.run`` sites in this list.
+        "apps/builtins/code_review_sage/tests/test_backend_routes.py"
+        "::test_save_then_load_roundtrip",
+        "apps/builtins/code_review_sage/tests/test_backend_routes.py"
+        "::test_orphaned_running_becomes_interrupted_on_load",
+        "apps/builtins/code_review_sage/tests/test_backend_routes.py" "::test_runs_file_is_0600",
+        "apps/builtins/code_review_sage/tests/test_backend_routes.py"
+        "::test_the_lockdown_never_runs_on_the_event_loop",
+        # Same construct and classification: these two drive ``_save_runs`` to prove
+        # the registry write no longer targets a predictable ``runs.json.tmp`` that a
+        # prompt-injected worker could pre-plant a symlink at. The pre-planted path is
+        # built by the test itself, so nothing here is agent-influenced either.
+        "apps/builtins/code_review_sage/tests/test_backend_routes.py"
+        "::test_a_planted_tmp_symlink_is_not_followed",
+        "apps/builtins/code_review_sage/tests/test_backend_routes.py"
+        "::test_the_predictable_tmp_name_is_never_used",
         # md-notebook shells out to the real git binary rather than a pure-Python
         # implementation, because a server refuses a push from the shallow clone
         # isomorphic-git produces. The command is the literal "git"; the remote
@@ -602,6 +625,38 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         #     body (--input -), never argv.
         # No binary or cwd is agent-selected.
         "apps/builtins/issue_radar/backend/gitlab_client.py::_glab_run",
+        # Issue Radar Azure DevOps access — the az counterpart of _gh_run and
+        # _glab_run, benign for the same reasons, differing from both in WHERE a
+        # request body travels and from glab in how the host is constrained.
+        # ALL az calls funnel through ONE chokepoint, _az_run: a fixed
+        # `az devops invoke` list-argv (never shell=True). az supplies the host's
+        # OWN authenticated session, so it CANNOT be sandbox-routed (the sandbox
+        # would hide ~/.azure and break auth). As defense-in-depth WITHIN this
+        # benign classification, _az_run resolves az through the shared provider
+        # policy (refusing a binary owned by another user, a world-writable one,
+        # or one inside the agent-writable project tree) and passes a MINIMAL env.
+        # The agent-reachable inputs:
+        #   • the HOST — unlike glab's operator-configurable allowlist there is
+        #     exactly ONE legal value, the module constant dev.azure.com, because
+        #     on-premises Server is out of scope. It is re-resolved inside _az_run
+        #     on every call and anything else (including empty) is refused, so a
+        #     corrupted config entry cannot retarget the spawn;
+        #   • organization / project / repository — charset-validated per segment
+        #     by azure_client.parse_azure_repo_url at /connect, then passed as the
+        #     --org URL and as --route-parameters values; read routes additionally
+        #     gate on store.is_repo_connected, which matches on provider+host too.
+        #     `--detect false` is passed so az cannot instead infer an
+        #     organization from the cwd's git remote;
+        #   • the work item / pull request id — coerced via int() before the path;
+        #   • --area / --resource / --api-version — module constants selected by
+        #     the calling function, never caller-supplied text;
+        #   • write bodies AND every WIQL query string — sent as a request-body
+        #     FILE (--in-file), never on argv, because az devops invoke has no
+        #     stdin body option the way gh and glab do. The file is uniquely
+        #     named, created 0600, and unlinked in a finally, so a body is neither
+        #     visible in the process table nor left behind.
+        # No binary or cwd is agent-selected.
+        "apps/builtins/issue_radar/backend/azure_client.py::_az_run",
         "apps/builtins/design_tweak/backend/server.py::_h_pick_folder",
         "apps/builtins/design_tweak/backend/server.py::_lsof_fields",
         "apps/builtins/design_tweak/backend/server.py::_start_dev_proc",
@@ -638,9 +693,18 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # spelled out inline before, with the target read from sys.executable and
         # the repo from the operator-configured checkout. Sandboxing it now would
         # refuse a step every platform has always run unsandboxed.
-        "dep_sync.py::interpreter_version",
-        "dep_sync.py::installed_console_script_target",
-        "dep_sync.py::installed_package_origin",
+        #
+        # The three interpreter probes (interpreter_version,
+        # installed_package_origin, installed_console_script_target) share one
+        # fixed-argv helper, _probe_interpreter, which is where their single
+        # spawn now lives: `<target python> -I -X utf8 -c <fixed probe>` with a
+        # neutral cwd, so the answer describes the venv instead of the caller.
+        # The doctor's venv deps check (cli_doctor._venv_deps_ok) and the STT
+        # scripts-dir probe (transcribe._python3_bin_dir) route through the
+        # same helper for the same reason: their argv is equally fixed, and an
+        # unisolated `python -c` would let a decoy on the caller's
+        # PYTHONPATH/CWD answer for the interpreter under test.
+        "dep_sync.py::_probe_interpreter",
         "dep_sync.py::sync",
         "dep_sync.py::sync_or_reinstall",
         # Foreground last-resort restart (Make Live on hosts with no drivable
@@ -701,14 +765,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # created; the sole input is the operator-typed app name.
         "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``), used to drive the async Discord
+        # privileged-intent probe from the loop-less doctor path. No child
+        # process is created: the probe is one HTTPS GET to Discord's own
+        # ``/oauth2/applications/@me`` with a bot token read from the operator's
+        # own credential store, and every failure is folded into its result. Same
+        # classification as ``cli_doctor.py::_doctor`` above.
+        "cli_doctor.py::_discord_intent_grants",
         "cli_doctor.py::_doctor_mcp_tools",
-        # Read-only diagnostic for the KAS backend section: ``<kiro-cli> acp
-        # --help`` with a fully constant argv tail — the binary comes from
-        # ``shutil.which(KIRO_CLI_BIN)`` (a fixed name, never agent-supplied)
-        # and the two trailing tokens are module constants. Operator-invoked
-        # doctor, 15s-capped, help text only — no session, no mutation. Same
-        # classification as the other fixed-argv doctor probes.
-        "cli_doctor.py::_kas_engine_flag_supported",
         # Read-only diagnostic for the Source Checkout section: ``git -C <repo>
         # rev-parse/rev-list`` with a hardcoded argv whose only variable is the
         # install's own source directory (derived from the package's module
@@ -741,6 +806,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_server.py::_logs_cmd",
         "cli_server.py::_spawn_detached_gateway",
         "cli_server.py::_update",
+        # The agent-only config refresh extracted from _update: a fixed argv
+        # (`<this interpreter> -m kiro_crew setup --agent-only`) built from
+        # sys.executable plus literals, cwd from the detected install layout —
+        # no shell, no PATH lookup, nothing agent-influenced. stdin=DEVNULL
+        # and TimeoutExpired handling are pinned by
+        # test_update_agent_refresh.py.
+        "cli_server.py::_refresh_agent_config",
+        # (_divergence_verdict removed — its counting now delegates to the
+        # git_divergence module, allowlisted below, and spawns nothing itself.)
         "cli_server.py::_update_wheel",
         "cli_setup.py::_setup_electron",
         # Cursor Motion overlay renderer: `<this interpreter> -m
@@ -795,6 +869,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # classification as the other ``asyncio.run`` sites in this list.
         "connections/l0_probe.py::_run_record",
         "connections/l0_probe.py::main",
+        # Same classification as l0_probe: a CLI entry point driving an
+        # in-process aiohttp sweep with asyncio.run.
+        "connections/l1_smoke.py::main",
         "cloud/source.py::_git_tracked_files",
         "cloud/source.py::_tracked_tree_is_dirty",
         "cloud/source.py::_use_git_archive",
@@ -871,9 +948,22 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "frontend.py::_npm_build_and_stage_locked",
         "frontend.py::build_frontend_async",
         "frontend.py::build_frontend_sync",
+        # The shared ahead/behind divergence count: a read-only ``git rev-list
+        # --count --left-right HEAD...<upstream>`` fixed list-argv (no shell)
+        # run against the install's own checkout. Callers pass the repo path
+        # (KIROCREW_PROJECT_DIR, an operator environment value) and the
+        # upstream spelling — a literal ``@{u}`` or ``origin/<branch>`` where
+        # <branch> is git's own ``rev-parse --abbrev-ref HEAD`` output sitting
+        # after the ``origin/`` prefix so it cannot become an option. Nothing
+        # agent-supplied, nothing written; same trust profile as the update
+        # surfaces it serves (``_check_git_checkout`` / ``api_update_apply`` /
+        # ``_update`` above). The papyrus status caller does NOT spawn through
+        # these: it reuses only the argv/parse primitives and keeps its own
+        # sandbox-routed runner.
+        "git_divergence.py::count_divergence",
+        "git_divergence.py::count_divergence_sync",
         "instances/diagnostics.py::_run_ok",
         "instances/diagnostics.py::_run_stdout",
-        "instances/ssh_tunnel_manager.py::_ps_lines",
         "instances/ssh_tunnel_manager.py::start",
         "instances/token_mint.py::mint_remote_token",
         "instances/token_mint.py::run_remote_kirocrew",
@@ -891,13 +981,16 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",
-        # Read-only `git config` / `git ls-remote --get-url` resolving which
-        # remote the update would fetch from, for the `updates.source` pin. Fixed
-        # list-argv (no shell=True), no agent input: the branch lands mid-key
+        # The update seam's one read-only git chokepoint: `git config` (the
+        # `updates.source` pin's remote, the repo-driver probe, and which remote a
+        # branch tracks) and `git ls-remote --get-url`. Fixed list-argv (no
+        # shell=True), no agent input: the branch lands mid-key
         # (`branch.<x>.remote`) so it cannot lead with a dash, and the remote
         # name — which is read out of git config and COULD — is passed after
         # `--`. Must NOT be sandboxed: it reads the real checkout's git metadata.
-        "platform/update_governance.py::_git",
+        # It does carry `git_neutralizer_env()`, so repo config cannot make these
+        # reads exec a program (`core.fsmonitor` and friends are pinned).
+        "platform/update_governance.py::_git_probe",
         # Read-only `git rev-parse --show-toplevel` deciding whether the install
         # root IS a working tree. Fixed list-argv (no shell=True); the only
         # variable is the path, which comes from KIROCREW_PROJECT_DIR — an
@@ -918,7 +1011,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "platform_compat.py::open_with_default_app",
         "platform_compat.py::_current_user_sid",
         "platform_compat.py::_posix_process_parent_map",
-        "platform_compat.py::find_listening_pids",
+        "platform_compat.py::find_port_listeners",
         "platform_compat.py::find_python_interpreter",
         "platform_compat.py::kill_pid",
         "platform_compat.py::kill_process_tree",
@@ -930,6 +1023,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # through the sandbox helper because sandbox imports platform_compat.
         "platform_compat.py::process_owner_uid",
         "platform_compat.py::process_matches",
+        # Same class as process_matches: a read-only process-attribute query
+        # (macOS ``ps -ww -o command= -p <pid>``; Linux reads /proc without
+        # spawning) whose only interpolated value is an int-guarded pid — the
+        # expected argv is compared IN PYTHON, never passed to the child. It is
+        # the strict identity check consulted before reclaiming a recorded
+        # forwarder pid, and cannot route through the sandbox helper because
+        # sandbox imports platform_compat.
+        "platform_compat.py::process_argv_matches_exact",
         # The single icacls chokepoint shared by restrict_to_owner (file shape)
         # and restrict_dir_to_owner (directory shape, inheritable grants). Both
         # public helpers delegate here, so this one entry covers the owner-only
@@ -954,7 +1055,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "pod/provision.py::_run",
         "pod/runtime.py::_git_worktrees",
         "pod/runtime.py::_run",
-        "pod/runtime.py::derive_port",
         "pod/runtime.py::recent_journal",
         "sandbox.py::_probe_sandbox_exec",
         "sandbox.py::_ssh_supports_accept_new",
@@ -1050,7 +1150,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apple_speech/__init__.py::inventory",
         "apple_speech/__init__.py::start",
         "apple_speech/__init__.py::transcribe",
-        "transcribe.py::_python3_bin_dir",
+        # (`transcribe.py::_python3_bin_dir` is absent: its scripts-dir probe
+        # routes through `dep_sync.py::_probe_interpreter`, so an entry here
+        # would be stale.)
         "transcribe.py::_run_whisper_cli",
         "transcribe.py::_transcribe_aws",
         # JSON-Schema ``pattern`` validation for MCP app→gateway tool-call args
@@ -1449,4 +1551,192 @@ def test_bundled_skill_assets_are_not_imported():
         "exempts:\n  " + "\n  ".join(sorted(offenders)) + "\n\nEither move the "
         "shared logic into a real module under src/kiro_crew (where the spawn "
         "audit reviews it), or drop the import."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Gateway spawn timeout discipline — issue #4210
+#
+# `slack/gateway.py` spawns children on the boot and auto-update paths. PR
+# #4049 established the discipline for a spawn that can time out: own process
+# group (`start_new_session` on POSIX), tree-kill + bounded reap on
+# TimeoutError AND on CancelledError. These two ratchets make the discipline
+# structural: the NEXT spawn added to the file cannot silently regress to an
+# abandoned-child-on-timeout, because the audit below fails until it carries
+# the same treatment.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_GATEWAY_REL = "slack/gateway.py"
+
+#: Functions that own the kill-the-tree + bounded-reap contract. The module
+#: helper lives in `platform/update_provider.py`; the two `_startup_child`
+#: methods are the boot-path equivalent (kill and reap split in two).
+_TREE_KILL_FUNCS = frozenset({"_kill_and_reap", "_kill_startup_child"})
+
+
+@functools.cache
+def _gateway_tree() -> ast.Module:
+    path = _SRC_ROOT / "slack" / "gateway.py"
+    return ast.parse(path.read_text(encoding="utf-8"), str(path))
+
+
+def _is_spawn_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith("create_subprocess_")
+    )
+
+
+def _handler_catches(handler: ast.ExceptHandler, name: str) -> bool:
+    """Whether *handler* names *name* (bare or attribute-qualified) explicitly.
+
+    A blanket ``except Exception`` deliberately does NOT count: the discipline
+    requires the timeout/cancel arm to be explicit so the kill is visibly tied
+    to the abandonment hazard, and `_auto_apply_update`'s outer
+    ``except Exception`` (which does not kill) must not satisfy this audit.
+    """
+    types = handler.type
+    if types is None:
+        return False
+    parts = types.elts if isinstance(types, ast.Tuple) else [types]
+    for part in parts:
+        if isinstance(part, ast.Name) and part.id == name:
+            return True
+        if isinstance(part, ast.Attribute) and part.attr == name:
+            return True
+    return False
+
+
+def _handler_kills(handler: ast.ExceptHandler, proc_name: str) -> bool:
+    """Whether *handler*'s body calls a tree-kill helper on *proc_name*."""
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        fname = (
+            fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+        )
+        if fname not in _TREE_KILL_FUNCS:
+            continue
+        if any(isinstance(a, ast.Name) and a.id == proc_name for a in node.args):
+            return True
+    return False
+
+
+def test_gateway_spawns_all_own_session():
+    """Every subprocess spawn in slack/gateway.py starts its own session.
+
+    `proc.kill()` signals only the direct child; without
+    ``start_new_session`` the process-group tree kill in the timeout/cancel
+    arms has no group of its own to address, so grandchildren survive the
+    kill and keep running (issue #4210).
+    """
+    missing: list[str] = []
+    spawns = 0
+    for node in ast.walk(_gateway_tree()):
+        if not _is_spawn_call(node):
+            continue
+        spawns += 1
+        if not any(kw.arg == "start_new_session" for kw in node.keywords):
+            missing.append(f"{_GATEWAY_REL}:{node.lineno}")
+    assert spawns >= 10, (
+        f"only {spawns} spawn sites found in {_GATEWAY_REL} — the audit's "
+        "spawn matcher no longer matches the file's spawn idiom; fix the "
+        "matcher rather than deleting the ratchet"
+    )
+    assert not missing, (
+        "Spawn(s) in slack/gateway.py without start_new_session — a timeout "
+        "kill would reach only the direct child, abandoning its descendants "
+        "(issue #4210):\n  " + "\n  ".join(missing) + "\n\nAdd "
+        "start_new_session=platform_compat.IS_POSIX to the spawn."
+    )
+
+
+def test_gateway_proc_waits_all_kill_on_timeout_and_cancel():
+    """Every ``wait_for(<proc>.communicate()|.wait())`` in slack/gateway.py
+    sits under explicit TimeoutError AND CancelledError arms that tree-kill
+    that proc.
+
+    Without the arm, the child is ABANDONED on timeout — the exception
+    propagates (or is swallowed) while the process keeps running with no
+    supervisor, which on the auto-update path means a `git reset` or
+    `kiro-cli update` still mutating the installation (issue #4210).
+    """
+    offenders: list[str] = []
+    audited = 0
+    for func in ast.walk(_gateway_tree()):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # Names assigned from a spawn IN THIS function. A proc received as a
+        # parameter (the reap helpers) is that caller's site, audited there.
+        proc_names = {
+            t.id
+            for stmt in ast.walk(func)
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Await)
+            and _is_spawn_call(stmt.value.value)
+            for t in stmt.targets
+            if isinstance(t, ast.Name)
+        }
+        if not proc_names:
+            continue
+        # Map each wait_for-on-a-proc to the Trys enclosing it in their body.
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(func):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        for node in ast.walk(func):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "wait_for"
+                and node.args
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Attribute)
+                and node.args[0].func.attr in ("communicate", "wait")
+                and isinstance(node.args[0].func.value, ast.Name)
+                and node.args[0].func.value.id in proc_names
+            ):
+                continue
+            audited += 1
+            proc_name = node.args[0].func.value.id
+            timeout_ok = cancel_ok = False
+            cursor: ast.AST | None = node
+            while cursor is not None and cursor is not func:
+                parent = parents.get(cursor)
+                if isinstance(parent, ast.Try) and cursor in ast.walk(parent):
+                    # Only count Trys where the wait sits in the BODY (an
+                    # already-handling arm re-waiting is the reap, not a site).
+                    in_body = any(
+                        cursor is stmt or cursor in ast.walk(stmt) for stmt in parent.body
+                    )
+                    if in_body:
+                        for handler in parent.handlers:
+                            if _handler_kills(handler, proc_name):
+                                if _handler_catches(handler, "TimeoutError"):
+                                    timeout_ok = True
+                                if _handler_catches(handler, "CancelledError"):
+                                    cancel_ok = True
+                cursor = parent
+            if not (timeout_ok and cancel_ok):
+                lacking = " and ".join(
+                    what
+                    for what, ok in (("TimeoutError", timeout_ok), ("CancelledError", cancel_ok))
+                    if not ok
+                )
+                offenders.append(
+                    f"{_GATEWAY_REL}:{node.lineno} ({func.name}: {proc_name}) lacks a "
+                    f"{lacking} arm that tree-kills the proc"
+                )
+    assert audited >= 10, (
+        f"only {audited} proc wait sites found in {_GATEWAY_REL} — the audit's "
+        "wait matcher no longer matches the file's idiom; fix the matcher "
+        "rather than deleting the ratchet"
+    )
+    assert not offenders, (
+        "wait_for on a spawned proc without kill+reap discipline (issue "
+        "#4210):\n  " + "\n  ".join(offenders) + "\n\nWrap the wait in explicit "
+        "TimeoutError and CancelledError arms that call _kill_and_reap (or the "
+        "startup-child kill/reap pair) on the proc before returning/re-raising."
     )

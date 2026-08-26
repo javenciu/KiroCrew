@@ -26,7 +26,7 @@ except ImportError:
     _resource = None  # type: ignore[assignment]  # Windows/non-POSIX
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
 from kiro_crew.executors import maintenance_executor
@@ -1629,6 +1629,51 @@ _SELF_PROTECTION_FLOOR_BY_ID: dict[str, str] = {
 }
 _SELF_PROTECTION_FLOOR_PATTERNS: frozenset[str] = frozenset(_SELF_PROTECTION_FLOOR_BY_ID.values())
 
+# Why a floor denial happened, in words, for the rules whose floor can fire on
+# input the catalog ``pattern`` provably does NOT match.
+#
+# The refusal's first line reports that pattern (see the floor branch in
+# ``is_denied``) so the reason and the SEL event still map back to a rule id.
+# That identifier is not an explanation, though, and for a floor hit it is a
+# misleading one: ``python -c "import kiro_crew"`` is denied by the argv floor,
+# while the pattern it names requires a ``token`` word the command does not
+# contain. A reader who trusts the line looks for the wrong thing — and the
+# refusal reason is now handed to the MODEL in-band on a tool deny
+# (``chat_runner._steer_policy_notice``), so a wrong explanation actively
+# misdirects the agent's next attempt rather than merely reading oddly in a log.
+#
+# Presentation only, on the refusal's SECOND line, which both consumers ignore:
+# ``RecoveryCard.tsx`` extracts the pattern with a per-line end-anchored regex
+# and the suite's ``_denied_by`` partitions on the first line's separator.
+_SELF_PROTECTION_FLOOR_NOTES: dict[str, str] = {
+    "credential-exfil-kirocrew-token": (
+        "Matched structurally on the command's argv, not by the pattern text above: "
+        "the product CLI is invoked to mint a dashboard token, or an inline "
+        "interpreter program imports it (an imported CLI can construct the token verb "
+        "itself, so the import is the gate and no 'token' word need appear)."
+    ),
+    "self-protection-kill": (
+        "Matched structurally on the command's argv, not by the pattern text above: "
+        "the command signals or kills this gateway's own process."
+    ),
+    "self-protection-restart": (
+        "Matched structurally on the command's argv, not by the pattern text above: "
+        "shell de-escaping resolves the command to a restart of this gateway."
+    ),
+    "self-protection-update": (
+        "Matched structurally on the command's argv, not by the pattern text above: "
+        "shell de-escaping resolves the command to a self-update."
+    ),
+    "self-protection-gateway-restart": (
+        "Matched structurally on the command's argv, not by the pattern text above: "
+        "shell de-escaping resolves the command to a gateway restart."
+    ),
+    "self-protection-cloud": (
+        "Matched structurally on the command's argv, not by the pattern text above: "
+        "shell de-escaping resolves the command to a destructive cloud operation."
+    ),
+}
+
 # The two INTERPRETER-payload rules.  They are ordinary regex-tier rules, but an
 # interpreter CONCATENATES adjacent string literals, so they are additionally matched
 # against a copy of the text with those joins collapsed.
@@ -2018,8 +2063,9 @@ def is_safe_user_regex(pattern: str) -> bool:
     reject/skip a pattern that fails this check so a catastrophic user regex can
     never freeze the synchronous PreToolUse gate.
 
-    The known-safe linearized aws flag run is stripped before the structural
-    check so the (harmless) built-in construct is never misflagged.
+    The known-safe aws flag runs are stripped before the structural check only
+    when the complete pattern is a built-in.  A user pattern wrapping the same
+    fragment receives no exemption.
 
     A pattern with a TOP-LEVEL alternation (``a|b``) is also rejected: it cannot
     be split on ``.*`` for the linear full-length fragment matcher, so it would
@@ -2033,7 +2079,11 @@ def is_safe_user_regex(pattern: str) -> bool:
         re.compile(pattern)
     except re.error:
         return False
-    scrubbed = pattern.replace(_DANGEROUS_AWS_FLAG_RUN, "").replace(_LINEARIZED_AWS_FLAG_RUN, "")
+    scrubbed = pattern
+    if pattern in BUILTIN_DENY_PATTERNS:
+        scrubbed = pattern.replace(_DANGEROUS_AWS_FLAG_RUN, "").replace(
+            _LINEARIZED_AWS_FLAG_RUN, ""
+        )
     if _redos_prone(scrubbed):
         return False
     return not _has_top_level_alternation(scrubbed)
@@ -4753,10 +4803,15 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     ".local/share/amazon-q",
     "Library/Application Support/kiro-cli",
     "Library/Application Support/amazon-q",
-    # Windows layout of the same stores (%APPDATA% defaults to
-    # ~/AppData/Roaming). This matcher is home-anchored, so a Roaming profile
-    # redirected outside the home directory is not covered — the default
-    # location is what agent file tools can reach by a fixed relative path.
+    # Windows layouts of the same stores. Current kiro-cli writes the local,
+    # non-roaming app-data directory (%LOCALAPPDATA% defaults to
+    # ~/AppData/Local); the Roaming entries cover layouts that used
+    # %APPDATA% (defaults to ~/AppData/Roaming). These matchers are
+    # home-anchored, so a profile redirected outside the home directory is not
+    # covered -- the default location is what agent file tools can reach by a
+    # fixed relative path.
+    "AppData/Local/kiro-cli",
+    "AppData/Local/amazon-q",
     "AppData/Roaming/kiro-cli",
     "AppData/Roaming/amazon-q",
 ]
@@ -4821,6 +4876,17 @@ _CREW_SECRET_LEAVES: list[str] = [
     # outside a home-relative entry; the default path is what ships and what an
     # agent would find.
     "workspace/md-notebook/pat",
+    # The WhatsApp channel's linked-device session store (whatsmeow's sqlite
+    # keys). It IS the credential: anything that can read it can act as the
+    # operator on WhatsApp, read every chat and send as them, with no second
+    # factor and nothing on the phone to notice. Owner-only file modes do not
+    # isolate another process running as the same UID, and a prompt-injected
+    # agent's fs_read is exactly that process, so it belongs behind the shared
+    # floor like every other credential store. Classified as the whole DIRECTORY
+    # so the WAL and SHM sidecars, which hold the same key bytes, are covered
+    # too. The channel's own client opens it directly rather than through this
+    # gate, so pairing keeps working.
+    "whatsapp",
     # The Notes builtin's vault registry. It is not a secret, but it stores each
     # vault's on-disk ``localPath``, which auto-sync trusts and runs ``git
     # add``/``commit``/``push`` against. A prompt-injected agent that could
@@ -4840,6 +4906,17 @@ _CREW_SECRET_LEAVES: list[str] = [
     "workspace/md-notebook/settings.json",
     "browser-cookies.txt",
     "playwright-storage-state.json",
+    # Per-session work ledgers (session_ledger.py). Not credentials, but each
+    # directory is one session's private work state, and the ledger's whole
+    # authorization model is "a session reaches only its OWN ledger" (the HTTP
+    # routes derive the target from the vetted caller identity). An agent's
+    # auto-approved file tools would bypass that boundary sideways — any
+    # session could read or corrupt any other session's ledger straight off
+    # disk. Unlike the transcript files beside it, the ledger has no
+    # legitimate file-tool reader: every legitimate access goes through the
+    # backend module, which opens paths directly rather than through this
+    # gate, so nothing breaks by fencing the whole subtree.
+    "ledger",
     # The optional Playwright extension token. It removes the browser-side approval
     # click for an attach, so a process that could read it could attach to the
     # operator's logged-in browser without them seeing a prompt. The gateway hands
@@ -4855,6 +4932,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     # dir is gated (like ``profiles``/``run``) so future trust-root material is
     # covered without a new entry. sel.py opens the key directly, not through
     # this gate.
+    #
+    # Spec Builder's decision record (``trust/spec-builder-decisions.json``) relies
+    # on that whole-directory gating. The app refuses a second answer for a decision
+    # it has recorded, so an agent able to write the file could erase an entry to
+    # make a settled decision answerable again, or forge one to lock a decision the
+    # user never answered. Gating the leaf alone was not enough: its parent under
+    # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
+    # path directly (as keystone writers must), so it would have followed the link.
     "trust",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
@@ -4980,6 +5065,37 @@ _CREW_SECRET_LEAVES: list[str] = [
     "token_signing.key",
     "refresh_chains.json",
     ".local_secret",
+    # Durable channel transport state: Teams' conversation -> serviceUrl and
+    # identity -> conversation maps, and Telegram's getUpdates cursor. Two shapes of
+    # the same control -- where a message GOES, and which messages are SEEN. Calling
+    # getUpdates with an offset is also the ack for everything below it, so an agent
+    # that could write that cursor would make the gateway skip every queued and
+    # future message, durably, past the restart that would otherwise clear it.
+    #
+    # Same class of control as ``workspace/md-notebook/vaults.json`` above: neither
+    # is a secret, both are PLUMBING. ``teams/transport.py`` resolves an explicit
+    # ``user:<upn>`` send target through the identity map, so an agent that could
+    # write it could point one operator's UPN at a different person's conversation
+    # and have the next cron result, subagent notice or ``send_message`` delivered
+    # there instead. The inbound path binds a ``serviceUrl`` to the JWT's own
+    # ``serviceurl`` claim and ``connector_host_allowed`` re-checks it wherever the
+    # Connector token is attached, but neither attestation survives PERSISTENCE,
+    # and no host check can tell one legitimate conversation id from another.
+    # Reading is fenced with writing because the file enumerates the operator's
+    # UPNs and the conversations they use.
+    #
+    # A DIRECTORY entry, not the file leaf, and that is the load-bearing part: a
+    # file leaf matches only its exact name, while ``atomic_write`` publishes
+    # through a ``tempfile.mkstemp`` sibling (``tmpXXXXXXXX.tmp``) in the same
+    # parent. With the store loose in the data-home root an agent watching that
+    # directory could overwrite the temp file in the window before the rename and
+    # have the rename publish its own routing. A directory entry covers every
+    # child, random temp names included. (``trust``, ``profiles`` and
+    # ``cron-history`` above are directories for the same reason among others.)
+    # ``ServiceUrlStore`` and ``TelegramClient`` open their paths directly, not
+    # through this gate, so
+    # proactive routing across a restart is unaffected.
+    "routing",
     # Inbound-webhook credential store directory. It holds the bearer HASHES and
     # the recoverable HMAC signing secrets for /api/hooks/agent, which is on the
     # dashboard-auth bypass list because it authenticates itself. An agent that
@@ -5430,6 +5546,9 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # by their remainder.
     appdata_var = (
         r"(?:%APPDATA(?::[^%\s]*)?%"
+        # cmd.exe delayed expansion (`cmd /V:ON`): `!APPDATA!` names the same
+        # location as `%APPDATA%`, with the same expansion modifiers.
+        r"|!APPDATA(?::[^!\s]*)?!"
         rf"|{re.escape('$env:APPDATA')}"
         rf"|{re.escape('${env:APPDATA}')})"
     )
@@ -5443,6 +5562,32 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     appdata_sensitive_path = (
         rf"{appdata_var}(?:{win_sep}\.\.{win_sep}Roaming)*"
         rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
+    )
+    # ``%LOCALAPPDATA%`` is the same shape one directory over: it points INTO
+    # ``AppData\Local``, so ``%LOCALAPPDATA%\kiro-cli\data.sqlite3`` names a
+    # fenced store without the ``AppData\Local`` text the home-anchored branch
+    # requires. Without this branch the shell tier would not cover the very
+    # spelling that names the CURRENT kiro-cli store on Windows, while the
+    # tuple in ``kiro_usage_api._CLI_SQLITE_DBS`` treats that store as a trust
+    # anchor — the fence the trust claim rests on must hold at this tier too.
+    localappdata_var = (
+        r"(?:%LOCALAPPDATA(?::[^%\s]*)?%"
+        # cmd.exe delayed expansion (`cmd /V:ON`): `!LOCALAPPDATA!` names the
+        # same location as `%LOCALAPPDATA%`, with the same expansion modifiers.
+        r"|!LOCALAPPDATA(?::[^!\s]*)?!"
+        rf"|{re.escape('$env:LOCALAPPDATA')}"
+        rf"|{re.escape('${env:LOCALAPPDATA}')})"
+    )
+    localappdata_remainders = "|".join(
+        win_gsep.join(re.escape(part) for part in d.split("/")[2:])
+        for d in _SENSITIVE_HOME_DIRS
+        if d.startswith("AppData/Local/")
+    )
+    # ``%LOCALAPPDATA%`` ends in ``Local`` by definition, so ``\..\Local``
+    # right after it is this anchor's canonical no-op.
+    localappdata_sensitive_path = (
+        rf"{localappdata_var}(?:{win_sep}\.\.{win_sep}Local)*"
+        rf"{win_gsep}(?:{localappdata_remainders})(?:{win_sep}|\s|$|['\"])"
     )
     # Windows-native spelling of the write-protected leaves. The POSIX leaf
     # branch above anchors on ``/`` separators, so on Windows the resolved home
@@ -5551,13 +5696,15 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
         # (4) Windows-native spelling, verb-independent (same token anchor):
         # covers quoted backslash paths AND embedded-script literals that the
-        # tokenizing passes cannot see. (5) the %APPDATA% alias of the fenced
-        # Roaming stores. (6) the write-protected leaves in that same native
-        # spelling, which branch (3) cannot see. (7) the distinctive leaves as a
-        # bare path SEGMENT, with no anchor at all, because branches (3) and (6)
-        # both fall to a ``cd`` plus a relative name.
+        # tokenizing passes cannot see. (5) the %APPDATA% / %LOCALAPPDATA%
+        # aliases of the fenced Roaming/Local stores. (6) the write-protected
+        # leaves in that same native spelling, which branch (3) cannot see.
+        # (7) the distinctive leaves as a bare path SEGMENT, with no anchor at
+        # all, because branches (3) and (6) both fall to a ``cd`` plus a
+        # relative name.
         rf"|(?:^|.*[\s'\"=:,;]){win_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){appdata_sensitive_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){localappdata_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){win_write_protected_path}"
         # (8) ~/.kiro/agents (POSIX and Windows-native spelling, plus the
         # ``$KIRO_HOME`` override), matched verb-INDEPENDENTLY with the same token
@@ -6127,6 +6274,11 @@ def is_sensitive_bash_command(command: str) -> str | None:
     if normalizer_result:
         return normalizer_result
 
+    # ── Pass 3: native-shell entry-then-relative-read scan ──
+    native_result = _check_native_home_entry_then_fenced_read(command)
+    if native_result:
+        return native_result
+
     # IMDS access via any IP encoding (decimal, hex, octal, IPv6-mapped)
     imds_result = _check_imds_access(command)
     if imds_result:
@@ -6173,6 +6325,149 @@ _DECLARATION_BUILTINS: frozenset[str] = frozenset(
 #: Ceiling on the never-pruned base-directory set, so a pathological command line
 #: cannot make the operand check quadratic. Well above any real one.
 _MAX_TRACKED_BASES = 64
+
+#: Every spelling of "change the working directory" the passes below have to
+#: recognise, in ONE place so the two of them cannot drift apart.
+#:
+#: This gate runs on the raw command string of every shell tool call, whatever
+#: shell will execute it -- ``hooks.py`` hands it the title and the command with
+#: no per-platform branch -- and the absolute-path pass in
+#: `_build_sensitive_regex` already models cmd.exe and PowerShell spellings
+#: (``%USERPROFILE%``, ``$env:USERPROFILE``, backslash separators). The
+#: working-directory tracker knew only bash's two verbs, so the Windows spelling
+#: of the cd-then-relative chain was unmodelled and read clean::
+#:
+#:     Set-Location ~; Get-Content .aws/credentials
+#:     chdir %USERPROFILE%; type .kiro/crew/token_signing.key
+#:
+#: ``sl`` is also a real (joke) program on some Linux boxes. Reading it as a
+#: chdir there can only ADD a base directory, and a base only ever produces more
+#: denials, so the collision fails in the safe direction -- the same posture the
+#: rest of this gate takes, where naming a fenced path is itself the signal.
+#:
+#: ``popd`` / ``Pop-Location`` are deliberately absent. Modelling them would
+#: REMOVE a tracked base, and `_remember_bases` keeps every base seen precisely
+#: so that undoing a move cannot walk a denial back.
+_CHDIR_VERBS: frozenset[str] = frozenset(
+    {
+        "cd",  # bash builtin; also a PowerShell alias and a cmd.exe builtin
+        "pushd",  # bash builtin; PowerShell alias of Push-Location; cmd.exe
+        "chdir",  # cmd.exe builtin; PowerShell alias of Set-Location
+        "sl",  # PowerShell alias of Set-Location
+        "set-location",
+        "push-location",
+    }
+)
+
+#: cmd.exe and PowerShell spellings of the home directory, as a ``cd`` target can
+#: write them. `_unresolved_home_hypothesis` cannot stand in for these: it reads
+#: ``$env:USERPROFILE`` as the variable ``$env`` followed by a literal
+#: ``:USERPROFILE``, so the hypothesis it forms is ``~:USERPROFILE`` -- a path
+#: `expanduser` leaves untouched, which then matches nothing.
+#:
+#: The alternation accepts EXACTLY the spellings the ``userprofile`` group in
+#: `_build_sensitive_regex` accepts, and a parametrized drift test pins both
+#: directions on one list. Notably that means a BARE ``%HOMEPATH%`` is not here:
+#: it omits the drive letter, the absolute pass does not accept it either, and
+#: covering it on this side alone would leave the same anchor half-fenced --
+#: the asymmetry this whole change exists to remove.
+#:
+#: Longest first, so ``%HOMEDRIVE%%HOMEPATH%`` is not consumed as
+#: ``%HOMEDRIVE%`` plus a stray tail.
+_WINDOWS_HOME_ANCHOR_RE = re.compile(
+    r"^(?:%HOMEDRIVE(?::[^%\s]*)?%%HOMEPATH(?::[^%\s]*)?%"
+    r"|\$\{env:HOMEDRIVE\}\$\{env:HOMEPATH\}"
+    r"|\$env:HOMEDRIVE\$env:HOMEPATH"
+    r"|%USERPROFILE(?::[^%\s]*)?%"
+    r"|\$\{env:USERPROFILE\}"
+    r"|\$env:USERPROFILE)",
+    re.IGNORECASE,
+)
+
+
+def _is_chdir_verb(token: str) -> bool:
+    """Does *token* name a program that changes the working directory?
+
+    Compared on the basename so an absolute spelling (``/usr/bin/chdir``) is
+    recognised, and case-folded because PowerShell cmdlet names are
+    case-insensitive (``set-location`` and ``Set-Location`` are one verb).
+    """
+    return os.path.basename(token).lower() in _CHDIR_VERBS
+
+
+def _is_chdir_switch(token: str) -> bool:
+    """Is *token* a flag on a chdir verb rather than the directory it moves to?
+
+    Only ``-``-prefixed flags, which covers bash and PowerShell. cmd.exe's ``/D``
+    switch is deliberately NOT classified here, and that took two review rounds
+    arguing opposite sides of the same line to settle:
+
+    * Classifying it as a switch reads ``cd /d %USERPROFILE%`` correctly, but a
+      single-letter absolute path is also a perfectly real POSIX directory -- and
+      one that can be the crew home, so discarding it turned
+      ``KIROCREW_HOME=/d`` + ``cd /d; cat token_signing.key`` from denied into
+      allowed. That is a keystone read, so the classification cost more than it
+      bought.
+    * Not classifying it needs nothing extra, because the selectors keep EVERY
+      non-switch argument as a candidate target. ``cd /d %USERPROFILE%`` still
+      reaches the real directory through the second candidate, and ``cd /d`` alone
+      simply bases on ``/d`` -- which is what a POSIX shell does and what the
+      fence needs.
+
+    So the switch is handled by the candidate rule rather than by a special case,
+    and neither reading of ``/d`` has to be guessed.
+    """
+    return token.startswith("-")
+
+
+def _chdir_candidates(tokens: list[str]) -> list[str]:
+    """Every token after a chdir verb that might name the directory it moves to.
+
+    Three shapes count, and all three were learned one review round at a time:
+
+    * a plain operand -- the ordinary ``cd ~/.aws``;
+    * EVERY plain operand rather than the first, because a PowerShell common
+      parameter's value is not switch-shaped, so
+      ``Set-Location -ErrorAction Stop ~`` otherwise tracked ``Stop``;
+    * the payload BOUND to a flag by ``:`` or ``=``, because PowerShell accepts
+      ``-Path:<value>`` and the whole token then begins with ``-``, so
+      ``Set-Location -Path:$env:USERPROFILE/.aws`` was read as a pure flag and
+      dropped.
+
+    Split at the FIRST separator only, which is what keeps ``$env:USERPROFILE``
+    intact inside the payload. Naming the parameters that carry a path would mean
+    maintaining a list that grows with the cmdlet surface (``-Path``,
+    ``-LiteralPath``, ...); taking any bound payload needs no list. A payload that
+    turns out not to be a directory only ADDS a candidate, and a candidate only
+    ever produces more denials.
+
+    Lives in one function because the same question is asked in three places --
+    the segment walk and both loops of the taint pass -- and those had already
+    drifted apart once.
+    """
+    out: list[str] = []
+    for token in tokens:
+        if not token or token == "--":
+            continue
+        if not _is_chdir_switch(token):
+            out.append(token)
+            continue
+        positions = [token.find(sep) for sep in (":", "=")]
+        bound = min((p for p in positions if p > 0), default=-1)
+        if bound > 0 and bound + 1 < len(token):
+            out.append(token[bound + 1 :])
+    return out
+
+
+def _rewrite_windows_home_anchor(token: str) -> str:
+    """Rewrite a leading cmd.exe / PowerShell home anchor in *token* as ``~``.
+
+    Returns *token* unchanged when it carries no such anchor, so every caller can
+    apply this unconditionally before the ``~``/absolute/relative split.
+    """
+    return _WINDOWS_HOME_ANCHOR_RE.sub("~", token, count=1)
+
+
 # A command substitution, in both spellings. Its value needs the command to run,
 # so it is unresolvable from the text in exactly the way an unassigned variable
 # is -- and it can carry a `cd` target: `cd "$(printf %s ~)/.kiro/crew"`.
@@ -6765,6 +7060,12 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
     # the line prompts. The taint pass already denies that shape, so this widens
     # nothing in practice.
     seen_bases: list[str] = []
+    # Classifying a base resolves symlinks and sensitive-home roots. A chained
+    # parameter expansion revisits the same bases many times, so repeating that
+    # filesystem work made this synchronous gate exceed its latency ceiling
+    # under normal test load. The filesystem cannot change while this one
+    # command is being inspected; keep the classification only for this call.
+    base_sensitivity: dict[str, bool] = {}
     # The directories `cd -` goes back to.
     prev_bases: list[str] = []
     # Saved (base_dirs, prev_bases, assignments) per open subshell.
@@ -6946,16 +7247,20 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
         # word is not always the first operand. Unwrapping is required rather than
         # cosmetic: the wrapped form was not recognised as a `cd` at all, so the
         # base was never tracked and the bare filename after it read clean. Only
-        # these two are unwrapped — they are the shell keywords that mean "run the
-        # builtin", and neither takes an option before its command word.
+        # these three are unwrapped — they are the words that mean "run the thing
+        # that follows", and none takes an option before its command word.
+        # `&` is PowerShell's call operator, which prefixes the cmdlet the same
+        # way (`& Set-Location ~`); in bash it never appears as a leading operand,
+        # so unwrapping it costs the POSIX reading nothing.
         while len(operands) > 1 and os.path.basename(operands[0]).lower() in (
             "builtin",
             "command",
+            "&",
         ):
             operands = operands[1:]
 
         # `cd <target>` moves the base directory for everything after it.
-        if os.path.basename(operands[0]).lower() in ("cd", "pushd"):
+        if _is_chdir_verb(operands[0]):
             args = [token for token in operands[1:] if token != "--"]
             # `cd -` returns to the previous directory. The shell remembers it,
             # so the tracker has to as well: skipping `-` as a flag left the base
@@ -6963,13 +7268,21 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
             if args and args[0] == "-":
                 base_dirs, prev_bases = prev_bases, base_dirs
                 continue
-            raw_target = next((token for token in args if not token.startswith("-")), None)
+            # EVERY candidate the shared rule finds, not just the first operand:
+            # see `_chdir_candidates` for the three shapes and why enumerating
+            # path-carrying parameters is the direction that does not converge.
+            raw_targets = _chdir_candidates(args)
             prev_bases = list(base_dirs)
-            if raw_target is None:
+            if not raw_targets:
                 # A bare `cd` goes to the home directory.
                 base_dirs = [os.path.expanduser("~")]
-                _remember_bases(seen_bases, base_dirs)
+                _remember_bases(seen_bases, base_dirs, base_sensitivity)
                 continue
+            # A Windows home anchor becomes `~` BEFORE anything else looks at the
+            # token: the hypothesis below reads `$env:USERPROFILE` as the variable
+            # `$env` plus a literal tail, so it would form a `~:USERPROFILE`
+            # non-path and lose the anchor entirely.
+            raw_targets = [_rewrite_windows_home_anchor(t) for t in raw_targets]
             # EVERY reading becomes a base. Picking one always lost the other: the
             # value reading is what catches `cd ${D:-/tmp}` when D is the sensitive
             # directory, and the unresolved reading is what catches
@@ -6977,26 +7290,27 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
             # both is the fail-closed answer and needs no guess about which
             # operator bash will take.
             next_bases: list[str] = []
-            for reading in _expansion_readings(raw_target, readings):
-                hypothesis = _unresolved_home_hypothesis(reading)
-                if hypothesis is not None:
-                    # Carries a variable or command substitution this command
-                    # cannot resolve. Fail closed on the hypothesis that it names a
-                    # home directory, so the reads that follow still join onto the
-                    # literal tail: `cd "$(printf %s ~)/.kiro/crew"` otherwise left
-                    # the base on a literal that matched nothing.
-                    resolved = [os.path.expanduser(hypothesis)]
-                elif reading.startswith("~"):
-                    resolved = [os.path.expanduser(reading)]
-                elif os.path.isabs(reading):
-                    resolved = [reading]
-                elif base_dirs:
-                    resolved = [os.path.join(b, reading) for b in base_dirs]
-                else:
-                    resolved = [reading]
-                for path in resolved:
-                    if path not in next_bases:
-                        next_bases.append(path)
+            for raw_target in raw_targets:
+                for reading in _expansion_readings(raw_target, readings):
+                    hypothesis = _unresolved_home_hypothesis(reading)
+                    if hypothesis is not None:
+                        # Carries a variable or command substitution this command
+                        # cannot resolve. Fail closed on the hypothesis that it names
+                        # a home directory, so the reads that follow still join onto
+                        # the literal tail: `cd "$(printf %s ~)/.kiro/crew"` otherwise
+                        # left the base on a literal that matched nothing.
+                        resolved = [os.path.expanduser(hypothesis)]
+                    elif reading.startswith("~"):
+                        resolved = [os.path.expanduser(reading)]
+                    elif os.path.isabs(reading):
+                        resolved = [reading]
+                    elif base_dirs:
+                        resolved = [os.path.join(b, reading) for b in base_dirs]
+                    else:
+                        resolved = [reading]
+                    for path in resolved:
+                        if path not in next_bases:
+                            next_bases.append(path)
             # Bound the working set. Each `cd ${D:-x}` segment can multiply the
             # base count (two relative readings joined onto every existing base),
             # so a chain of them grows `base_dirs` exponentially and hangs this
@@ -7008,7 +7322,7 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
             base_dirs = next_bases
             if len(base_dirs) > _MAX_TRACKED_BASES:
                 del base_dirs[: len(base_dirs) - _MAX_TRACKED_BASES]
-            _remember_bases(seen_bases, next_bases)
+            _remember_bases(seen_bases, next_bases, base_sensitivity)
             continue
 
         # No read-verb requirement: the operands of this segment are checked
@@ -7057,7 +7371,9 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
     return _check_sensitive_cd_taint(command)
 
 
-def _remember_bases(seen: list[str], bases: list[str]) -> None:
+def _remember_bases(
+    seen: list[str], bases: list[str], sensitivity: dict[str, bool]
+) -> None:
     """Add *bases* to the never-pruned *seen* list, keeping order and uniqueness.
 
     Bounded so a long chain of `cd`s cannot grow it without limit; the cap is far
@@ -7072,11 +7388,10 @@ def _remember_bases(seen: list[str], bases: list[str]) -> None:
         # Never evict sensitive bases -- an attacker could flood with dummy cd
         # targets to push a real sensitive base out of the tracked set.
         excess = len(seen) - _MAX_TRACKED_BASES
-        evictable = [
-            i
-            for i, b in enumerate(seen)
-            if not is_sensitive_path(b) and not _dir_holds_sensitive_leaf(b)
-        ]
+        for base in seen:
+            if base not in sensitivity:
+                sensitivity[base] = is_sensitive_path(base) or _dir_holds_sensitive_leaf(base)
+        evictable = [i for i, base in enumerate(seen) if not sensitivity[base]]
         to_remove = set(evictable[:excess])
         seen[:] = [b for i, b in enumerate(seen) if i not in to_remove]
 
@@ -7089,6 +7404,415 @@ def _strip_grouping(token: str) -> str:
     punctuation that opened the group.
     """
     return token.lstrip("$(`{ ")
+
+
+#: ---------------------------------------------------------------------------
+#: Native-shell path reading: cut into words, NORMALIZE, compare.
+#:
+#: The first six review rounds of this pass were spent matching SPELLINGS, and the
+#: boundary half of that converged -- one lookaround on "what a path is" replaced a
+#: growing list of punctuation. The PATH half never converged, for a reason worth
+#: writing down rather than rediscovering: ``%USERPROFILE%\.``, ``~/``, ``C:.aws``,
+#: ``C:/`` versus ``C:\``, ``a\..\``, ``a\b\..\..\`` and ``.aw^s`` all name ONE
+#: file. Path identity is a COMPUTATION -- collapse ``.``, net ``..`` against
+#: depth, unify separators, apply the shell's escape -- and a pattern can only
+#: enumerate the spellings someone thought to write down, so every round supplied
+#: one more.
+#:
+#: So this scan no longer matches path spellings. It cuts the command into words,
+#: normalizes each word as a path, and compares the RESULT. An unbounded family of
+#: patterns becomes one bounded function, and the shells' escape characters stop
+#: being special cases -- see `_native_words`, which owns quoting and escaping so
+#: path shaping never has to.
+#:
+#: It stays grammar-free, which is the property that made this pass worth having: a
+#: word ends at an operator, but WHICH operator -- sequencer, background, pipe,
+#: redirect -- is never asked. Only target selection stays inside one
+#: operator-delimited run; the fenced-path search deliberately crosses every
+#: boundary, because a monotone scan may only ever widen.
+_WORD_SPACE = frozenset(" \t")
+_WORD_QUOTE = frozenset("\"'")
+#: The two shells' escape characters: cmd.exe uses ``^``, PowerShell uses a
+#: backtick. Both protect exactly the next character, INCLUDING a space, so they
+#: belong to the word layer rather than to path normalization. The backtick is
+#: therefore not an operator here even though bash reads it as command
+#: substitution -- this is the native-Windows pass, and bash's substitution is
+#: handled by the segment splitter the earlier passes use.
+_WORD_ESCAPE = frozenset("^`")
+#: Braces are deliberately NOT boundaries: PowerShell spells an environment
+#: variable ``${env:USERPROFILE}``, so splitting on ``{`` would cut a home anchor
+#: in half. A brace-delimited block (``ForEach-Object { ... }``) is already broken
+#: by the ``|`` or ``;`` in front of it, so nothing needs them to end a run.
+_WORD_OPERATOR = frozenset(";&|()<>\r\n")
+
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+#: A flag carrying its value in the same word (``-Path:~``, ``--path=~``, ``/D:x``).
+#: The payload after the first ``:`` or ``=`` is what names the directory.
+_BOUND_PAYLOAD_RE = re.compile(r"^[-/][A-Za-z][\w-]*[:=](?P<value>.+)$")
+_SWITCH_WORD_RE = re.compile(r"^[-/][A-Za-z][\w-]*(?:[:=]\S*)?$")
+_GLUED_SWITCH_RE = re.compile(r"^[A-Za-z]$")
+
+#: One path SEGMENT naming the home directory, in every spelling these shells
+#: accept -- including cmd.exe delayed expansion (``!USERPROFILE!``) and the
+#: optional substring/substitution payload after the first delimiter. Anchor
+#: spellings ARE a closed set, because the shells define them; that is why an
+#: alternation is the right tool for this part and the wrong one for path identity.
+_HOME_SEGMENT_RE = re.compile(
+    r"^(?:"
+    r"~"
+    r"|\$HOME|\$\{HOME\}"
+    r"|%USERPROFILE(?::[^%]*)?%"
+    r"|!USERPROFILE(?::[^!]*)?!"
+    r"|(?:%HOMEDRIVE(?::[^%]*)?%|!HOMEDRIVE(?::[^!]*)?!)"
+    r"(?:%HOMEPATH(?::[^%]*)?%|!HOMEPATH(?::[^!]*)?!)"
+    r"|\$\{env:USERPROFILE\}|\$env:USERPROFILE"
+    r"|\$\{env:HOMEDRIVE\}\$\{env:HOMEPATH\}|\$env:HOMEDRIVE\$env:HOMEPATH"
+    r")$",
+    re.IGNORECASE,
+)
+
+_CHDIR_VERBS_LOWER = frozenset(verb.lower() for verb in _CHDIR_VERBS)
+
+
+class _PathShape(NamedTuple):
+    """What one word means as a path, after normalization."""
+
+    segments: tuple[str, ...]
+    home_anchored: bool
+    absolute: bool
+    #: A ``..`` climbed above the directory the path was spelled from, so it names
+    #: something OUTSIDE that directory. This scan has no claim on those: denying
+    #: ``project\..\..\.aws`` would deny a different file than the fenced one.
+    escaped: bool
+
+
+def _strip_windows_component_padding(segment: str) -> str:
+    """Windows drops trailing dots and spaces from every path component.
+
+    So ``.aws.`` and ``.aws`` are the SAME directory, and ``type .aws.\\credentials``
+    after entering home genuinely reads the credential -- a whole-segment
+    comparison would otherwise let the trailing dot walk past every entry in
+    `_SENSITIVE_HOME_DIRS` at once.
+
+    A segment made only of dots is left alone: ``.`` and ``..`` are navigation
+    rather than a name carrying padding, and stripping them would erase the very
+    netting that decides whether a path escapes its directory.
+    """
+    if not segment.strip("."):
+        return segment
+    return segment.rstrip(". ")
+
+
+def _native_words(command: str) -> list[tuple[int, str, bool]]:
+    """Cut the command into ``(offset, word, starts_new_run)`` triples.
+
+    This layer implements the shells' QUOTING and ESCAPING, and nothing else. It
+    used to approximate them -- quotes were skipped and escapes were removed later,
+    during path shaping -- and each approximation cost a review round: a quoted
+    ``C:\\Users\\John Doe`` was split at the space, a fenced entry with a space of
+    its own was too, and PowerShell's backtick escape went unread while cmd.exe's
+    caret was handled. All three are the same omission, so they are fixed in the
+    same place.
+
+    The rules, both closed sets the shells define:
+
+    * An escape (``^`` in cmd.exe, a backtick in PowerShell) protects exactly the
+      next character, which reaches the word while the escape does not. A doubled
+      escape therefore yields one literal escape character, so ``.a^^ws`` stays the
+      distinct file ``.a^ws``.
+    * A quote does not reach the word. Whitespace inside one is AMBIGUOUS in a way
+      no amount of lexing settles: ``"C:\\Users\\John Doe"`` is one path, while
+      ``cmd /C "cd ~ & type .aws\\credentials"`` is a whole command line that must
+      still be cut apart. So both readings are emitted -- the whitespace-separated
+      parts AND, when a quoted region holds whitespace, the joined region as one
+      extra word. Taking both is sound precisely because this scan is monotone:
+      an extra reading can only add a denial, never remove one.
+
+    ``starts_new_run`` is True when an operator (or the start of the command)
+    preceded the word -- the only structural fact this scan needs, since a chdir's
+    target cannot live across an operator while the fenced-path search ignores
+    operators entirely.
+    """
+    words: list[tuple[int, str, bool]] = []
+    buffer: list[str] = []
+    start = -1
+    word_new_run = True
+    next_new_run = True
+    quote = ""
+    region: list[str] = []
+    region_start = -1
+    index = 0
+    length = len(command)
+
+    def begin(at: int) -> None:
+        nonlocal start, word_new_run, next_new_run
+        if not buffer:
+            start = at
+            word_new_run = next_new_run
+            next_new_run = False
+
+    def flush() -> None:
+        nonlocal buffer
+        if buffer:
+            words.append((start, "".join(buffer), word_new_run))
+            buffer = []
+
+    while index < length:
+        char = command[index]
+        if char in _WORD_ESCAPE:
+            index += 1
+            if index < length:
+                begin(index)
+                buffer.append(command[index])
+                if quote:
+                    region.append(command[index])
+                index += 1
+            continue
+        if char in _WORD_QUOTE:
+            if quote == char:
+                joined = "".join(region)
+                if any(space in joined for space in _WORD_SPACE):
+                    words.append((region_start, joined, False))
+                quote = ""
+                region = []
+            elif not quote:
+                quote = char
+                region = []
+                region_start = index + 1
+            else:
+                begin(index)
+                buffer.append(char)
+                region.append(char)
+            index += 1
+            continue
+        if char in _WORD_SPACE or char in _WORD_OPERATOR:
+            flush()
+            if char in _WORD_OPERATOR:
+                next_new_run = True
+            if quote:
+                region.append(char)
+            index += 1
+            continue
+        begin(index)
+        buffer.append(char)
+        if quote:
+            region.append(char)
+        index += 1
+    flush()
+    if quote:
+        joined = "".join(region)
+        if any(space in joined for space in _WORD_SPACE):
+            words.append((region_start, joined, False))
+    return words
+
+
+def _shape_path_token(word: str) -> _PathShape:
+    """Normalize one word as a path and report what it names.
+
+    Every equivalence that cost a review round is decided here, once: a bound flag
+    payload, a drive-relative prefix, either separator, a no-op ``.``, the trailing
+    dots Windows itself drops, and ``..`` netted against depth so
+    ``a\\b\\..\\..\\.aws`` and ``a\\..\\.aws`` and ``.aws`` all arrive as the same
+    segments.
+
+    Escapes and quoting are deliberately NOT handled here -- `_native_words` owns
+    them. Keeping the two layers separate is what makes the split safe: an escape
+    removed twice would turn ``.a^^ws`` (a real file named ``.a^ws``) into the
+    fenced ``.aws`` and deny a command that touches nothing.
+    """
+    text = word
+    bound = _BOUND_PAYLOAD_RE.match(text)
+    if bound:
+        text = bound.group("value")
+    absolute = False
+    if _DRIVE_PREFIX_RE.match(text):
+        # A drive letter FOLLOWED by a separator is absolute on that drive. With
+        # nothing after it, it means "the current directory there" -- which is
+        # precisely the relative form this scan exists for, so the prefix is
+        # dropped rather than treated as evidence the path is not relative.
+        absolute = text[2:3] in ("/", "\\")
+        text = text[2:]
+    text = text.replace("\\", "/")
+    if text.startswith("/"):
+        absolute = True
+    raw = [
+        _strip_windows_component_padding(segment)
+        for segment in text.split("/")
+    ]
+    raw = [segment for segment in raw if segment not in ("", ".")]
+    home_anchored = False
+    if raw and _HOME_SEGMENT_RE.match(raw[0]):
+        home_anchored = True
+        raw = raw[1:]
+    stack: list[str] = []
+    escaped = False
+    for segment in raw:
+        if segment == "..":
+            if stack:
+                stack.pop()
+            else:
+                escaped = True
+        else:
+            stack.append(segment)
+    return _PathShape(tuple(stack), home_anchored, absolute, escaped)
+
+
+def _names_home_directory(word: str) -> bool:
+    """Does this word name the home directory ITSELF, not something under it?
+
+    ``cd ~/project`` is deliberately False: entering a subdirectory of home is not
+    entering home, and a later ``.aws`` there resolves to ``~/project/.aws``, which
+    is not fenced. That distinction used to be a lookahead refusing a path
+    continuation; it is now just "no segments left after the anchor".
+
+    The resolved home is read PER CALL. Binding it at import time freezes it for
+    the life of the process, which `test_host_isolation_floor`'s shared-path
+    ratchet forbids and which would make a repointed home invisible here.
+    """
+    shape = _shape_path_token(word)
+    if shape.escaped:
+        return False
+    if shape.home_anchored:
+        return not shape.segments
+    if shape.absolute:
+        # Windows paths are case-insensitive, so `c:\users\u` is the same entry as
+        # `C:\Users\u`. `_fenced_relative_prefix` and `_HOME_SEGMENT_RE` already
+        # fold; this was the one comparison in the pass that did not, which made
+        # a case-varied spelling of the resolved home invisible.
+        home = _shape_path_token(str(Path.home()))
+        return (
+            shape.absolute == home.absolute
+            and shape.home_anchored == home.home_anchored
+            and tuple(segment.lower() for segment in shape.segments)
+            == tuple(segment.lower() for segment in home.segments)
+        )
+    return False
+
+
+def _fenced_relative_prefix(shape: _PathShape) -> str | None:
+    """Which fenced directory a RELATIVE path names, if any.
+
+    Read from `_SENSITIVE_HOME_DIRS` at call time, not folded into a pattern at
+    import, so leaves appended to that list later (the crew data-home secrets) are
+    covered with no second edit. Segments are compared whole, which is what keeps
+    ``x.aws/credentials`` and ``.npmrcnotes`` out.
+    """
+    if shape.absolute or shape.home_anchored or shape.escaped or not shape.segments:
+        return None
+    lowered = tuple(segment.lower() for segment in shape.segments)
+    for fenced in _SENSITIVE_HOME_DIRS:
+        parts = tuple(part.lower() for part in fenced.split("/") if part)
+        if parts and lowered[: len(parts)] == parts:
+            return fenced
+    return None
+
+
+def _is_chdir_verb_word(word: str) -> bool:
+    """A change-directory verb, including cmd.exe's glued ``cd/d``.
+
+    Sourced from the same `_CHDIR_VERBS` the walk reads, so a spelling added there
+    reaches this scan with no second edit.
+    """
+    base, slash, glued = word.partition("/")
+    if base.lower() not in _CHDIR_VERBS_LOWER:
+        return False
+    return not slash or bool(_GLUED_SWITCH_RE.match(glued))
+
+
+def _chdir_target_is_home(words: list[tuple[int, str, bool]], verb_index: int) -> bool:
+    """Within the verb's own run, does any word name the home directory?
+
+    The whole run is scanned rather than a bounded window of candidates. A window
+    was wrong for a nameable reason: a PowerShell parameter can take its value as a
+    separate word, so an arbitrary number of words can sit between the verb and its
+    positional target (``Set-Location -ErrorAction Stop -WarningAction Stop ~``),
+    and any cap stops short of some legitimate spelling. Scanning the run cannot
+    over-reach, because an operator ends the run and the fenced-path search -- which
+    is the half that actually decides a denial -- is monotone anyway.
+
+    The order of the two checks below is LOAD-BEARING and easy to invert by
+    accident. ``-Path:~`` satisfies both predicates -- it looks like a switch AND it
+    names home, because the shape reads the payload after the colon. The home check
+    therefore has to run FIRST; skipping switches first would silently stop
+    detecting a parameter-bound target.
+
+    The running JOIN exists for one cmd.exe quirk: ``cd`` takes the rest of the line
+    as its path, so ``cd /d C:\\Users\\John Doe`` is a valid entry with no quotes at
+    all. Switch-shaped words are left out of the join so a leading ``/d`` does not
+    poison it.
+    """
+    parts: list[str] = []
+    for _offset, word, new_run in words[verb_index + 1 :]:
+        if new_run:
+            return False
+        if _names_home_directory(word):
+            return True
+        if _SWITCH_WORD_RE.match(word):
+            continue
+        parts.append(word)
+        if len(parts) > 1 and _names_home_directory(" ".join(parts)):
+            return True
+    return False
+
+
+def _check_native_home_entry_then_fenced_read(command: str) -> str | None:
+    """Did the command enter the home directory, then name a fenced path relative to it?
+
+    Pass 2 answers "where is the shell now" by WALKING the command: split into
+    segments, track the chdir target, join relative operands onto it. That walk
+    must agree with the shell's grammar, and for a NATIVE WINDOWS command line it
+    does not. ``normalize_shell_command`` tokenizes in POSIX mode, where a
+    backslash is an escape rather than a separator and a single ``&`` backgrounds
+    rather than sequences; ``_split_shell_segments`` rightly declines to break on
+    ``|`` because in bash the ``cd`` would run in a subshell, while a PowerShell
+    pipeline does move the directory; and cmd.exe's ``^`` escape and glued ``/D``
+    switch are two more spellings the tokenizer reads as something else.
+
+    Closing those one at a time is the direction `_check_sensitive_via_normalizer`
+    warns is unbounded, and four consecutive review rounds each named one more
+    element. So this pass asks the question that needs NO grammar, the same move
+    `_check_sensitive_cd_taint` makes for a sensitive target: was an entry into
+    the home directory seen ANYWHERE, and does a fenced path spelled relative to
+    it appear AFTER that? Both halves are read off the raw text::
+
+        cd ~ & type .aws\\credentials                    sequencer + separator
+        Set-Location ~ | ForEach-Object { cat .aws/x }   pipeline
+        cd/d %USERPROFILE% && type .aws^\\credentials     glued switch + caret
+
+    Monotone and position-ordered: once the entry is seen no later token can
+    clear it, which is exactly the property a positional tracker lacks.
+
+    Cost, stated plainly: naming a fenced RELATIVE path after entering the home
+    directory is denied even when the command would not have read it (a
+    ``grep`` for that text in a note). That is the posture the absolute-path pass
+    already takes -- naming a fenced path is itself the signal -- extended to the
+    spelling that only makes sense once the shell is in the home directory.
+
+    Returns a denial reason, or None when clean.
+    """
+    words = _native_words(command)
+    entry_offset: int | None = None
+    for index, (offset, word, _new_run) in enumerate(words):
+        if not _is_chdir_verb_word(word):
+            continue
+        # A bare chdir -- nothing after it in its own run -- lands in the home
+        # directory in every shell this pass covers.
+        bare = index + 1 >= len(words) or words[index + 1][2]
+        if bare or _chdir_target_is_home(words, index):
+            entry_offset = offset
+            break
+    if entry_offset is None:
+        return None
+    for offset, word, _new_run in words:
+        if offset <= entry_offset:
+            continue
+        fenced = _fenced_relative_prefix(_shape_path_token(word))
+        if fenced is not None:
+            return (
+                "Blocked: command enters the home directory and then names a "
+                f"sensitive credential path relative to it ({fenced})"
+            )
+    return None
 
 
 def _check_sensitive_cd_taint(command: str) -> str | None:
@@ -7177,40 +7901,59 @@ def _check_sensitive_cd_taint(command: str) -> str | None:
                 break
 
         for index, token in enumerate(tokens):
-            if os.path.basename(_strip_grouping(token)).lower() not in ("cd", "pushd"):
+            if not _is_chdir_verb(_strip_grouping(token)):
                 continue
-            target = next((t for t in tokens[index + 1 :] if t and not t.startswith("-")), None)
-            if not target:
+            # Every candidate the shared rule finds, for the reasons given in
+            # `_chdir_candidates`. Over-tainting is safe here by construction.
+            candidates = _chdir_candidates(tokens[index + 1 :])
+            if not candidates:
                 continue
-            # A cd target containing a command substitution with separators may
-            # assemble a sensitive path piecemeal that static analysis cannot
-            # reconstruct.  Fail closed: taint the command.
-            if ("$(" in target or "`" in target):
-                inner = target[target.index("$(") + 2:] if "$(" in target else target[target.index("`") + 1:]
-                if any(sep in inner for sep in (";", "&&", "||", "\n")):
-                    tainted_by = target
-                    break
-            # Expand variable references from tracked assignments before probing.
-            expanded = _expand_known_vars(target, taint_assignments)
-            probe = os.path.expanduser(expanded) if expanded.startswith("~") else expanded
-            if (
-                is_sensitive_path(probe)
-                or _dir_holds_sensitive_leaf(expanded)
-                or _sensitive_under_unresolved_var(expanded)
-            ):
-                tainted_by = target
-                break
-            # Also check the unexpanded form in case the variable is not tracked
-            # but _sensitive_under_unresolved_var can still flag it.
-            if target != expanded:
-                probe_orig = os.path.expanduser(target) if target.startswith("~") else target
+            for target in candidates:
+                # A cd target containing a command substitution with separators may
+                # assemble a sensitive path piecemeal that static analysis cannot
+                # reconstruct.  Fail closed: taint the command.
+                if ("$(" in target or "`" in target):
+                    inner = (
+                        target[target.index("$(") + 2:]
+                        if "$(" in target
+                        else target[target.index("`") + 1:]
+                    )
+                    if any(sep in inner for sep in (";", "&&", "||", "\n")):
+                        tainted_by = target
+                        break
+                # Expand variable references from tracked assignments before probing,
+                # then fold a cmd.exe / PowerShell home anchor down to `~`. The probe
+                # forms are separate from `target` so the reported reason still quotes
+                # what the command actually wrote.
+                expanded = _rewrite_windows_home_anchor(
+                    _expand_known_vars(target, taint_assignments)
+                )
+                probe = os.path.expanduser(expanded) if expanded.startswith("~") else expanded
                 if (
-                    is_sensitive_path(probe_orig)
-                    or _dir_holds_sensitive_leaf(target)
-                    or _sensitive_under_unresolved_var(target)
+                    is_sensitive_path(probe)
+                    or _dir_holds_sensitive_leaf(expanded)
+                    or _sensitive_under_unresolved_var(expanded)
                 ):
                     tainted_by = target
                     break
+                # Also check the unexpanded form in case the variable is not tracked
+                # but _sensitive_under_unresolved_var can still flag it.
+                if target != expanded:
+                    unexpanded = _rewrite_windows_home_anchor(target)
+                    probe_orig = (
+                        os.path.expanduser(unexpanded)
+                        if unexpanded.startswith("~")
+                        else unexpanded
+                    )
+                    if (
+                        is_sensitive_path(probe_orig)
+                        or _dir_holds_sensitive_leaf(unexpanded)
+                        or _sensitive_under_unresolved_var(unexpanded)
+                    ):
+                        tainted_by = target
+                        break
+            if tainted_by is not None:
+                break
 
         # `bash -c '...'` / `sh -c '...'`: the string argument is a nested command
         # that inherits the parent's exported variables.  Expand tracked assignments
@@ -7245,18 +7988,23 @@ def _check_sensitive_cd_taint(command: str) -> str | None:
             except Exception:
                 continue
             for idx, tok in enumerate(seg_tokens):
-                if os.path.basename(_strip_grouping(tok)).lower() not in ("cd", "pushd"):
+                if not _is_chdir_verb(_strip_grouping(tok)):
                     continue
-                tgt = next((t for t in seg_tokens[idx + 1:] if t and not t.startswith("-")), None)
-                if not tgt:
-                    continue
-                if ("$(" in tgt or "`" in tgt):
+                # Every candidate the shared rule finds, matching the primary
+                # taint loop. This scan is the only one that can see a `cd` target
+                # which IS a separator-carrying substitution, so reaching it past a
+                # parameter value or a bound payload changes the verdict.
+                for tgt in _chdir_candidates(seg_tokens[idx + 1 :]):
+                    if "$(" not in tgt and "`" not in tgt:
+                        continue
                     inner_start = tgt.index("$(") + 2 if "$(" in tgt else tgt.index("`") + 1
                     inner_text = tgt[inner_start:]
                     if any(sep in inner_text for sep in (";", "&&", "||", "\n")):
                         taint_idx = seg_i
                         tainted_by = tgt
                         break
+                if taint_idx >= 0:
+                    break
             if taint_idx >= 0:
                 break
         if taint_idx >= 0:
@@ -8166,6 +8914,22 @@ _CREDENTIAL_PATTERNS = re.compile(
     # adjacent fields; over-redacting a rare ``digits:token`` lookalike is the
     # safe direction.
     r"|[0-9]{6,}:[A-Za-z0-9_-]{30,}"  # Telegram bot token
+    # Discord bot token: three base64url segments — ``base64(application_id)``,
+    # a 6-char timestamp, and an HMAC. The first segment is base64 of a decimal
+    # snowflake, so its leading character is fixed by the id's first digit
+    # (``M``/``N``/``O`` for the 1-9 range every live snowflake starts with), and
+    # the timestamp segment is always EXACTLY 6 characters. Both anchors matter:
+    # the same rule written as three open-ended runs matches an ordinary dotted
+    # identifier or a base64 blob with periods in it, and a redactor that eats
+    # arbitrary text is a different bug. Length floors sit below the real ones so
+    # a shortened/rotated test token is still caught. Same reasoning as Telegram
+    # above — ``discord.bot_token`` can live in ``config.json``, which the agent
+    # can read, so an echoed config would otherwise leak bot control verbatim.
+    # The boundary guards keep the leading ``[MNO]`` from landing mid-run inside
+    # a longer base64 blob and redacting an arbitrary tail of it, the same way
+    # the link-token branch below guards its own ``eyJ`` anchor.
+    r"|(?<![A-Za-z0-9_-])[MNO][A-Za-z0-9_-]{22,30}"
+    r"\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}(?![A-Za-z0-9_-])"  # Discord bot token
     # ── Third-party developer credentials (AWS-345 / AWS-59) ──
     # Distinctive, fixed-case prefixes → very low false-positive risk.  Minimum
     # lengths are kept slightly below the real token lengths so shortened test /
@@ -9162,6 +9926,38 @@ def _inline_interpreter_bindings(text: str) -> str:
     return _INTERP_IDENT_RE.sub(lambda m: bindings.get(m.group(0), m.group(0)), text)
 
 
+def _deny_reason(
+    matched: str,
+    reason_notes: "dict[str, str] | None",
+    *,
+    note_override: str = "",
+) -> str:
+    """Refusal text for *matched*, with the operator note on a SECOND line.
+
+    The first line is byte-for-byte what it has always been. That is load bearing,
+    not stylistic: ``RecoveryCard.tsx`` extracts the pattern with
+    ``/Blocked by security policy:\\s*(.+?)\\s*$/gm`` -- per-line and end-anchored --
+    so anything appended to the SAME line is captured as part of the pattern, and
+    ``_denied_by`` in the test suite partitions on the exact
+    ``"Blocked by security policy: "`` separator.  A note therefore goes on its own
+    line, where both readers ignore it.
+
+    Built-in rules never carry a note (the map holds user patterns only), so for them
+    this returns exactly the historical string -- unless the caller passes
+    *note_override*, which the argv-structural floor uses to say why a pattern the
+    input does not literally match was still the rule that fired.  Without it the
+    reported pattern is the rule's catalog regex, which for that path provably
+    cannot match the input, so the reason names a cause the reader can disprove.
+
+    Module-level rather than a closure because EVERY tier that can refuse must emit
+    the identical micro-format: a second producer would be free to drift from the
+    three consumers that parse it.
+    """
+    head = f"{DENY_REASON_PREFIX}{matched}"
+    note = (note_override or (reason_notes or {}).get(matched, "")).strip()
+    return f"{head}\n{note}" if note else head
+
+
 def is_denied(
     tool_name: str,
     extra_patterns: list[str] | None = None,
@@ -9240,23 +10036,14 @@ def is_denied(
     """
     lower = tool_name.lower()
 
-    def _reason(matched: str) -> str:
-        """Refusal text for *matched*, with the operator note on a SECOND line.
+    def _reason(matched: str, note_override: str = "") -> str:
+        """Refusal text for *matched* -- see :func:`_deny_reason`, the shared producer.
 
-        The first line is byte-for-byte what it has always been. That is load
-        bearing, not stylistic: ``RecoveryCard.tsx`` extracts the pattern with
-        ``/Blocked by security policy:\\s*(.+?)\\s*$/gm`` — per-line and
-        end-anchored — so anything appended to the SAME line is captured as part
-        of the pattern, and ``_denied_by`` in the test suite partitions on the
-        exact ``"Blocked by security policy: "`` separator.  A note therefore
-        goes on its own line, where both readers ignore it.
-
-        Built-in rules never carry a note (the map holds user patterns only), so
-        for them this returns exactly the historical string.
+        *note_override* lets the argv-structural floor say why a pattern the input
+        does not literally match was still the rule that fired (see
+        ``_SELF_PROTECTION_FLOOR_NOTES``).
         """
-        head = f"{DENY_REASON_PREFIX}{matched}"
-        note = (reason_notes or {}).get(matched, "").strip()
-        return f"{head}\n{note}" if note else head
+        return _deny_reason(matched, reason_notes, note_override=note_override)
 
     glob_patterns = list(extra_patterns or [])
     if denied_regexes is None:
@@ -9344,9 +10131,12 @@ def is_denied(
             continue
         if predicate(lower):
             # Report the rule's own pattern, exactly as the regex tier does, so
-            # the denial reason and the SEL event still map back to the rule id.
+            # the denial reason and the SEL event still map back to the rule id —
+            # plus a second line saying the match was STRUCTURAL, because a floor
+            # hit routinely occurs on input that pattern cannot match and the
+            # bare identifier reads as a false explanation.
             _emit_deny_event(tool_name, pattern, lower)
-            return _reason(pattern)
+            return _reason(pattern, _SELF_PROTECTION_FLOOR_NOTES.get(rule_id, ""))
 
     # ── Pass 1: whole-string deny ──
     # If any pattern matches the full input AND no exception matches the
@@ -9398,6 +10188,84 @@ def is_denied(
     # feature-branch push, emit the deferred allow audit now (final outcome).
     if push_allow_pending:
         _schedule_push_allow_audit(lower)
+    return None
+
+
+def is_denied_synthesized_target(
+    target: str,
+    patterns: list[str] | None = None,
+    *,
+    extra_patterns: list[str] | None = None,
+    reason_notes: dict[str, str] | None = None,
+) -> str | None:
+    """Evaluate a SYNTHESIZED target against the patterns that participate in one.
+
+    A synthesized target is not a command line.  It is a ``"<namespace> key=value ..."``
+    summary this gate mints from a tool call's structured arguments so a rule can see a
+    scope that exists nowhere in text (``hooks._search_deny_target``).  Handing it to
+    :func:`is_denied` evaluates it against the WHOLE shared rule set, including the ~140
+    command-oriented built-ins -- and those match its path text incidentally: the
+    ``mkfs.*`` rule denies a read-only search of a directory named ``mkfs-tests``.  The
+    only per-rule remedy is disabling that rule by id, which also stops it protecting
+    real shell commands, so the collision costs a real control to clear.
+
+    Which patterns participate: exactly the ones the CALLER passes.  The hooks gate
+    passes the operator's own enabled regexes, and the companion overlay is evaluated
+    separately and unscoped a layer up (``PolicyAuthority``).  The shipped built-in
+    catalogue is NOT passed and takes no part in a synthesized target: a built-in cannot
+    express a scope rule for one -- none is authored against the grammar, ratcheted by
+    ``test_no_shipped_builtin_is_authored_against_the_grammar`` -- so its only possible
+    hit here is the incidental one this tier exists to drop.  A future built-in written
+    against the grammar fails that ratchet, which is the signal to give it an explicit
+    way in.
+
+    This is deliberately a caller-supplied SET rather than a filter applied here.  An
+    earlier revision classified the merged effective set by testing each pattern's text
+    against the shipped catalogue, and text cannot answer that question: an operator who
+    authors a pattern whose text coincides with a shipped one (``mkfs.*`` is a natural
+    thing to type) had their OWN rule read as shipped and dropped -- a silent fail-open on
+    an explicit deny.  Pattern text is not provenance.  Passing only what participates
+    makes provenance structural: there is nothing left to misclassify.
+
+    What this does NOT run, and why:
+
+    * The argv-structural floors (credential mint, self-kill, restart/update/cloud) and
+      the verb-anchored git-publish detector.  Each interprets SHELL SYNTAX, and a
+      synthesized target has none: its tokens are the namespace and ``key=value`` pairs,
+      values are whitespace-encoded by the synthesizer so one cannot split into two
+      tokens, and no such target can name a program.  A search of a tree cannot mint a
+      credential or kill a process, so these can only produce false positives here.  A
+      real command still reaches them through its own ``command`` target.
+    * Per-segment (pass 2) re-evaluation.  Segment splitting exists to isolate a chained
+      command inside one shell line; a synthesized target has no chaining semantics, so
+      splitting it only manufactures pseudo-commands out of path substrings -- the same
+      collision class, one layer down.
+
+    Args:
+        target: The synthesized target, e.g. ``"file-search path=/srv max_depth=3"``.
+        patterns: Regex-tier patterns that participate (the operator's own).  ``None``
+            or empty means the regex tier contributes nothing -- NOT that it falls back
+            to every built-in, which would be the opposite of this tier's contract.
+        extra_patterns: Glob-tier patterns that participate (``auto_deny_tools``).
+        reason_notes: Optional ``{pattern: operator note}`` map, presentation only.
+
+    Returns:
+        Denial reason string (mentioning the matched pattern), or ``None`` if allowed.
+    """
+    lower = target.lower()
+    all_patterns: list[tuple[str, bool]] = [(p, True) for p in list(patterns or [])] + [
+        (p, False) for p in list(extra_patterns or [])
+    ]
+    for pattern, is_regex in all_patterns:
+        if not _deny_pattern_matches(pattern, lower, is_regex):
+            continue
+        # No ``_DENY_EXCEPTIONS`` carve-out here.  That map ships EMPTY and its machinery
+        # is retained in ``is_denied`` only for a future scoped exception, so replicating
+        # it here would be dead symmetry.  If it ever gains an entry, this tier has to be
+        # revisited deliberately -- ``test_the_deny_exception_map_is_still_empty`` reddens
+        # then, so the omission cannot become a silent gap.
+        _emit_deny_event(target, pattern, lower)
+        return _deny_reason(pattern, reason_notes)
     return None
 
 

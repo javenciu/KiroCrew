@@ -7,6 +7,7 @@ const path = require("path");
 const http = require("http");
 
 const { findKirocrewBin } = require("./find-bin");
+const { buildGatewayEnvironment } = require("./gateway-env");
 const { resolveGatewayPath } = require("./mac-env");
 const {
   findMissingBundleParts,
@@ -20,7 +21,9 @@ const { createTokenRetryHandler } = require("./token-retry");
 const { createRendererRecovery } = require("./renderer-recovery");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
 const { exitImmersiveModes } = require("./blocking-prompt");
-const { hideToTray } = require("./hide-to-tray");
+const { armSplashHistoryClear } = require("./splash-history");
+const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
+const { attachHtmlFullScreen } = require("./html-fullscreen");
 const { shouldRetryLocalTokenMint, tokenMintRetryDelayMs, TOKEN_MINT_MAX_RETRIES } = require("./token-acquire");
 const { createDisplayMediaHandler } = require("./display-media");
 const { applyFocusModeChrome } = require("./focus-chrome");
@@ -50,7 +53,13 @@ const {
   windowsProcessCommand,
   windowsTaskkill,
 } = require("./windows-port");
-const { waitForGateway, describeGatewayFailure, tailLines, isPortInUse } = require("./gateway-wait");
+const {
+  gatewayWaitTimeoutMs,
+  waitForGateway,
+  describeGatewayFailure,
+  tailLines,
+  isPortInUse,
+} = require("./gateway-wait");
 const { describeSandboxProfileNeed } = require("./sandbox-profile");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
 const {
@@ -72,7 +81,8 @@ const {
   unrecoverableGatewayDialog,
 } = require("./gateway-recovery");
 const { capturePySpyDump } = require("./pyspy-dump");
-const { createMetricsRecorder } = require("./perf-metrics");
+const { createMetricsRecorder, profilingEnabled } = require("./perf-metrics");
+const { createPierrePerfLog } = require("./pierre-perf-log");
 const { identityFamily, decideGatewayAction, classifyGatewayReadiness, FAMILY_META, HEALTH_IDENTITY_PATH, READY_PATH } = require("./instance-guard");
 const { initMochi, shutdownMochi } = require("./mochi/index");
 const { borrowSessionToken } = require("./mochi-session-token");
@@ -150,6 +160,7 @@ const store = new Store({
     lastNudgedVersion: "",                 // last update version announced via native notification (nudge once per version)
     themeAccent: "",                       // user's resolved theme accent hex; injected into the boot splash
     updateChannel: "",                     // "" = follow the stable default; "insider"|"stable" = user opt-in (Settings > About)
+    autoDownloadUpdates: true,             // ON by default: a discovered update downloads in the background and installs on the next quit. false = notify only, download on request (Settings > About)
     runLocalGateway: true,                 // false = act as a pure client; never start a gateway on this machine
     linuxFrameless: null,                  // Linux window chrome: true = frameless, false = native frame, null = follow the desktop environment (see linux-frame.js)
   },
@@ -202,7 +213,6 @@ if (migrateRemoteHostConfig(store, PORT)) {
 }
 const HEALTH_URL = `${BACKEND_URL}/api/status`;
 const POLL_INTERVAL_MS = 500;
-const MAX_WAIT_MS = 30_000; // 30s max wait for backend
 const IS_MAC = process.platform === "darwin";
 const IS_WINDOWS = process.platform === "win32";
 const IS_WIN = IS_WINDOWS;
@@ -281,6 +291,9 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on("second-instance", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      // Relaunching the app is a request for the window back; it must win over
+      // a hide still deferred to the fullscreen exit (see hide-to-tray.js).
+      cancelPendingTrayHide(mainWindow);
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
       mainWindow.focus();
@@ -376,6 +389,12 @@ function glog(line) {
   try { fs.appendFileSync(gatewayLogPath(), entry); } catch { /* never let logging break launch */ }
   console.log(`[gateway-launch] ${line}`);
 }
+
+// Highlight-churn history for the renderer-crash post-mortem. Module scope
+// because the reports arrive on an ipcMain channel while the flush happens in
+// the window's render-process-gone handler. Holds only plain numbers, bounded to
+// its capacity, and writes nothing until a crash.
+const pierrePerfLog = createPierrePerfLog();
 
 // ── Cross-app gateway ownership (shared ~/.kiro/crew, shared port) ─────────
 // The nightly app and the production app are different bundles sharing one
@@ -969,7 +988,7 @@ function spawnGateway(resolve) {
           // without this every app launch opens a persistent console window
           // beside the Electron app. Ignored on POSIX.
           windowsHide: true,
-          env: {
+          env: buildGatewayEnvironment({
             ...cleanEnv,
             // Overrides the inherited PATH only when the launchd domain
             // actually contributed a directory (see resolveGatewayPath above);
@@ -990,7 +1009,7 @@ function spawnGateway(resolve) {
             // gateway spawns (app servers run on the same interpreter), so
             // the whole process tree stays out of the bundle.
             PYTHONPYCACHEPREFIX: path.join(kirocrewDir, "cache", "pycache"),
-          },
+          }),
         });
         gatewayProcess = child;
         // We own this child — recovery may kill+respawn it. Ownership
@@ -1232,7 +1251,13 @@ function waitForBackend(targetWin, healthUrl = HEALTH_URL, { watchSpawn = false 
     getFailure: watchSpawn ? (() => gatewayStartFailure) : (() => null),
     isWindowAlive: () => !targetWin?.isDestroyed(),
     onStatus: (msg) => { try { targetWin?.webContents?.send("status", msg); } catch { /* window gone */ } },
-    maxWaitMs: MAX_WAIT_MS,
+    // Windows may spend well past the ordinary deadline importing a newly
+    // installed bundled Python tree. Keep showing live splash progress only for
+    // the gateway child we spawned; exits still fail immediately via getFailure.
+    maxWaitMs: gatewayWaitTimeoutMs({
+      platform: process.platform,
+      watchSpawn: watchSpawn && gatewayOwnership === "spawned",
+    }),
     pollIntervalMs: POLL_INTERVAL_MS,
   });
 }
@@ -1422,6 +1447,17 @@ function setupWindowContents(win, backendUrl) {
   view.setBackgroundColor("#00000000");
   win.contentView.addChildView(view);
 
+  // Keep the boot splash / token prompt out of reachable navigation history:
+  // once the dashboard commits, prune the transient shell entries so mouse
+  // button 4 (Chromium's built-in history-back) cannot land the user on a
+  // dead-end loading.html with no way forward. Armed once per window; covers
+  // boot, the gateway reconnect/recovery re-paints, and the renderer-driven
+  // token-prompt handoff. See splash-history.js and #5538.
+  armSplashHistoryClear(view.webContents, {
+    isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
+    log: glog,
+  });
+
   // Clean up views when window is closed
   win.on("closed", () => {
     if (win._mcAgentChannel) void win._mcAgentChannel.stop();
@@ -1451,8 +1487,40 @@ function setupWindowContents(win, backendUrl) {
     if (win.isDestroyed() || view.webContents.isDestroyed()) return;
     view.webContents.send("fullscreen-changed", win.isFullScreen());
   };
-  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); });
-  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); });
+  // Fullscreen transitions fire before the window finishes reflowing, so the
+  // synchronous updateViewBounds() in the handlers below can read a pre-reflow
+  // content rect — the same stale-getContentBounds hazard the did-finish-load
+  // settle pass below documents. Observed on Linux, where the in-window menu
+  // bar's ~28px is reclaimed only after `leave-full-screen`, leaving the view
+  // taller than the window and clipping bottom-anchored rows until some other
+  // resize. Keep the synchronous call (already correct where reflow is
+  // immediate) and follow it with bounded deferred recomputes so the settled
+  // bounds win: a quick pass for the common fast reflow and a late backstop
+  // matching the startup settle delay for slow window managers. Re-reading
+  // bounds on an already-correct window is a no-op, so this runs on every
+  // platform rather than behind a process.platform gate. updateViewBounds()
+  // itself no-ops on a destroyed window; the timers are also cleared on
+  // "closed" so nothing fires into a torn-down window.
+  let fullscreenSettleTimers = [];
+  const scheduleFullscreenSettle = () => {
+    for (const t of fullscreenSettleTimers) clearTimeout(t);
+    fullscreenSettleTimers = [250, 1500].map((ms) => setTimeout(updateViewBounds, ms));
+  };
+  win.on("closed", () => { for (const t of fullscreenSettleTimers) clearTimeout(t); });
+  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  // DOM fullscreen (an inline <video>'s fullscreen button, the media viewer) is
+  // a SEPARATE pair of events from the two above, raised on the WebContents
+  // rather than the window. Without this bridge the element goes :fullscreen
+  // inside a WebContentsView still clamped to the un-fullscreened window, so
+  // nothing visibly happens. `enter-full-screen` above then re-runs
+  // updateViewBounds() so the view grows into the new content rect.
+  //
+  // Parked on the window (same pattern as _mcBrowserPanels) because
+  // persistMainWindowState() must ask whether the CURRENT fullscreen is one the
+  // bridge raised: a video's fullscreen is not a window preference and must not
+  // be what a quit mid-playback relaunches into.
+  win._mcHtmlFullScreen = attachHtmlFullScreen({ win, webContents: view.webContents });
   // The initial updateViewBounds() above runs before win.show() and before the
   // dashboard finishes loading, so getContentBounds() can return a pre-layout
   // size — leaving the WebContentsView mis-sized (content overflows / gets cut
@@ -2081,7 +2149,13 @@ function syncLinuxMaximizeState(win, view) {
 // menu's Keep on Top toggle can trigger a save. No-op while mainWindow is
 // absent/destroyed (captureWindowState returns null).
 function persistMainWindowState() {
-  const s = captureWindowState(mainWindow);
+  const s = captureWindowState(mainWindow, {
+    // A fullscreen the DOM-fullscreen bridge raised for a `<video>` is the app's
+    // doing, not the user's preference, so it must never be the state we relaunch
+    // into after a quit or crash mid-playback. The bridge is the only thing that
+    // knows which transitions are its own.
+    transientFullScreen: mainWindow?._mcHtmlFullScreen?.raisedWindow() === true,
+  });
   if (s) store.set("windowState", s);
 }
 
@@ -2252,6 +2326,13 @@ function createWindow() {
     },
   });
   mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    // Flush the highlight history FIRST so the log reads in causal order: what
+    // the highlighter was doing, then the death and what the processes had grown
+    // to. Unconditional -- this is the moment the buffer was kept for, and it is
+    // also the one moment the write cost is justified. An empty flush is itself
+    // informative: no highlighting in the last two minutes points away from the
+    // Pierre worker pool as the cause.
+    for (const line of pierrePerfLog.flush()) glog(line);
     rendererRecovery.handleGone(details || {});
   });
 
@@ -2277,6 +2358,13 @@ function createWindow() {
 }
 
 function createTray() {
+  // A tray gesture asking for the window back must first disarm any hide that
+  // hideToTray() deferred to the fullscreen exit, or the show is undone moments
+  // later when the exit completes (see hide-to-tray.js CANCELLATION).
+  const showFromTray = () => {
+    cancelPendingTrayHide(mainWindow);
+    mainWindow?.show();
+  };
   // Nightly ships its own icon (night-sky variant) so the menu-bar presence
   // matches the Dock identity; app.name was set channel-aware at boot.
   const nightly = identityFamily(app.getVersion()) === "nightly";
@@ -2314,7 +2402,7 @@ function createTray() {
   // tabs were removed with the single-surface shell redesign).
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: `Show ${app.name}`, click: () => mainWindow?.show() },
+      { label: `Show ${app.name}`, click: showFromTray },
       { type: "separator" },
       { label: "New Connection Window…", click: () => openNewConnectionWindow() },
       { type: "separator" },
@@ -2323,7 +2411,7 @@ function createTray() {
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
     ])
   );
-  tray.on("click", () => mainWindow?.show());
+  tray.on("click", showFromTray);
 }
 
 // ── Remote host settings ──
@@ -3145,6 +3233,9 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
 
 async function openNewConnectionWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  // Reachable from the tray menu during the deferred fullscreen-exit hide; the
+  // pending hide would otherwise take the parent away from under the modal.
+  cancelPendingTrayHide(mainWindow);
   mainWindow.show();
 
   const css = await getModalCSS();
@@ -3444,6 +3535,9 @@ app.whenReady().then(async () => {
   const openSettingsPage = (tab) => {
     const win = focusedDashboardWindow();
     if (!win) return;
+    // The window may be mid deferred-hide (still visible, still focusable);
+    // opening settings on it is a request to keep it, not lose it 2s later.
+    cancelPendingTrayHide(win);
     if (win.isMinimized()) win.restore();
     win.show();
     win.focus();
@@ -3865,6 +3959,34 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Pierre highlight-churn reports (src/lib/pierrePerf.ts). Buffered in memory
+  // and flushed to the log only when the renderer dies -- see pierre-perf-log.js
+  // for why nothing is written in steady state (glog has no rotation, so a line
+  // every few seconds would grow the user's log without bound).
+  //
+  // The payoff: every future renderer crash carries the two minutes of
+  // highlighter activity that preceded it, on a normal install, with no env var
+  // set ahead of time.
+  //
+  // KIROCREW_DEBUG additionally logs each window as it arrives, for watching a
+  // live reproduction instead of reading a post-mortem. Checked per message so
+  // toggling the variable needs no rebuild.
+  ipcMain.on("pierre-perf", (_event, w) => {
+    // Only the primary renderer's activity belongs in this buffer. The channel is
+    // reachable from any window that loads the shared preload (companion panels,
+    // secondary dashboards), but the flush is triggered by THIS window's
+    // render-process-gone -- so accepting a sibling's reports would file its
+    // highlighting under the primary renderer's crash history and point the
+    // post-mortem at the wrong process. Mis-attributed evidence is worse than
+    // none, because it is acted upon.
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (_event.sender !== mainWindow.webContents) return;
+    if (!pierrePerfLog.record(w)) return;
+    if (!profilingEnabled(process.env)) return;
+    const line = pierrePerfLog.lastLine();
+    if (line) glog(line);
+  });
+
   createTray();
   const win = createWindow();
   // Bind the summon hotkey only now that the main window exists: registering
@@ -3918,18 +4040,31 @@ app.whenReady().then(async () => {
     Notification,
     getFlavor: () => "stable",
     getChannelPreference: () => store.get("updateChannel", ""),
-    // Once-per-version nudge: tell the user an update exists; downloading and
-    // installing stay in Settings > About (the in-app dot guides them there).
-    notifyUpdateFound: (version) => {
+    // ON by default (see the store defaults). The updater reads this per
+    // discovery, so a Settings toggle takes effect on the next check.
+    getAutoDownloadPreference: () => store.get("autoDownloadUpdates", true) !== false,
+    // Once-per-version nudge. The copy has to match what actually happens next,
+    // so it branches on the mode the updater already decided and passed in --
+    // re-reading the store here could disagree with that decision if the
+    // preference changed between the two reads.
+    notifyUpdateFound: (version, { autoDownload = false } = {}) => {
       if (!version || store.get("lastNudgedVersion", "") === version) return;
       store.set("lastNudgedVersion", version);
       try {
         const n = new Notification({
           title: `${app.name} update available`,
-          body: `Version ${version} is ready. Open Settings > About to download and install.`,
+          body: autoDownload
+            // Names the opt-out. This notification is where an existing user
+            // first learns the default flipped, so it is the one place that
+            // must not assert the new behaviour without saying how to decline
+            // it -- the consent-mode sibling already points at the same panel.
+            ? `Version ${version} is downloading and will install the next time you quit. `
+              + "Manage in Settings > About."
+            : `Version ${version} is ready. Open Settings > About to download and install.`,
         });
         n.on("click", () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
+            cancelPendingTrayHide(mainWindow);
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
             mainWindow.focus();
@@ -3998,6 +4133,21 @@ app.whenReady().then(async () => {
     updater.check();
     return { ok: true, info: updaterInfo() };
   });
+  // Auto-download opt-out. Turning it ON re-checks so a version already
+  // discovered this session starts downloading now instead of waiting up to
+  // four hours for the next poll. Turning it OFF keeps any bytes already
+  // fetched -- discarding a verified stage would leave the user with nothing to
+  // show for the transfer -- but it DOES disarm the install-on-quit for a stage
+  // that was downloaded automatically, so the update the user just declined
+  // does not land on their next quit. An explicit Install still applies it.
+  ipcMain.handle("update:set-auto-download", (_e, enabled) => {
+    if (typeof enabled !== "boolean") {
+      return { ok: false, error: `invalid value: ${typeof enabled}` };
+    }
+    store.set("autoDownloadUpdates", enabled);
+    if (enabled) updater.check();
+    return { ok: true, info: updaterInfo() };
+  });
 
   await startGateway();
   await showLoadingThenConnect(win);
@@ -4023,6 +4173,12 @@ app.whenReady().then(async () => {
   }
 
   app.on("activate", () => {
+    // An activate landing while hideToTray() is still waiting out the
+    // fullscreen-exit animation must win over the pending hide: the window is
+    // still visible at this point, so the isVisible() guard below would skip
+    // the show and the deferred hide would then take the window away — the
+    // user clicked the Dock icon and watched the window vanish.
+    cancelPendingTrayHide(mainWindow);
     if (!mainWindow?.isVisible()) mainWindow?.show();
   });
 });

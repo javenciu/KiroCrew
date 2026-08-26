@@ -1,34 +1,12 @@
-"""Collection-time platform gate for the Code Review Sage suite.
+"""Shared fixtures for the Code Review Sage suite.
 
-Two independent reasons, both still true:
-
-* the app refuses to run on Windows — `sage_lib/discovery.py` raises because its
-  review worker invokes `python3`, which is not an interpreter there; and
-* these tests assert POSIX behaviour throughout anyway (`0600` file modes,
-  forward-slash path suffixes, shell-script `gh` stubs the Windows runner cannot
-  execute).
-
-Note what changed and what did not. The provider-CLI trust gate Sage shares with
-Issue Radar is no longer POSIX-only: `github_runner.validate_provider_executable`
-now answers from the Windows ACL. Sage's own refusal is narrower than it was — it
-names the interpreter, not the trust check — but it is still a refusal, so
-running this suite on Windows would still exercise a configuration the app
-rejects.
-
-This lives next to the suite it gates, so the reason travels with the tests
-rather than sitting in a CI workflow that would hide it.
+The suite collects on every platform. Tests that pin inherently POSIX
+behaviour carry their own ``skipUnless`` guards (owner-only mode bits,
+unprivileged symlinks), so this module carries no platform gate -- only the
+fixtures every platform needs.
 """
 
-import os
-
 import pytest
-
-collect_ignore_glob = ["*"] if os.name == "nt" else []
-
-pytestmark = pytest.mark.skipif(
-    os.name == "nt",
-    reason="Code Review Sage does not run on Windows yet (see sage_lib/discovery.py)",
-)
 
 
 @pytest.fixture(autouse=True)

@@ -316,6 +316,15 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     api_skills_create,
     api_skills_pending,
     api_skills_pending_dismiss_all,
+    api_skills_trust,
+    api_skills_trust_grant,
+    api_skills_trust_revoke,
+)
+
+# ── Session work ledger (handlers/session_ledger.py) ──
+from kiro_crew.dashboard.handlers.session_ledger import (  # noqa: E402, F401
+    api_session_ledger_get,
+    api_session_ledger_record,
 )
 
 # ── Sessions (extracted to handlers/sessions.py) ──
@@ -326,6 +335,7 @@ from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
     api_session_storage,
     api_session_storage_cleanup,
     api_session_storage_empty,
+    api_session_storage_empty_status,
     api_session_storage_restore,
 )
 from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
@@ -381,6 +391,12 @@ from kiro_crew.dashboard.handlers.steering import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.tailnet import (  # noqa: E402, F401
     api_tailnet_status,
 )
+from kiro_crew.dashboard.handlers.tailnet_mobile import (  # noqa: E402, F401
+    api_tailnet_mobile_publish,
+    api_tailnet_mobile_qr,
+    api_tailnet_mobile_status,
+    api_tailnet_mobile_unpublish,
+)
 
 # ── Task Runner (extracted to handlers/taskrunner.py) ──
 from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
@@ -411,6 +427,7 @@ from kiro_crew.dashboard.handlers.telemetry import (  # noqa: E402, F401
     api_collection_status,
     api_context_trace,
     api_telemetry_startup,
+    api_usage_turns,
 )
 from kiro_crew.dashboard.handlers.terminal import (  # noqa: E402, F401
     api_terminal_complete,

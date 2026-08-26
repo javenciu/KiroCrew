@@ -47,6 +47,7 @@ vi.mock('../api/client', () => ({
     getWeComConfig: vi.fn().mockRejectedValue(new Error('boom')),
     getWeixinConfig: vi.fn().mockResolvedValue({ connected: false, configured: false }),
     getIMessageConfig: vi.fn().mockResolvedValue({ connected: false, configured: false }),
+    getWhatsAppConfig: vi.fn().mockResolvedValue({ connected: false, configured: false }),
     // Governance policy map; default all-permitted so the existing (non-governance)
     // tests are unaffected. Governance-specific tests override it per case.
     getGovernanceChannels: (...a: unknown[]) => govChannelsMock(...a),
@@ -133,7 +134,7 @@ describe('ChannelsPanel — wide (two-pane)', () => {
     renderAt()
     expect(await screen.findByText('Connected')).toBeInTheDocument()       // slack
     expect(await screen.findByText('Not connected')).toBeInTheDocument()   // discord
-    expect((await screen.findAllByText('Needs setup')).length).toBe(5)     // telegram, webex, teams, weixin, imessage
+    expect((await screen.findAllByText('Needs setup')).length).toBe(6)     // telegram, webex, teams, weixin, imessage, whatsapp
     expect(await screen.findByText('Status unavailable')).toBeInTheDocument() // wecom (fetch error)
   })
 })
@@ -142,16 +143,16 @@ describe('ChannelsPanel — narrow (list <-> detail)', () => {
   it('shows only the list when nothing is selected', () => {
     mockWidth = 500
     renderAt()
-    expect(screen.getByRole('listbox', { name: 'Chat channels' })).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: 'Chat channels' })).toBeInTheDocument()
     expect(screen.queryByTestId('slack-panel')).not.toBeInTheDocument()
   })
 
   it('drills into a full-width detail with a back button on row click', async () => {
     mockWidth = 500
     renderAt()
-    fireEvent.click(screen.getByRole('option', { name: /Discord/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Discord/ }))
     expect(await screen.findByTestId('discord-panel')).toBeInTheDocument()
-    expect(screen.queryByRole('listbox', { name: 'Chat channels' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('list', { name: 'Chat channels' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Channels/ })).toBeInTheDocument()
   })
 
@@ -159,14 +160,14 @@ describe('ChannelsPanel — narrow (list <-> detail)', () => {
     mockWidth = 500
     renderAt('/settings?tab=channels&channel=discord')
     fireEvent.click(screen.getByRole('button', { name: /Channels/ }))
-    expect(screen.getByRole('listbox', { name: 'Chat channels' })).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: 'Chat channels' })).toBeInTheDocument()
     expect(screen.queryByTestId('discord-panel')).not.toBeInTheDocument()
   })
 
   it('ignores an invalid ?channel= value and shows the list', () => {
     mockWidth = 500
     renderAt('/settings?tab=channels&channel=nonsense')
-    expect(screen.getByRole('listbox', { name: 'Chat channels' })).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: 'Chat channels' })).toBeInTheDocument()
   })
 })
 
@@ -208,7 +209,7 @@ describe('ChannelsPanel — width transitions preserve the mounted panel', () =>
     // channel param was stamped during the null-width paint.
     mockWidth = 500
     rerender(ui())
-    expect(screen.getByRole('listbox', { name: 'Chat channels' })).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: 'Chat channels' })).toBeInTheDocument()
     expect(screen.queryByTestId('slack-panel')).not.toBeInTheDocument()
   })
 })

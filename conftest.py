@@ -13,7 +13,7 @@ test collected from any testpath, because what they protect is the
 developer's machine rather than the correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has five parts, and each one exists because the "remember to isolate
+The floor has six parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
@@ -25,6 +25,10 @@ this" contract failed at least once:
   under ``src/kiro_crew/apps/builtins/*/tests/`` -- which see this conftest and no
   other -- write the operator's live ``~/.kiro/crew`` the moment they touch
   ``config_dir()``.
+* **Credential environment.** Recognised fixed credentials and validated
+  ``JIRA_TOKEN_<HEX>`` keys are restored after every test, so a fabricated
+  ``.env`` cannot silently override the next test's credentials in the same
+  worker.
 * **The agent-spec home.** ``kiro_agents_dir()`` is a LAZY resolver, so neither of
   the two above reaches it, and a test that reaches the spec write path rewrites
   the machine-wide ``<kiro home>/agents/kirocrew.json`` -- the file that decides
@@ -35,7 +39,10 @@ this" contract failed at least once:
   directory for the whole process, so a bare ``mkdtemp()`` whose cleanup is missing
   or skipped leaves its directory somewhere this run owns and removes, instead of
   accumulating in the shared temp root forever. What was left behind is REPORTED
-  first, so the leak is a red rather than silent inode consumption.
+  first, so the leak is a red rather than silent inode consumption. On macOS the
+  base is additionally moved to ``/tmp`` -- the prefix Linux and CI already use --
+  because the launchd per-user temp dir is long enough to break an AF_UNIX bind and
+  random enough to read as a credential. See :data:`_SHORT_TMP_BASE`.
 * **The repository checkout.** The run fails when it ends with residue anywhere in
   the checkout, which is how a subprocess spawned without ``cwd=`` announces
   itself.
@@ -94,6 +101,32 @@ import threading
 import warnings
 
 import pytest
+
+
+def _root_can_create_real_symlink() -> bool:
+    """Probe real-link capability for tests collected outside ``test/`` too.
+
+    Ordinary Windows shells commonly lack ``SeCreateSymbolicLinkPrivilege``.
+    This is a capability probe, not an OS guess: Developer Mode/elevated Windows
+    runners retain the security coverage, while only the exact tests inventoried
+    in ``test/requires-real-symlinks.txt`` skip on an incapable host.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "target")
+        os.mkdir(target)
+        try:
+            os.symlink(
+                target,
+                os.path.join(tmp, "link"),
+                target_is_directory=True,
+            )
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        return True
+
+
+_ROOT_HAS_REAL_SYMLINKS = _root_can_create_real_symlink()
+
 
 #: Service managers whose *mutating* subcommands reconfigure, start, or stop a
 #: real service. Matched on BASENAME against every token of the argv, not just
@@ -360,6 +393,51 @@ def _isolate_launchd_paths(_xdg_config_root, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_credential_env_residue():
+    """Restore the credential env vars a test may have had INJECTED into it.
+
+    ``KiroCrewConfig.load_credentials()`` deliberately propagates every credential
+    it reads into ``os.environ`` with ``setdefault``, so a spawned child (sandboxed
+    agent, MCP server, cron subprocess) inherits it through ``Popen``'s default
+    ``env=os.environ.copy()``. Any test that points ``env_path()`` at a fabricated
+    ``.env`` therefore leaves those fake credentials in the WORKER's environment,
+    for every test that follows it.
+
+    The usual guard does not catch this, which is what makes it worth a floor:
+    ``monkeypatch.delenv(KEY, raising=False)`` on a key that is ABSENT records
+    nothing to undo, so a value written during the test is restored to nothing.
+
+    And the residue is not inert -- ``load_credentials`` lets ``os.environ`` WIN
+    over the file it just read, so the next test pointing at a different ``.env``
+    is answered with the previous test's token. Observed between
+    ``test_handlers_messaging_coverage.py`` and ``test_review_fixes.py``: a Slack
+    token from one file's temp ``.env`` silently satisfied the other's assertion,
+    and only when both landed in the same worker.
+
+    Bounded to the recognised fixed keys and the validated ``JIRA_TOKEN_<HEX>``
+    shape. Two linear environment scans per test also catch a dynamic key that
+    did not exist at setup, without masking an unrelated environment change.
+    """
+    from kiro_crew.config.loader import _CREDENTIAL_KEYS, _JIRA_TOKEN_RE
+
+    fixed = frozenset(_CREDENTIAL_KEYS)
+
+    def _is_credential(key: str) -> bool:
+        return key in fixed or _JIRA_TOKEN_RE.match(key) is not None
+
+    before = {key: value for key, value in os.environ.items() if _is_credential(key)}
+    try:
+        yield
+    finally:
+        current = {key for key in os.environ if _is_credential(key)}
+        for key in current | before.keys():
+            if key not in before:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = before[key]
+
+
+@pytest.fixture(autouse=True)
 def _block_host_service_mutation(request, monkeypatch):
     """Fail loudly if a test really starts, stops, or reconfigures a service.
 
@@ -470,8 +548,52 @@ _TESTS_SINCE_LINECACHE_CLEAR = 0
 _FROZEN_AT_COLLECTION: int | None = None
 
 
+#: A short, path-shaped temp prefix for Darwin. macOS resolves the per-user temp dir to
+#: ``/var/folders/<2 chars>/<30 random chars>/T``, which is both LONG and free of any
+#: character outside ``[A-Za-z0-9/]`` -- and two limits the suite has nothing to do with
+#: fall straight out of that:
+#:
+#: * ``sun_path`` for an AF_UNIX socket is 104 bytes on Darwin (108 on Linux), so a
+#:   socket under a pytest temp dir cannot be bound at all: ``OSError: AF_UNIX path too
+#:   long`` is raised before the behaviour under test runs.
+#: * ``security._BARE_SECRET_RUN_RE`` matches a >=40-character run of ``[A-Za-z0-9+/]``,
+#:   and ``/`` is IN that class, so a temp path is ONE contiguous run. The 30-character
+#:   random segment carries that run over the 4.3-bits/char entropy floor whose whole
+#:   job is to keep file paths out, so any temp path echoed through a redactor comes
+#:   back ``[REDACTED: credential]`` and the assertion sees a mangled path.
+#:
+#: Both are properties of the HOST's temp prefix rather than of the code under test:
+#: these same tests pass on Linux and in CI, where ``gettempdir()`` is ``/tmp``. Giving
+#: macOS the prefix Linux already has is the smallest change that removes both, and it
+#: removes them for every test at once instead of teaching each one about a platform
+#: limit it is not about.
+#:
+#: The posture does not change. ``/tmp`` is world-writable with a sticky bit on Linux
+#: too, pytest still builds its per-user ``pytest-of-<user>`` tree inside it, and this
+#: file's own temp root is still ``mkdtemp``-created with O_EXCL and mode 0700 -- see
+#: :func:`_create_tmp_root` for why that is what makes a shared parent safe.
+_SHORT_TMP_BASE = "/tmp"
+
+
+def _prefer_short_tmp_base() -> None:
+    """Point this run's temp base at :data:`_SHORT_TMP_BASE` on Darwin.
+
+    Called from ``pytest_configure``, which is early enough: pytest resolves its
+    ``basetemp`` lazily from ``tempfile.gettempdir()`` on the first ``mktemp`` /
+    ``getbasetemp()``, and that cannot happen before a fixture runs. Both the module
+    global and the env vars are set, because ``gettempdir()`` MEMOISES into
+    ``tempfile.tempdir`` and a spawned child reads the env instead.
+    """
+    if sys.platform != "darwin" or not os.path.isdir(_SHORT_TMP_BASE):
+        return
+    tempfile.tempdir = _SHORT_TMP_BASE
+    for name in _TMP_ENV_VARS:
+        os.environ[name] = _SHORT_TMP_BASE
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Record the working directory pytest started in, before any test can move it."""
+    _prefer_short_tmp_base()
     global _SESSION_CWD
     try:
         _SESSION_CWD = os.getcwd()
@@ -902,7 +1024,13 @@ def pytest_runtest_setup(item):
 
 
 def pytest_collection_modifyitems(config, items):
-    """On Windows, skip the tracked known-gap tests (all parametrizations).
+    """Apply exact capability skips, then Windows' tracked known-gap skips.
+
+    Real-symlink tests are listed individually rather than intercepting
+    ``os.symlink`` globally.  A global interception also catches production
+    compatibility helpers before they can handle WinError 1314 and fall back to
+    a junction, silently dropping the Windows behavior those tests exist to
+    cover.  Exact collection markers leave every non-link path untouched.
 
     The list lives in ``test/windows-expected-failures.txt`` -- one unparametrized node
     id per line, captured from the first Windows CI runs. It is a burn-down backlog:
@@ -920,6 +1048,24 @@ def pytest_collection_modifyitems(config, items):
     always spelled with ``/`` even on Windows, so the in-package entries need no
     translation.
     """
+    if not _ROOT_HAS_REAL_SYMLINKS:
+        listfile = _REPO_ROOT / "test" / "requires-real-symlinks.txt"
+        try:
+            text = listfile.read_text(encoding="utf-8")
+        except OSError:  # pragma: no cover - list file absent in a partial checkout
+            text = ""
+        requires_real_symlink = {
+            _base_nodeid(ln.strip())
+            for ln in text.splitlines()
+            if ln.strip() and not ln.startswith("#")
+        }
+        marker = pytest.mark.skip(
+            reason="test requires real symlink creation; host lacks that capability"
+        )
+        for item in items:
+            if _base_nodeid(item.nodeid) in requires_real_symlink:
+                item.add_marker(marker)
+
     if not platform_compat_or_none() or not platform_compat_or_none().IS_WINDOWS:
         return
     listfile = _REPO_ROOT / "test" / "windows-expected-failures.txt"
@@ -1875,10 +2021,7 @@ def _drain_windows_proactor_finalizers() -> None:
     def _suppress_closed_loop(unraisable: sys.UnraisableHookArgs) -> None:
         """Suppress 'Event loop is closed' from transport __del__."""
         exc = unraisable.exc_value
-        if (
-            isinstance(exc, RuntimeError)
-            and str(exc) == "Event loop is closed"
-        ):
+        if isinstance(exc, RuntimeError) and str(exc) == "Event loop is closed":
             # Silently swallow — the transport is being finalized after its loop
             # closed, which is harmless (the I/O is already done).
             return

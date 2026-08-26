@@ -25,7 +25,8 @@ import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/r
 import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
 import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
-import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import { isChatPageSurface, slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import ErrorNotice from '../components/ErrorNotice'
 import { toolStatusLabel } from '../utils/toolStatusLabel'
 import { sessionRefBlockReason, type SessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup, Badge } from '../components/ui'
@@ -43,7 +44,7 @@ import { useSessionActions } from '../hooks/useSessionActions'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 import { platformShortcut } from '../utils/platform'
-import { useImeGuard } from '../hooks/useImeGuard'
+import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import { safeSetItem } from '../utils/safeStorage'
@@ -77,6 +78,7 @@ import { focusSiblingSessionRow, SESSION_ROW_SELECTOR } from './chat/sessionRowN
 import { focusComposer } from './chat/composerFocus'
 import { compareBySort, comparePinnedThenSort, fmtRelativeTime, slotActivityTs } from './chat/sessionOrder'
 import type { SortKey } from './chat/sessionOrder'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields, fmtList } from '../i18n/format'
@@ -1323,6 +1325,7 @@ function ChatSidebar({
   defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSource, collapsible,
   chatDropTarget, onDropSessionRef,
 }: ChatSidebarProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
   const queryClient = useQueryClient()
   const ime = useImeGuard()
@@ -1339,6 +1342,16 @@ function ChatSidebar({
   const [seedError, setSeedError] = useState('')
   const [slotFilter, setSlotFilter] = useState('')
   const [historyFilter, setHistoryFilter] = useState('')
+  // A resumed history row whose surface ChatPage cannot display (e.g. a
+  // dashboard session) used to succeed on the wire and then silently bounce
+  // the user back to whatever slot was already open, indistinguishable from a
+  // dead click (#3624). Set right after such a resume resolves; cleared on
+  // dismiss or the next resume attempt.
+  const [unresumableNotice, setUnresumableNotice] = useState<string | null>(null)
+  // Monotonic guard for the resume promise chain below: rapid successive row
+  // clicks each start a resume, and an EARLIER one resolving after a LATER one
+  // must not show (or clear) feedback for a row the user has moved past.
+  const resumeSeqRef = useRef(0)
   // Digest of session keys + titles (NOT status), fed to both searches as their
   // revalidate signal. Sorted+joined so reordering `slots` alone cannot refetch.
   const slotTitleDigest = useMemo(
@@ -1669,7 +1682,7 @@ function ChatSidebar({
       out[s.key] = {
         count: mine.length,
         label: mine.length > 1
-          ? `${mine.length} workflows running`
+          ? i18nT('pages.chatSidebar.workflow_running', { count: mine.length })
           : `${name}${phase ? ` · ${phase}` : ''}`,
       }
     }
@@ -1895,7 +1908,7 @@ function ChatSidebar({
       // list when some slots' resets raised. Surface it and keep the panel
       // open instead of silently closing on a partial success.
       if (res.failed?.length) {
-        setBulkModelError(`${res.failed.length} session${res.failed.length !== 1 ? 's' : ''} failed to switch`)
+        setBulkModelError(i18nT('pages.chatSidebar.session_failed_to_switch', { count: res.failed.length }))
       } else {
         setBulkModelOpen(false)
         setBulkModel('')
@@ -2089,6 +2102,12 @@ function ChatSidebar({
   // together with the onKeyDown (Escape + Tab-trap) on the popover, this makes the
   // portaled overlay fully keyboard-operable.
   const columnPopoverRef = useRef<HTMLDivElement>(null)
+  // Shared IME latch for the popover's Tab trap: a Tab that lands during an
+  // IME composition (or its post-`compositionend` window) is choosing a
+  // candidate, not leaving the field, so the trap must decline it instead of
+  // yanking focus and aborting the composition (`useDialogFocusTrap` is the
+  // reference consumer of the same seam).
+  const columnPopoverImeLatch = useDocumentImeLatch(columnEditId !== null)
   const closeColumnPopover = useCallback((colId: string) => {
     setColumnEditId(null)
     requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-testid="column-edit-${colId}"]`)?.focus())
@@ -3476,16 +3495,14 @@ function ChatSidebar({
     const subagentQueuedCount = Math.min(subagentQueued?.[s.key] || 0, subagentActive)
     const subagentStarted = subagentActive - subagentQueuedCount
     const subagentLabel = subagentStarted === 0
-      ? `${subagentQueuedCount} agent${subagentQueuedCount === 1 ? '' : 's'} queued`
+      // Reuses the subagentRunCard keys: same meaning, same grammatical role
+      // (counted agents queued/running), so a second namespace would be a
+      // byte-identical duplicate across all 12 catalogs.
+      ? i18nT('pages.chat.subagentRunCard.agent_queued', { count: subagentQueuedCount })
       : subagentQueuedCount > 0
         ? i18nT('pages.chatSidebar.running_queued', { started: subagentStarted, queued: subagentQueuedCount })
-        : `${subagentStarted} agent${subagentStarted === 1 ? '' : 's'} running`
-    // Plain literal, like the running/queued label above it: `en.json` is
-    // codemod-generated and carries no interpolated values, so a counted
-    // string belongs in code until both sibling labels are localized together.
-    const subagentApprovalLabel = subagentAwaiting === 1
-      ? '1 sub-agent needs approval'
-      : `${subagentAwaiting} sub-agents need approval`
+        : i18nT('pages.chat.subagentRunCard.agent_running', { count: subagentStarted })
+    const subagentApprovalLabel = i18nT('pages.chatSidebar.sub_agent_needs_approval', { count: subagentAwaiting })
     const wfActive = workflowActive[s.key]
     // The agent's own ask: a question card the user has not answered yet. The
     // turn is parked on it, so this replaces a "Thinking…" that would otherwise
@@ -3633,7 +3650,7 @@ function ChatSidebar({
         key: 'workflow',
         when: !!wfActive,
         build: () => (
-          <div className={ROW_STATUS_LINE_ACCENT_CLS} title={`${wfActive?.count ?? 0} workflow${(wfActive?.count ?? 0) > 1 ? 's' : ''} running`}>
+          <div className={ROW_STATUS_LINE_ACCENT_CLS} title={i18nT('pages.chatSidebar.workflow_running', { count: wfActive?.count ?? 0 })}>
             <Workflow size={ROW_ICON_PX} className="shrink-0 text-accent animate-pulse" aria-hidden />
             <span className="truncate">{wfActive?.label}</span>
           </div>
@@ -4246,7 +4263,7 @@ function ChatSidebar({
           type="button"
           onClick={() => toggleReveal(containerKey)}
           aria-expanded={open}
-          title={open ? i18nT('pages.chatSidebar.collapse_hidden_folders') : `Show ${n} hidden folder${n === 1 ? '' : 's'}`}
+          title={open ? i18nT('pages.chatSidebar.collapse_hidden_folders') : i18nT('pages.chatSidebar.show_hidden_folder', { count: n })}
           className="w-full flex items-center gap-1.5 py-1 pr-2 text-left text-[11px] text-muted hover:text-fg hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
           style={{ paddingLeft: `${8 + depth * 12}px` }}
         >
@@ -4649,7 +4666,7 @@ function ChatSidebar({
               <Btn className="text-[12px] px-3 py-1 bg-accent text-accent-fg hover:bg-accent-hover" disabled={archivable.length === 0 || cleanupMutation.isPending || cleanupPreviewLoading} onClick={() => {
                 setCleanupError('')
                 cleanupMutation.mutate()
-              }}>{cleanupMutation.isPending ? i18nT('pages.chatSidebar.archiving') : `Archive ${archivable.length} session${archivable.length !== 1 ? 's' : ''}`}</Btn>
+              }}>{cleanupMutation.isPending ? i18nT('pages.chatSidebar.archiving') : i18nT('pages.chatSidebar.archive_session', { count: archivable.length })}</Btn>
             </div>
           </div>
         )
@@ -4674,7 +4691,7 @@ function ChatSidebar({
           <div className="flex items-center gap-2 justify-end">
             {bulkModelError && <span className="text-[11px] text-danger flex-1">{bulkModelError}</span>}
             <Btn className="text-[12px] px-3 py-1" onClick={() => { setBulkModelOpen(false); setBulkModel(''); setBulkModelError('') }}>{i18nT('pages.chatSidebar.cancel')}</Btn>
-            <Btn className="text-[12px] px-3 py-1 bg-accent text-accent-fg hover:bg-accent-hover" disabled={!bulkModel || bulkAffectedCount === 0 || bulkModelMutation.isPending} onClick={() => { setBulkModelError(''); bulkModelMutation.mutate({ model: bulkModel, skipRunning: bulkSkipRunning }) }}>{bulkModelMutation.isPending ? i18nT('pages.chatSidebar.switching') : `Switch ${bulkAffectedCount} session${bulkAffectedCount !== 1 ? 's' : ''}`}</Btn>
+            <Btn className="text-[12px] px-3 py-1 bg-accent text-accent-fg hover:bg-accent-hover" disabled={!bulkModel || bulkAffectedCount === 0 || bulkModelMutation.isPending} onClick={() => { setBulkModelError(''); bulkModelMutation.mutate({ model: bulkModel, skipRunning: bulkSkipRunning }) }}>{bulkModelMutation.isPending ? i18nT('pages.chatSidebar.switching') : i18nT('pages.chatSidebar.switch_session', { count: bulkAffectedCount })}</Btn>
           </div>
         </div>
       )}
@@ -5326,8 +5343,22 @@ function ChatSidebar({
                         const f = Array.from(root.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input:not([disabled]),[tabindex]:not([tabindex="-1"])'))
                         if (f.length === 0) return
                         const first = f[0], last = f[f.length - 1]
-                        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
-                        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+                        const wrapsBackward = e.shiftKey && document.activeElement === first
+                        const wrapsForward = !e.shiftKey && document.activeElement === last
+                        // A mid-popover Tab is the browser's to move, and not the trap's
+                        // to claim. A boundary Tab the IME owns must not cycle focus —
+                        // the user is choosing a candidate, not leaving the field —
+                        // so `claimKey` (native-event contract in useImeGuard.ts) runs
+                        // before the preventDefault() and focus move.
+                        if (!wrapsBackward && !wrapsForward) return
+                        // `claimKey` consumes the native event (document/window
+                        // listeners), but React 17+ checks the SYNTHETIC propagation
+                        // flag when walking component ancestors — stop that half too
+                        // so a declined Tab cannot trigger an ancestor's own
+                        // keyboard handling.
+                        if (!columnPopoverImeLatch.claimKey(e.nativeEvent)) { e.stopPropagation(); return }
+                        e.preventDefault()
+                        ;(wrapsBackward ? last : first).focus()
                       }}>
                       <div className="flex items-center justify-between mb-1">
                         <span className="text-[11px] font-semibold text-muted uppercase tracking-wider">{i18nT('pages.chatSidebar.column_filter')}</span>
@@ -5528,6 +5559,14 @@ function ChatSidebar({
                   <button type="button" className="absolute right-2 top-1/2 -translate-y-1/2 text-muted hover:text-text cursor-pointer bg-transparent border-none p-0 leading-none transition-colors" onClick={() => setHistoryFilter('')} aria-label={i18nT('pages.chatSidebar.clear_search')}><X size={13} /></button>
                 )}
               </div>
+              {unresumableNotice && (
+                <ErrorNotice
+                  message={unresumableNotice}
+                  onDismiss={() => setUnresumableNotice(null)}
+                  variant="block"
+                  className="mt-1.5"
+                />
+              )}
             </div>
             {/* scroll-shadow already fades the top/bottom edge as its
              *  scrollability cue, so the bar itself is redundant here. */}
@@ -5609,8 +5648,34 @@ function ChatSidebar({
                   const remoteInstanceId = (s as { instance_id?: string }).instance_id
                   const remoteInstanceName = (s as { instance_name?: string }).instance_name
                   const activateRow = () => {
+                    // A remote row never resumes here, so it can never produce the
+                    // unresumable notice below — the pane switch IS its outcome.
                     if (remoteInstanceId) { selectInstance(remoteInstanceId); return }
+                    // Resume, then check whether the resolved surface is one ChatPage
+                    // can actually show. The request itself succeeds either way
+                    // (`ok`), so `ok` alone cannot tell a genuinely usable resume
+                    // apart from one that will bounce right back (#3624).
+                    setUnresumableNotice(null)
+                    const seq = ++resumeSeqRef.current
                     dispatch(resumeFromHistory({ key: s.key, title: s.title || s.key }))
+                      .unwrap()
+                      .then(result => {
+                        // Latest-click-wins: an earlier resume resolving late must
+                        // not narrate a row the user has already moved past.
+                        if (seq !== resumeSeqRef.current) return
+                        if (result.ok && !isChatPageSurface(result.surface)) {
+                          // Name the surface from the WIRE answer the check itself
+                          // used. The key-prefix heuristic stays only as the
+                          // localized label for the known dashboard case and as a
+                          // last-resort fallback -- interpolating it for arbitrary
+                          // surfaces mislabels them (e.g. "a Session session").
+                          const noticeSurface = isDashboard ? surfaceLabel : (result.surface || surfaceLabel)
+                          setUnresumableNotice(
+                            i18nT('pages.chatSidebar.this_session_cannot_be_opened_from_the_chat_side', { title: s.title || s.key, surface: noticeSurface }),
+                          )
+                        }
+                      })
+                      .catch(() => { /* resumeFromHistory itself never rejects on an API-level failure; a genuine rejection has nothing more useful to add here. */ })
                   }
                   return (
                     <div className={`group relative flex items-start gap-2.5 pr-4 py-2 rounded-md text-sm transition-all select-none ${!connected ? 'text-muted opacity-50 cursor-not-allowed' : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'}`} style={{ paddingLeft: '10px' }} title={s.title || s.key} {...offlineProps(connected, 'resume sessions')} role="button" tabIndex={0} aria-disabled={!connected} onKeyDown={e => {

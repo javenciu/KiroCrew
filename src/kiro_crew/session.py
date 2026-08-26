@@ -85,6 +85,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -439,6 +440,20 @@ _COMPACT_FAILURE_COOLDOWN_SECS = 60.0
 # land above ``autocompact_pct`` while still having freed real headroom.
 _COMPACT_MIN_EFFECT_PCT_POINTS = 5.0
 
+# A compaction whose SETTLED verdict is ineffective (see
+# _COMPACT_MIN_EFFECT_PCT_POINTS) while the confirmed reading is still AT OR
+# ABOVE this percentage has not restored usable headroom: the very next turn
+# re-crosses the trigger threshold, and on the task runner the next prompt
+# itself may no longer fit. Such a session is reset — with its native resume
+# sid cleared, so the overflowed conversation is not reloaded — instead of
+# limping through compact/cooldown cycles. Promoted from the task runner's
+# post-compaction verification so every compaction caller gets it (#4686).
+# The escalation rides the verdict settle (not a raw re-read after compact())
+# because only a settled reading has passed the measurability rules — a raw
+# re-read can be unknown (kiro zeroes + flags stats) or stale (a backend that
+# never reset them), and resetting on either would destroy a healthy session.
+_POST_COMPACT_RESET_PCT = 95.0
+
 
 class _CompactCallback(Protocol):
     async def __call__(self, key: str, pct: float, *, success: bool) -> None: ...  # noqa: E704
@@ -569,13 +584,13 @@ class SpeculativeResumeRefused(RuntimeError):
 
     A speculative caller must never be the one that resumes a persisted
     session — unless it passes ``speculative_resume=True`` (resume prefetch),
-    which preserves the observation by arming ``_Session.resumed_armed`` for
-    the first real claimant. Without the opt-in the refusal stands: the real
-    first turn needs to observe ``resumed=True`` to make its
-    history-injection decision, and existing-session reuse would report
-    ``resumed=False``. Raised on the same session-map read that would drive
-    the resume, so there is no window for a mapping to appear between a
-    caller-side check and the create.
+    which preserves the observation by arming ``_Session.first_turn`` as
+    :attr:`FirstTurnState.RESUMED` for the first real claimant. Without the
+    opt-in the refusal stands: the real first turn needs to observe
+    ``resumed=True`` to make its history-injection decision, and
+    existing-session reuse would report ``resumed=False``. Raised on the same
+    session-map read that would drive the resume, so there is no window for a
+    mapping to appear between a caller-side check and the create.
     """
 
 
@@ -677,6 +692,46 @@ def _provider_has_unfinished_turn(provider: LLMProvider) -> bool:
 StopOutcome = Literal["soft", "hard", "idle"]
 
 
+class FirstTurnState(Enum):
+    """One-shot first-turn observation on a ``_Session``.
+
+    Records what the session's creator observed at provider start, for the
+    first REAL claimant to consume atomically under the per-session semaphore
+    (a speculative claimant reads without consuming). A single three-member
+    field — not a pair of booleans — so the illegal fourth combination the
+    old ``is_new``/``resumed_armed`` pair could represent by accident (a
+    resume marker armed on an already-claimed session, which would silently
+    skip history injection) has no spelling.
+
+    Internal representation only: public return shapes stay
+    ``(provider, is_new, resumed)``, derived via :attr:`is_new` /
+    :attr:`resumed` at the return boundary.
+    """
+
+    # Session already claimed — no first-turn observation armed. The state
+    # every session reaches once a real turn has consumed the observation
+    # (and the state ``get_or_create``'s real creator registers, having
+    # consumed its own; ``open_task_session``'s cold path instead registers
+    # FRESH unconsumed, exactly as it left ``is_new`` armed before).
+    NOTHING_ARMED = auto()
+    # Fresh session: the first real turn injects Kiro Crew history.
+    FRESH = auto()
+    # Natively resumed — a speculative resume creator's ACP ``session/load``
+    # restored the persisted transcript, so the first real turn must skip
+    # history injection.
+    RESUMED = auto()
+
+    @property
+    def is_new(self) -> bool:
+        """The ``is_new`` boolean this state derives to at the return boundary."""
+        return self is not FirstTurnState.NOTHING_ARMED
+
+    @property
+    def resumed(self) -> bool:
+        """The ``resumed`` boolean this state derives to at the return boundary."""
+        return self is FirstTurnState.RESUMED
+
+
 @dataclass
 class _Session:
     provider: LLMProvider
@@ -685,17 +740,18 @@ class _Session:
     # ``last_used`` is monotonic (correct for idle math, but it has no epoch), so
     # it cannot answer "how long has this session been alive".
     created_at: float = field(default_factory=time.time)
-    is_new: bool = True
-    # One-shot companion to ``is_new``, armed only by a SPECULATIVE creator
-    # whose provider start restored the persisted transcript via ACP
-    # session/load. The existing-session fast path and the won-race path
-    # otherwise report ``resumed=False``, which would make the real first turn
-    # inject Kiro Crew history on top of the natively-replayed transcript. Set
-    # atomically at registration (never on its own — only ever alongside an
-    # armed ``is_new``) and consumed together with ``is_new`` by the first
-    # real claimant under the per-session semaphore; a speculative claimant
-    # reads without consuming.
-    resumed_armed: bool = False
+    # One-shot first-turn observation, consumed by the first REAL claimant
+    # under the per-session semaphore (a speculative claimant reads without
+    # consuming). A single ``FirstTurnState`` field replacing the old
+    # ``is_new``/``resumed_armed`` boolean pair, so arming a resume marker on
+    # an already-claimed session is unrepresentable rather than forbidden by
+    # convention. ``RESUMED`` is selected only by a SPECULATIVE creator whose
+    # provider start restored the persisted transcript via ACP session/load —
+    # the existing-session fast path and the won-race path otherwise report
+    # ``resumed=False``, which would make the real first turn inject Kiro
+    # Crew history on top of the natively-replayed transcript. Selected
+    # atomically at registration; read and cleared in one consume.
+    first_turn: FirstTurnState = FirstTurnState.FRESH
     # Set when an identity sweep found this session BUSY and therefore left its
     # in-flight turn alone. The child is authenticated as an account that is no
     # longer signed in, so the NEXT turn on this key must not reuse it: the
@@ -748,8 +804,11 @@ class _Session:
         self.provider_switch_replay = False
         # The replacement provider is a fresh native session, not a resumed
         # one — a stale armed observation would make the next first turn skip
-        # history injection it actually needs.
-        self.resumed_armed = False
+        # history injection it actually needs. Only the resume half of the
+        # observation is stale: an armed fresh observation, or nothing armed,
+        # describes the replacement just as well and carries over unchanged.
+        if self.first_turn is FirstTurnState.RESUMED:
+            self.first_turn = FirstTurnState.FRESH
         self.prompt_count = 0
         self.consecutive_failures = 0
         self.prev_turn_cancelled = False
@@ -824,6 +883,24 @@ def unlink_queued_temp_paths(kwargs: dict) -> None:
             os.unlink(p)
         except OSError:
             pass
+
+
+def _unlink_session_queue(session: "_Session") -> None:
+    """Unlink temp files for every entry still queued on a popped session.
+
+    Every teardown path that pops a whole ``_Session`` out of ``_sessions``
+    (stale-provider eviction, ``reset``, RSS recycle, ``remove``,
+    ``remove_if_unclaimed``, ``destroy``, ``discard_conversation``,
+    ``drain_all_providers``) discards ``session.queue`` along with it.
+    Anything still sitting there never reaches ``_dispatch_queued``'s own
+    cleanup — that only runs for an entry that actually gets dispatched —
+    so this is the one place responsible for unlinking the images behind a
+    whole-session teardown, the same way ``cancel_queued``/``clear_queue``/
+    ``dequeue``'s cancelled-skip already do for a live session's own
+    piecemeal discards.
+    """
+    for _, _, kwargs in session.queue:
+        unlink_queued_temp_paths(kwargs)
 
 
 class SessionManager:
@@ -953,6 +1030,19 @@ class SessionManager:
         # cold-start).
         self._recycling: dict[str, "_Session"] = {}
         self._compact_cooldown_until: dict[str, float] = {}
+        #: Session keys whose NEXT cold start must not replay prior history.
+        #:
+        #: Set by ``discard_conversation(replay=False)`` and consumed one-shot at
+        #: the replay gate. It cannot live on the session object the way
+        #: ``needs_context_reinjection`` does, because ``discard_conversation``
+        #: POPS that session — the decision is made by the turn that tears the
+        #: conversation down and acted on by the NEXT turn, which builds a new one.
+        #:
+        #: Process-scoped on purpose. A gateway restart also cold-starts the
+        #: session, but there the replay is legitimate: nobody asked for a fresh
+        #: conversation, the process simply went away, and re-anchoring is the
+        #: behaviour that surface has always had.
+        self._suppress_replay: set[str] = set()
         # Compactions whose effect could not be measured at completion time
         # (post-compaction stats reset to unknown, or telemetry not refreshed
         # yet): key -> the pct that triggered the attempt. Settled by the
@@ -1207,7 +1297,11 @@ class SessionManager:
             return
         async with self._lock:
             if BACKGROUND_KEY not in self._sessions:
-                sess = _Session(provider=provider, is_new=False, agent=BACKGROUND_AGENT)
+                sess = _Session(
+                    provider=provider,
+                    first_turn=FirstTurnState.NOTHING_ARMED,
+                    agent=BACKGROUND_AGENT,
+                )
                 self._sessions[BACKGROUND_KEY] = sess
                 logger.info("Background session created")
             else:
@@ -1274,7 +1368,7 @@ class SessionManager:
                                 runtime.pid,
                                 reason,
                             )
-                            await runtime.kill()
+                            await runtime.kill(expected=True)  # deliberate staleness recycle
                             self._bg_runtime = None
                     elif runtime._stale_by_age():
                         # Stale but co-tenant sessions are active, so recycling
@@ -1432,7 +1526,7 @@ class SessionManager:
             runtime = self._subagent_runtimes.pop(parent_session_key, None)
         if runtime is not None:
             try:
-                await runtime.kill()
+                await runtime.kill(expected=True)  # deliberate teardown with parent
             except Exception:
                 logger.warning(
                     "Failed to kill subagent runtime for %s", parent_session_key, exc_info=True
@@ -1564,6 +1658,7 @@ class SessionManager:
                 del self._sessions[key]
                 dead = sess.provider
         if dead is not None:
+            await asyncio.to_thread(_unlink_session_queue, sess)
             try:
                 await dead.shutdown()
             except Exception:
@@ -1650,7 +1745,7 @@ class SessionManager:
             else:
                 sess = _Session(
                     provider=provider,
-                    is_new=True,
+                    first_turn=FirstTurnState.FRESH,
                     approval_policy=approval_policy,
                     agent=agent or "",
                 )
@@ -1942,7 +2037,17 @@ class SessionManager:
             # Check TTL (0 = disabled)
             age = time.monotonic() - spawn_time
             if self._pool_ttl_secs and age > self._pool_ttl_secs:
-                logger.warning(
+                # Same severity rule as the health sweep: a TTL recycle of a
+                # healthy provider is routine (INFO); one that also died before
+                # aging out is a genuine anomaly and keeps WARNING.
+                try:
+                    ttl_alive = (
+                        hasattr(provider, "is_process_alive") and provider.is_process_alive()
+                    )
+                except Exception:
+                    ttl_alive = False
+                ttl_log = logger.info if ttl_alive else logger.warning
+                ttl_log(
                     "Warm pool: %.0fs old provider exceeds TTL %ds, discarding",
                     age,
                     self._pool_ttl_secs,
@@ -2081,7 +2186,19 @@ class SessionManager:
                 if isinstance(pid, int):
                     self._pool_sweep_pids.add(pid)
                 if self._pool_ttl_secs and age > self._pool_ttl_secs:
-                    logger.warning(
+                    # A scheduled TTL recycle of a HEALTHY provider is the pool
+                    # working as designed, not operator-actionable — INFO. A
+                    # provider that also died before aging out is a genuine
+                    # anomaly: keep the pre-existing WARNING for it (same
+                    # message, same discard path — severity only).
+                    try:
+                        ttl_alive = (
+                            hasattr(provider, "is_process_alive") and provider.is_process_alive()
+                        )
+                    except Exception:
+                        ttl_alive = False
+                    ttl_log = logger.info if ttl_alive else logger.warning
+                    ttl_log(
                         "Pool health: %.0fs old provider (pid=%s) exceeds TTL %ds, discarding",
                         age,
                         pid,
@@ -2507,11 +2624,11 @@ class SessionManager:
                 Opts in to speculatively resuming a persisted session
                 (resume prefetch): instead of refusing a resumable key, the
                 speculative creator performs the session/load and registers
-                the session with BOTH one-shot markers armed —
-                ``is_new=True`` and ``resumed_armed=True`` when the load
-                actually restored the transcript. The first real claimant
-                consumes both atomically under the per-session semaphore and
-                receives ``(provider, True, True)``, preserving its
+                the session with the one-shot observation armed as
+                :attr:`FirstTurnState.RESUMED` when the load actually
+                restored the transcript. The first real claimant consumes it
+                atomically under the per-session semaphore and receives
+                ``(provider, True, True)``, preserving its
                 history-injection decision exactly as if it had performed the
                 resume itself.
         """
@@ -2523,6 +2640,7 @@ class SessionManager:
         # cold-starts a context-free duplicate (thread split).
         key = self._fold_key(key)
         stale_provider = None
+        stale_session: "_Session | None" = None
         _claimed: "_Session | None" = None
         try:
             async with self._lock:
@@ -2578,6 +2696,7 @@ class SessionManager:
                                 "Session %s has dead provider — removing stale entry", key
                             )
                             stale_provider = sess.provider
+                            stale_session = sess
                             del self._sessions[key]
                             # Preserve session_map entry: the kiro-cli session
                             # files survive on disk, enabling lossless resume
@@ -2625,6 +2744,8 @@ class SessionManager:
             # Kill orphaned child processes (MCP servers, kiro-cli-chat)
             # outside the lock — shutdown() may involve signals/waitpid.
             if stale_provider is not None:
+                if stale_session is not None:
+                    await asyncio.to_thread(_unlink_session_queue, stale_session)
                 try:
                     await stale_provider.shutdown()
                 except Exception:
@@ -2638,21 +2759,21 @@ class SessionManager:
         if _claimed is not None:
             sess = _claimed
             if await self._reacquire_and_validate(key, sess):
-                # Consume the one-shot first-turn flags HERE, as the semaphore
-                # owner — not at claim time under self._lock. A claimant
-                # cancelled while waiting must not destroy the flags, and when
-                # several callers queue on an armed (speculatively created)
-                # session, the flags belong to whichever real caller acquires
-                # first. A speculative claimant reads without consuming.
-                # ``resumed_armed`` travels with ``is_new``: both are set only
-                # together at registration and consumed together here, so the
-                # real first turn observes resumed=True exactly when a resume
-                # prefetch restored the transcript.
-                was_new = sess.is_new
-                was_resumed = sess.resumed_armed
+                # Consume the one-shot first-turn observation HERE, as the
+                # semaphore owner — not at claim time under self._lock. A
+                # claimant cancelled while waiting must not destroy the
+                # observation, and when several callers queue on an armed
+                # (speculatively created) session, the observation belongs to
+                # whichever real caller acquires first. A speculative claimant
+                # reads without consuming. ONE read and ONE clear of a single
+                # field — the fresh and resumed halves cannot go out of sync,
+                # so the real first turn observes resumed=True exactly when a
+                # resume prefetch restored the transcript.
+                first_turn = sess.first_turn
                 if not speculative:
-                    sess.is_new = False
-                    sess.resumed_armed = False
+                    sess.first_turn = FirstTurnState.NOTHING_ARMED
+                was_new = first_turn.is_new
+                was_resumed = first_turn.resumed
                 return sess.provider, was_new, was_resumed
             # Stale between claim and acquire — the semaphore has already been
             # released by the re-validate. If the entry is still ours but the
@@ -2706,8 +2827,8 @@ class SessionManager:
         # turn needs to observe resumed=True to make its history-injection
         # decision, and the existing-session fast path would otherwise report
         # resumed=False. The opt-in path preserves that observation by arming
-        # resumed_armed at registration for the first real claimant to
-        # consume. Checked HERE, on the same map read that would drive the
+        # first_turn as RESUMED at registration for the first real claimant
+        # to consume. Checked HERE, on the same map read that would drive the
         # resume, so no check-then-act window exists for a mapping to appear
         # in between.
         if speculative and resume_sid and not speculative_resume:
@@ -2790,9 +2911,7 @@ class SessionManager:
                         )
                         return _crew, _load_watchdog_settings(_crew)
 
-                    _claim_crew, _claim_wd = await asyncio.to_thread(
-                        _resolve_claim_watchdog
-                    )
+                    _claim_crew, _claim_wd = await asyncio.to_thread(_resolve_claim_watchdog)
                     provider.client.rekey(
                         key,
                         channel_id,
@@ -2894,9 +3013,7 @@ class SessionManager:
                 is_cc_now = (
                     ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider)
                 ) or _is_claude_backend(provider)
-                current_provider = (
-                    PROVIDER_LABEL_CLAUDE if is_cc_now else _provider_label(provider)
-                )
+                current_provider = PROVIDER_LABEL_CLAUDE if is_cc_now else _provider_label(provider)
                 if detect_provider_switch(self._session_map, key, current_provider):
                     resume_sid = None
                     _provider_switched = True
@@ -3016,28 +3133,30 @@ class SessionManager:
                     _won_race_sess = sess
                     _dup_provider = provider
                 else:
+                    # First-turn observation, selected atomically at
+                    # registration under self._lock — this is what replaces
+                    # the racy rearm-after-release design. A real creator
+                    # consumes the observation itself (is_new=True goes back
+                    # to it in `result`), so it registers NOTHING_ARMED. A
+                    # speculative creator leaves the observation ARMED for the
+                    # first real turn, which claims it via the fast path or
+                    # the won-race path: RESUMED when its session/load
+                    # actually restored the transcript (it owes that
+                    # resumed=True observation to the first real claimant),
+                    # FRESH otherwise.
+                    if not speculative:
+                        _first_turn = FirstTurnState.NOTHING_ARMED
+                    elif resumed:
+                        _first_turn = FirstTurnState.RESUMED
+                    else:
+                        _first_turn = FirstTurnState.FRESH
                     sess = _Session(
                         provider=provider,
-                        # A real creator consumes the first-turn flag itself
-                        # (is_new=True goes back to it in `result`); a
-                        # speculative creator leaves it ARMED for the first
-                        # real turn, which claims it via the fast path or the
-                        # won-race path. Set atomically at registration, under
-                        # self._lock — this is what replaces the racy
-                        # rearm-after-release design.
-                        is_new=bool(speculative),
-                        # Armed only alongside is_new: a speculative resume
-                        # creator whose session/load actually restored the
-                        # transcript owes the resumed=True observation to the
-                        # first real claimant. A real creator receives
-                        # ``resumed`` directly in its own return tuple.
-                        resumed_armed=bool(speculative and resumed),
+                        first_turn=_first_turn,
                         approval_policy=approval_policy,
                         agent=agent or "",
                     )
-                    _replay_needed = (
-                        getattr(provider, "_history_replay_needed", False) is True
-                    )
+                    _replay_needed = getattr(provider, "_history_replay_needed", False) is True
                     if _provider_switched or _replay_needed:
                         # provider_switch_replay OR F2 load-recovery fell back to
                         # a fresh native session (stale lock never cleared):
@@ -3117,19 +3236,20 @@ class SessionManager:
                         "Failed to shut down duplicate provider for %s", key, exc_info=True
                     )
             if await self._reacquire_and_validate(key, _won_race_sess):
-                # Mirror the fast path's flag handling: when the race winner
-                # was a SPECULATIVE creator it registered the session with the
-                # first-turn flag still armed, and this loser may be the first
-                # real turn — hardcoding False here would strand the flag and
-                # skip first-turn context injection (then fire it, late, on a
-                # later message). Both-real races are unchanged: the real
-                # winner consumed its own flag at registration, so was_new
-                # reads False exactly as before.
-                was_new = _won_race_sess.is_new
-                was_resumed = _won_race_sess.resumed_armed
+                # Mirror the fast path's observation handling: when the race
+                # winner was a SPECULATIVE creator it registered the session
+                # with the first-turn observation still armed, and this loser
+                # may be the first real turn — hardcoding False here would
+                # strand the observation and skip first-turn context injection
+                # (then fire it, late, on a later message). Both-real races
+                # are unchanged: the real winner registered NOTHING_ARMED
+                # (having consumed its own observation), so was_new reads
+                # False exactly as before.
+                first_turn = _won_race_sess.first_turn
                 if not speculative:
-                    _won_race_sess.is_new = False
-                    _won_race_sess.resumed_armed = False
+                    _won_race_sess.first_turn = FirstTurnState.NOTHING_ARMED
+                was_new = first_turn.is_new
+                was_resumed = first_turn.resumed
                 return _won_race_sess.provider, was_new, was_resumed
             # Stale winner: the semaphore has already been released by the
             # re-validate; retry from the top (cold-starts cleanly). Bounded so
@@ -3162,6 +3282,7 @@ class SessionManager:
         *,
         expect_session: _Session | None = None,
         skip_if_busy: bool = False,
+        clear_conversation: bool = False,
     ) -> bool:
         """Kill and recreate a session (context overflow recovery).
 
@@ -3181,6 +3302,15 @@ class SessionManager:
             (semaphore held), so a live stream is never cut mid-turn. This is
             enforced here, atomically with the pop, rather than in a caller's
             separate lock acquisition (which reopens the window).
+
+        ``clear_conversation`` additionally drops the session map's native
+        resume sid (the entry itself — and the channel bindings it carries —
+        survives, exactly as in ``_recycle_held``): used by the still-critical
+        post-compaction escalation, where resuming the overflowed conversation
+        would reload the very context the reset exists to shed. The clear runs
+        in the SAME event-loop tick as the pop (no await between them), so a
+        racing cold-start can never have registered a replacement sid for this
+        key in between — the clear cannot erase a successor's pointer.
         """
         key = self._fold_key(key)
         async with self._lock:
@@ -3193,9 +3323,14 @@ class SessionManager:
             # The new process is a fresh start — drop any stale failure
             # cooldown so it isn't inherited.
             self._compact_cooldown_until.pop(key, None)
+            self._suppress_replay.discard(key)
             self._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
+        if clear_conversation and session is not None:
+            # Same tick as the pop — see the docstring.
+            self._session_map.clear_sid(key)
         if session:
+            await asyncio.to_thread(_unlink_session_queue, session)
             # Capture PID and child tree before shutdown clears them
             client = getattr(session.provider, "_client", None)
             raw_pid = getattr(client, "_pid", None) if client else None
@@ -3281,6 +3416,12 @@ class SessionManager:
         """Check context usage and fire background compaction at the
         configured ``autocompact_pct`` threshold.
 
+        Whether compaction may run is decided by
+        :meth:`_compaction_gate_decision`, consumed via
+        :meth:`_trigger_compaction` (which commits and schedules the
+        attempt); this method only tracks prompt counts and logs the usage
+        arms for declined readings.
+
         Falls back to prompt-count compaction if metadata never reports %.
         Returns context usage percentage immediately — never blocks.
         """
@@ -3292,54 +3433,71 @@ class SessionManager:
         if session:
             session.prompt_count += 1
 
-        # Settle a deferred compaction verdict on the first CONFIRMED reading
-        # after the attempt (see _settle_compact_cooldown). Runs BEFORE the
-        # trigger decision below so an ineffective compaction's cooldown
-        # suppresses the immediate re-trigger in this very call.
-        baseline = self._compact_pending_verdict.get(key)
-        if baseline is not None and not _context_pct_is_unknown(provider):
-            del self._compact_pending_verdict[key]
-            self._judge_compact_effect(key, baseline, pct)
+        decline = self._trigger_compaction(key, f"context at {pct:.0f}%", pct, provider)
 
-        # Warn one margin below the configured action point. Guarded as > 0 so a
-        # very low configured threshold cannot push the warn level negative and
-        # make the warning arm swallow the ordinary info arm below it.
-        _warn_at = self._cfg.session.autocompact_pct - CONTEXT_WARN_MARGIN_PCT
-
-        # CC per_session handles its own compaction natively — skip KiroCrew's
-        _is_cc_persistent = (
-            ClaudeCodeProvider is not None
-            and isinstance(provider, ClaudeCodeProvider)
-            and provider.connection_mode == "per_session"
-        )
-        if _is_cc_persistent:
+        if decline == "cc_managed":
             if pct > 0:
                 logger.info("Session %s context at %.0f%% (CC-managed)", key, pct)
-        elif pct >= self._cfg.session.autocompact_pct:
-            # Defensive twin of the rekey-time reset (#2932): compaction is
-            # destructive-ish (it rewrites the conversation), so it must never
-            # fire on a percentage that no telemetry has confirmed for the
-            # CURRENT session binding. Today every path that raises context_pct
-            # also calls note_pct_reported(), so this gate is unreachable in
-            # production — it exists so a future handoff/reset path that
-            # preserves a stale pct while leaving it flagged unknown degrades
-            # to a skipped compaction instead of compacting an empty session.
-            # Fail-quiet on doubles: providers without the probe read as
-            # "confirmed" (unchanged behavior).
-            if _context_pct_is_unknown(provider):
-                logger.info(
-                    "Session %s context %.0f%% is unconfirmed for this session — "
-                    "skipping compaction until telemetry reports",
-                    key,
-                    pct,
-                )
-            else:
-                self._trigger_compaction(key, f"context at {pct:.0f}%", pct)
-        elif _warn_at > 0 and pct >= _warn_at:
-            logger.warning("Session %s context at %.0f%%", key, pct)
-        elif pct > 0:
-            logger.info("Session %s context at %.0f%%", key, pct)
+        elif decline == "below_threshold":
+            # Warn one margin below the configured action point. Guarded as
+            # > 0 so a very low configured threshold cannot push the warn
+            # level negative and make the warning arm swallow the ordinary
+            # info arm below it.
+            _warn_at = self._cfg.session.autocompact_pct - CONTEXT_WARN_MARGIN_PCT
+            if _warn_at > 0 and pct >= _warn_at:
+                logger.warning("Session %s context at %.0f%%", key, pct)
+            elif pct > 0:
+                logger.info("Session %s context at %.0f%%", key, pct)
+        # The remaining declines (unconfirmed / in_progress / cooldown) are
+        # logged by the gate ladder itself; a None decline means the attempt
+        # was committed and logged by _trigger_compaction.
         return pct
+
+    async def compact_if_needed(self, key: str) -> str:
+        """Awaitable twin of the ``check_context_usage`` compaction trigger.
+
+        For callers that must not start their next turn while a compaction is
+        pending — the task runner checks context BETWEEN turns and needs the
+        attempt finished before it feeds the next prompt (#4686). Whether the
+        attempt may start is decided by :meth:`_compaction_gate_decision` —
+        the same ladder, in the same order, that ``check_context_usage`` →
+        ``_trigger_compaction`` consumes — after which this seam AWAITS
+        ``_compact_session`` instead of scheduling it, so the caller inherits
+        the turn-semaphore exclusion, the post-compaction verification, and
+        skills reinjection without reaching into private helpers.
+
+        Returns the outcome for observability:
+
+        - ``"absent"``: no live session under *key* — nothing to compact.
+        - ``"reset"``: this call's own attempt completed but the
+          immediately-measured verdict was ineffective-and-still-critical,
+          and the promoted post-compaction escalation reset the session —
+          AWAITED, so the caller's next turn cold-starts on a fresh process.
+        - ``"cc_managed"`` / ``"below_threshold"`` / ``"unconfirmed"`` /
+          ``"in_progress"`` / ``"cooldown"``: gate declines, verbatim from
+          :meth:`_compaction_gate_decision` — see its docstring for what
+          each gate protects and why the order is what it is.
+        - ``"ok"`` / ``"busy"`` / ``"recycled"`` / ``"failed"``: terminal
+          outcomes of the awaited attempt (see ``_compact_session``). A
+          ``"busy"`` decline means a turn holds the semaphore — the caller
+          must leave the session alone and retry on a later check, never
+          fall back to a direct ``provider.compact()``.
+        """
+        key = self._fold_key(key)
+        session = self._sessions.get(key)
+        if session is None:
+            return "absent"
+        provider = session.provider
+        pct = provider.context_usage_pct()
+
+        decline = self._compaction_gate_decision(key, provider, pct)
+        if decline is not None:
+            return decline
+        logger.warning("Session %s compacting — context at %.0f%% (awaited)", key, pct)
+        # No await between the ladder's membership check and this add, so the
+        # dedup handshake with _trigger_compaction stays atomic on the loop.
+        self._compacting.add(key)
+        return await self._compact_session(key, pct)
 
     def set_compact_callback(self, cb: _CompactCallback | None) -> None:
         """Register a callback fired after a compact attempt.
@@ -3377,6 +3535,25 @@ class SessionManager:
         sess.needs_context_reinjection = False
         return True
 
+    def consume_replay_suppression(self, key: str) -> bool:
+        """Read *and clear* whether *key*'s next cold start must skip replay.
+
+        One-shot by construction, the same shape as
+        :meth:`consume_needs_reinjection`: the flag is cleared as it is read, so
+        exactly the FIRST cold start after ``discard_conversation(replay=False)``
+        starts empty. Leaving it set would make every later cold start on that
+        key — an idle-timeout expiry, a gateway restart — silently amnesiac,
+        which nobody asked for.
+        """
+        if key in self._suppress_replay:
+            self._suppress_replay.discard(key)
+            return True
+        folded = self._fold_key(key)
+        if folded in self._suppress_replay:
+            self._suppress_replay.discard(folded)
+            return True
+        return False
+
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register a callback fired when the watchdog recycles a session.
 
@@ -3390,39 +3567,121 @@ class SessionManager:
             logger.warning("Recycle callback already registered; replacing existing handler")
         self._on_recycled = cb
 
-    def _trigger_compaction(self, key: str, reason: str, pct: float) -> None:
-        """Schedule a background compact task for *key*, gated by two checks.
+    def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
+        """THE place that decides whether a compaction attempt may start.
 
-        - ``_compacting`` set: dedup concurrent triggers; an in-flight
-          compaction blocks new triggers until it completes.
-        - ``_compact_cooldown_until``: after a failed OR ineffective compact,
-          suppress re-triggers until the cooldown elapses.
+        Both entry points consume this ladder — ``check_context_usage`` via
+        :meth:`_trigger_compaction` (which schedules the attempt) and
+        :meth:`compact_if_needed` (which awaits it) — so a gate added here
+        reaches both paths by construction; gate-order parity between the
+        paths is pinned by ``test_task_runner_compaction.py``. Returns the
+        decline reason, or ``None`` to proceed. *pct* is the reading the
+        caller observed on *provider*; the ladder never re-reads it.
 
-        The actual work runs in a fire-and-forget task so the caller's
-        response path is never blocked.
+        The gates run in this order, and the order is behavior:
+
+        1. Pending-verdict settle — a side effect, never declines. The first
+           CONFIRMED reading after a deferred attempt settles its verdict
+           (see ``_settle_compact_cooldown``) and MUST run before the
+           cooldown gate below, so an ineffective prior attempt suppresses
+           the immediate re-trigger within this very call. Deliberately
+           damping-only: a deferred reading includes the following turn's
+           own growth and cannot distinguish a failed compaction from a
+           successful one regrown by a large turn — safe to damp on, never
+           safe to reset on (the promoted #4686 escalation fires only on
+           immediately-measured verdicts inside ``_compact_session``).
+        2. ``"cc_managed"`` — CC ``per_session`` compacts natively; checked
+           before the threshold, so a CC session below threshold also
+           declines here.
+        3. ``"below_threshold"`` — *pct* below ``session.autocompact_pct``.
+        4. ``"unconfirmed"`` — over threshold but no telemetry has confirmed
+           the reading for the CURRENT session binding; defensive twin of
+           the rekey-time reset (#2932). Compaction is destructive-ish (it
+           rewrites the conversation), so it must never fire on an unproven
+           percentage. Today every path that raises context_pct also calls
+           note_pct_reported(), so this gate is unreachable in production —
+           it exists so a future handoff/reset path that preserves a stale
+           pct while leaving it flagged unknown degrades to a skipped
+           compaction instead of compacting an empty session. Fail-quiet on
+           doubles: providers without the probe read as "confirmed".
+        5. ``"in_progress"`` — the ``_compacting`` dedup, CHECK only. The
+           caller commits with ``_compacting.add(key)`` itself, synchronously
+           after a ``None`` return: committing here would leak a stale entry
+           whenever the cooldown gate below declines, and committing at the
+           call site keeps the check-then-add handshake atomic on the event
+           loop (this method never awaits).
+        6. ``"cooldown"`` — a failed or ineffective attempt armed
+           ``_compact_cooldown_until``; re-triggers are suppressed until it
+           elapses so a broken or ineffective ``/compact`` does not fire on
+           every subsequent turn.
+
+        The declining gates that log (unconfirmed / in_progress / cooldown)
+        log here, identically for both entry points; the silent declines
+        (cc_managed / below_threshold) are logged, where at all, by the
+        entry-point arms that own them.
         """
+        baseline = self._compact_pending_verdict.get(key)
+        if baseline is not None and not _context_pct_is_unknown(provider):
+            del self._compact_pending_verdict[key]
+            self._judge_compact_effect(key, baseline, pct)
+
+        if (
+            ClaudeCodeProvider is not None
+            and isinstance(provider, ClaudeCodeProvider)
+            and provider.connection_mode == "per_session"
+        ):
+            return "cc_managed"
+        if pct < self._cfg.session.autocompact_pct:
+            return "below_threshold"
+        if _context_pct_is_unknown(provider):
+            logger.info(
+                "Session %s context %.0f%% is unconfirmed for this session — "
+                "skipping compaction until telemetry reports",
+                key,
+                pct,
+            )
+            return "unconfirmed"
         if key in self._compacting:
             logger.info("Session %s compaction already in progress", key)
-            return
+            return "in_progress"
         cooldown_until = self._compact_cooldown_until.get(key, 0.0)
         if cooldown_until > time.monotonic():
-            # Last compact failed or made no progress. Skip until the cooldown
-            # elapses so a broken or ineffective /compact does not fire on
-            # every subsequent turn. Log at INFO — the original outcome was
-            # already logged at exception/warning level.
+            # The original failure/ineffectiveness was already logged at
+            # exception/warning level — the skip logs at INFO.
             logger.info(
                 "Session %s compaction skipped — cooldown active for %.0fs more",
                 key,
                 cooldown_until - time.monotonic(),
             )
-            return
+            return "cooldown"
+        return None
+
+    def _trigger_compaction(
+        self, key: str, reason: str, pct: float, provider: LLMProvider
+    ) -> str | None:
+        """Schedule a background compact task for *key* when the gates allow.
+
+        The decision is :meth:`_compaction_gate_decision` — the same ladder
+        the awaited ``compact_if_needed`` seam consumes — evaluated against
+        the *provider* the caller observed *pct* on. A decline returns the
+        reason (the ladder has already logged the declines that log) so
+        ``check_context_usage`` keeps its usage-log arms; on ``None`` the
+        attempt is committed and the actual work runs in a fire-and-forget
+        task, so the caller's response path is never blocked.
+        """
+        decline = self._compaction_gate_decision(key, provider, pct)
+        if decline is not None:
+            return decline
         logger.warning("Session %s compacting — %s", key, reason)
+        # No await between the ladder's membership check and this add, so the
+        # dedup handshake with compact_if_needed stays atomic on the loop.
         self._compacting.add(key)
         t = asyncio.create_task(self._compact_session(key, pct))
         self._background_tasks.add(t)
         t.add_done_callback(self._background_tasks.discard)
+        return None
 
-    async def _compact_session(self, key: str, pct: float) -> None:
+    async def _compact_session(self, key: str, pct: float) -> str:
         """Compact a session that hit the context threshold.
 
         Both backends compact **in place** first, so the kiro-cli process (or
@@ -3439,6 +3698,13 @@ class SessionManager:
         and the kill. A recycle is never forced through a live turn: if the turn
         semaphore cannot be acquired within the budget, the attempt is skipped
         and the next turn-end ``check_context_usage`` re-triggers it.
+
+        Returns the terminal outcome — ``"ok"``, ``"reset"`` (completed but
+        the immediately-measurable verdict was ineffective-and-still-critical,
+        so the promoted escalation reset the session here, awaited),
+        ``"busy"``, ``"recycled"``, ``"failed"``, or ``"absent"`` — so the
+        awaited entry point (:meth:`compact_if_needed`) can report it. The
+        fire-and-forget trigger path ignores the return value, unchanged.
         """
         try:
             session = self._sessions.get(key)
@@ -3469,13 +3735,26 @@ class SessionManager:
                         time.monotonic() + _COMPACT_FAILURE_COOLDOWN_SECS
                     )
                     await self._fire_compact_callback(key, pct, success=False)
-                    return
+                    return "failed"
                 # Completed: decide the cooldown from the measured effect —
-                # an ineffective compaction keeps it, an effective one clears it.
-                self._settle_compact_cooldown(key, claude_session.provider, pct)
+                # an ineffective compaction keeps it, an effective one clears
+                # it, and an ineffective-and-still-critical one escalates to
+                # the promoted reset (#4686). The reset runs BEFORE the
+                # compaction callback: the callback awaits arbitrary surface
+                # I/O, and a queued turn completing inside that window must
+                # not be erased by a verdict measured before it ran (a turn
+                # that started meanwhile is caught by skip_if_busy).
+                did_reset = False
+                if self._settle_compact_cooldown(key, claude_session.provider, pct):
+                    did_reset = await self._reset_still_critical(
+                        key,
+                        pct,
+                        claude_session.provider.context_usage_pct(),
+                        expect=claude_session,
+                    )
                 logger.info("Compacted session %s (context overflow)", key)
                 await self._fire_compact_callback(key, pct, success=True)
-                return
+                return "reset" if did_reset else "ok"
 
             # ── kiro-cli: in-place /compact, recycling on failure ──
             # Every outcome is terminal. _compact_in_place owns the turn
@@ -3483,7 +3762,7 @@ class SessionManager:
             # recycle — so there is no window here in which a queued turn can
             # be dispatched into a session that is mid-compaction or mid-kill.
             if session is None:
-                return
+                return "absent"
             outcome = await self._compact_in_place(key, session, pct)
             if outcome == "busy":
                 # A turn is still running. NEVER kill a live turn for
@@ -3497,8 +3776,10 @@ class SessionManager:
                     key,
                     COMPACT_WAIT_TIMEOUT_SECS,
                 )
+            return outcome
         except Exception:
             logger.exception("Session compaction/recycle failed for %s", key)
+            return "failed"
         finally:
             self._compacting.discard(key)
 
@@ -3529,6 +3810,9 @@ class SessionManager:
                 popped = None
                 if self._sessions.get(key) is session:
                     popped = self._sessions.pop(key, None)
+            # popped is session by identity when non-None (see pop-by-identity
+            # above), but session's queue is abandoned in either branch below.
+            await asyncio.to_thread(_unlink_session_queue, session)
             if popped is None:
                 # A racing cold-start already replaced the entry — the map
                 # now points at a fresh, healthy session. Reap OUR old
@@ -3553,6 +3837,11 @@ class SessionManager:
           The success callback has been fired and the cooldown settled from
           the measured effect (cleared when effective, armed when
           ineffective, deferred when not yet measurable).
+        - ``"reset"``: compaction completed, but the immediately-measured
+          verdict was ineffective-and-still-critical and the promoted #4686
+          escalation tore the session down HERE — before the compaction
+          callback, so a turn completing inside the callback's await window
+          can never be erased by it.
         - ``"busy"``: the turn semaphore could not be acquired within
           ``COMPACT_WAIT_TIMEOUT_SECS`` — a turn is still running. Nothing was
           attempted; the caller must NOT recycle (no mid-turn kill).
@@ -3643,13 +3932,38 @@ class SessionManager:
             return "recycled"
         finally:
             session.semaphore.release()
-        self._settle_compact_cooldown(key, session.provider, pct)
+        escalate = self._settle_compact_cooldown(key, session.provider, pct)
         logger.info("Compacted session %s in place (context overflow)", key)
+        # Escalate BEFORE the compaction callback: the callback awaits
+        # arbitrary surface I/O (e.g. a channel notice), and a queued turn
+        # completing inside that window must not be erased by a verdict
+        # measured before it ran. With the reset here, no event-loop yield
+        # separates the semaphore release from the guarded pop (the settle is
+        # sync and an uncontended manager-lock acquire does not yield), so
+        # the interleave window is closed rather than merely narrowed; under
+        # lock contention a turn that started meanwhile is caught by
+        # skip_if_busy. The callback still fires afterwards — its
+        # mark_needs_reinjection no-ops for the popped session (a reset
+        # cold-starts with re-seeded context, same rationale as the recycle
+        # exclusion), and the surface notice stays accurate.
+        did_reset = False
+        if escalate:
+            did_reset = await self._reset_still_critical(
+                key, pct, session.provider.context_usage_pct(), expect=session
+            )
         await self._fire_compact_callback(key, pct, success=True)
-        return "ok"
+        return "reset" if did_reset else "ok"
 
-    def _settle_compact_cooldown(self, key: str, provider: LLMProvider, pct_before: float) -> None:
+    def _settle_compact_cooldown(self, key: str, provider: LLMProvider, pct_before: float) -> bool:
         """Set, clear, or defer the failure cooldown from a compaction's effect.
+
+        Returns ``True`` when the immediately-measurable verdict is
+        ineffective-and-still-critical (see :meth:`_judge_compact_effect`) —
+        the async compaction caller must then AWAIT the promoted reset
+        escalation before reporting its outcome (#4686). A deferred verdict
+        returns ``False``; it settles at the next confirmed reading in
+        :meth:`_compaction_gate_decision`, the gate ladder shared by
+        ``check_context_usage`` and ``compact_if_needed``.
 
         Re-reads ``context_usage_pct()`` and compares it with *pct_before* (the
         reading that triggered the attempt). A completed compaction that freed
@@ -3670,11 +3984,12 @@ class SessionManager:
           compaction would compute a zero drop and be damped by mistake.
 
         Both defer: the trigger pct is stashed in ``_compact_pending_verdict``
-        and ``check_context_usage`` settles it at the first CONFIRMED reading
-        (that reading includes the following turn's own growth, so a very
-        large turn can under-measure the drop and arm one spurious cooldown —
-        bounded at ``_COMPACT_FAILURE_COOLDOWN_SECS``). Any cooldown already
-        running is left to expire on its own while a verdict is pending.
+        and :meth:`_compaction_gate_decision` settles it at the first
+        CONFIRMED reading (that reading includes the following turn's own
+        growth, so a very large turn can under-measure the drop and arm one
+        spurious cooldown — bounded at ``_COMPACT_FAILURE_COOLDOWN_SECS``).
+        Any cooldown already running is left to expire on its own while a
+        verdict is pending.
 
         The compaction callback still fires ``success=True`` for an
         ineffective attempt: the compaction genuinely completed and rewrote
@@ -3696,31 +4011,108 @@ class SessionManager:
                 pct_after,
                 ", unconfirmed" if unknown else "",
             )
-            return
+            return False
         self._compact_pending_verdict.pop(key, None)
-        self._judge_compact_effect(key, pct_before, pct_after)
+        return self._judge_compact_effect(key, pct_before, pct_after)
 
-    def _judge_compact_effect(self, key: str, pct_before: float, pct_after: float) -> None:
+    def _judge_compact_effect(self, key: str, pct_before: float, pct_after: float) -> bool:
         """Arm the cooldown on an ineffective measured drop; clear it otherwise.
 
         The test is the measured drop, not "still above the threshold": a
         legitimately good compaction of a very long turn can land above
         ``autocompact_pct`` while still having freed real headroom, and what
         the cooldown damps is the no-progress case.
+
+        Returns ``True`` when the verdict is ineffective AND the reading is
+        still at or above ``_POST_COMPACT_RESET_PCT`` — the promoted
+        task-runner post-compaction check (#4686). Only the
+        IMMEDIATELY-MEASURED settle (``_settle_compact_cooldown`` called
+        right after the attempt, inside ``_compact_session``) may act on that
+        ``True`` by awaiting :meth:`_reset_still_critical`: the deferred
+        settle site (:meth:`_compaction_gate_decision`, shared by turn-end
+        ``check_context_usage`` and the ``compact_if_needed`` pre-check)
+        deliberately IGNORES it, because a deferred reading includes the
+        following turn's own growth and cannot distinguish a failed
+        compaction from a successful one regrown by a large turn — damping
+        on that ambiguity is safe, destroying a valid conversation on it is
+        not. The cooldown is armed either way, so a declined or deferred
+        escalation stays damped and the still-critical session re-attempts
+        the whole compact-and-escalate cycle at its next threshold crossing.
         """
         if pct_before - pct_after < _COMPACT_MIN_EFFECT_PCT_POINTS:
             self._compact_cooldown_until[key] = time.monotonic() + _COMPACT_FAILURE_COOLDOWN_SECS
+            still_critical = pct_after >= _POST_COMPACT_RESET_PCT
             logger.warning(
                 "Session %s compaction ineffective — context %.1f%% -> %.1f%% "
-                "(freed %.1f < %.1f points); cooldown applied",
+                "(freed %.1f < %.1f points); %s",
                 key,
                 pct_before,
                 pct_after,
                 pct_before - pct_after,
                 _COMPACT_MIN_EFFECT_PCT_POINTS,
+                ("still critical — escalating to reset" if still_critical else "cooldown applied"),
             )
-            return
+            return still_critical
         self._compact_cooldown_until.pop(key, None)
+        return False
+
+    async def _reset_still_critical(
+        self, key: str, pct_before: float, pct_after: float, *, expect: "_Session | None"
+    ) -> bool:
+        """Reset a session whose immediately-measured verdict is
+        ineffective-and-critical.
+
+        The promoted task-runner post-compaction escalation (#4686): a
+        compaction that completed but left the context confirmed at or above
+        ``_POST_COMPACT_RESET_PCT`` has not bought usable headroom — the next
+        prompt may no longer fit — so the session is torn down and re-seeded.
+        Reached ONLY from ``_compact_session`` on a verdict measured directly
+        after the attempt: a deferred (next-reading) verdict includes later
+        turn growth and cannot prove the compaction failed, so it is never
+        allowed to reach this reset — it damps via the cooldown instead.
+
+        *expect* is the session the verdict was measured on, forwarded as
+        ``reset(expect_session=...)``: awaits sit between the measurement and
+        this teardown (the compaction callback, the lock acquisition), so the
+        key may have been replaced by a fresh cold-start in the window — a
+        stale escalation must never destroy the replacement or clear ITS
+        resume sid. ``skip_if_busy`` keeps the never-cut-a-live-turn
+        contract: if a queued turn won the semaphore in that same window, the
+        escalation declines and the caller reports plain ``"ok"`` — the
+        still-critical context re-crosses the trigger threshold at the next
+        check, so after the cooldown the whole compact-and-escalate attempt
+        re-runs and completes once the session is idle (the mid-stream
+        overflow guard covers the interim). ``clear_conversation`` drops the
+        native resume sid in the same tick as the registry pop (same
+        rationale as ``_recycle_held``): the overflowed conversation must not
+        be resumed, while the session-map entry — and the channel bindings it
+        carries — survives.
+        """
+        logger.warning(
+            "Session %s still at %.0f%% after compaction (was %.0f%%) — resetting",
+            key,
+            pct_after,
+            pct_before,
+        )
+        try:
+            did = await self.reset(
+                key, expect_session=expect, skip_if_busy=True, clear_conversation=True
+            )
+        except Exception:
+            logger.exception("Session %s critical reset failed", key)
+            return False
+        if not did:
+            logger.info(
+                "Session %s critical reset skipped — %s; the next threshold "
+                "crossing re-attempts after the cooldown",
+                key,
+                (
+                    "session replaced since the verdict"
+                    if expect is not None and self._sessions.get(key) is not expect
+                    else "turn in flight"
+                ),
+            )
+        return did
 
     async def _fire_compact_callback(self, key: str, pct: float, *, success: bool) -> None:
         """Invoke ``_on_compacted`` if registered, swallowing exceptions."""
@@ -3770,9 +4162,11 @@ class SessionManager:
         async with self._lock:
             session = self._sessions.pop(key, None)
             self._compact_cooldown_until.pop(key, None)
+            self._suppress_replay.discard(key)
             self._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
         if session:
+            await asyncio.to_thread(_unlink_session_queue, session)
             await session.provider.shutdown()
             # Reap any companion subagent runtime keyed by this parent (the
             # get_subagent_runtime fallback path). shutdown() covers the common
@@ -3881,6 +4275,7 @@ class SessionManager:
                             continue
                         del self._sessions[key]
                         self._compact_cooldown_until.pop(key, None)
+                        self._suppress_replay.discard(key)
                         self._origin_links.pop(key, None)
                         doomed.append((key, sess.provider))
             finally:
@@ -4053,7 +4448,7 @@ class SessionManager:
             if runtime.has_active_or_initializing_sessions():
                 return False
             try:
-                await runtime.kill()
+                await runtime.kill(expected=True)  # deliberate logout teardown
             except Exception:
                 logger.warning(
                     "Failed to retire the background runtime after an identity change",
@@ -4073,23 +4468,30 @@ class SessionManager:
         holds kiro-cli's native per-session lock, so one the user never
         returns to must be released cleanly instead of waiting out the idle
         sweep. "Unclaimed" is checked under the manager lock — the one-shot
-        ``is_new`` marker is still armed (no real turn consumed it) and the
-        per-session semaphore is unheld (no claimant mid-turn). A claimant
-        that has been handed the session object but not yet acquired the
-        semaphore loses the race benignly: its re-validate fails and it
-        cold-starts, exactly as if the prefetch never ran. Returns ``True``
-        when a session was removed. The session map survives (mirrors
-        :meth:`remove`), so the next open resumes normally.
+        first-turn observation is still armed (``first_turn`` is not
+        ``NOTHING_ARMED``: no real turn consumed it) and the per-session
+        semaphore is unheld (no claimant mid-turn). A claimant that has been
+        handed the session object but not yet acquired the semaphore loses
+        the race benignly: its re-validate fails and it cold-starts, exactly
+        as if the prefetch never ran. Returns ``True`` when a session was
+        removed. The session map survives (mirrors :meth:`remove`), so the
+        next open resumes normally.
         """
         key = self._fold_key(key)
         async with self._lock:
             session = self._sessions.get(key)
-            if session is None or not session.is_new or session.semaphore.locked():
+            if (
+                session is None
+                or session.first_turn is FirstTurnState.NOTHING_ARMED
+                or session.semaphore.locked()
+            ):
                 return False
             del self._sessions[key]
             self._compact_cooldown_until.pop(key, None)
+            self._suppress_replay.discard(key)
             self._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
+        await asyncio.to_thread(_unlink_session_queue, session)
         await session.provider.shutdown()
         await self.release_subagent_runtime(key)
         logger.info("Removed unclaimed speculative session (map preserved): %s", key)
@@ -4105,9 +4507,11 @@ class SessionManager:
         async with self._lock:
             session = self._sessions.pop(key, None)
             self._compact_cooldown_until.pop(key, None)
+            self._suppress_replay.discard(key)
             self._compact_pending_verdict.pop(key, None)
         try:
             if session:
+                await asyncio.to_thread(_unlink_session_queue, session)
                 await session.provider.shutdown()
             # Reap any companion subagent runtime keyed by this parent (see remove()).
             await self.release_subagent_runtime(key)
@@ -4115,7 +4519,7 @@ class SessionManager:
             self._session_map.delete(key, reason=UNBIND_REASON_SESSION_DESTROYED)
             logger.info("Destroyed session (map deleted): %s", key)
 
-    async def discard_conversation(self, key: str) -> None:
+    async def discard_conversation(self, key: str, *, replay: bool = True) -> None:
         """Tear down the live session and drop ONLY its native conversation.
 
         Like :meth:`destroy`, the provider is shut down and the resume sid is
@@ -4128,14 +4532,38 @@ class SessionManager:
         conversation. Used by the poisoned-conversation escalation in
         chat_runner, where the conversation is unusable but the session's
         channel identity must persist.
+
+        ``replay`` is what "fresh" MEANS to the caller, and the default keeps
+        every existing caller's behaviour. Clearing the sid stops the provider
+        resuming its own conversation — and "the provider has no history" is
+        precisely the condition that makes the next cold start rebuild one from
+        ``conversation_log`` as a ``[CONVERSATION HISTORY]`` block. So the two
+        mechanisms work against each other: the caller discards the
+        conversation and the next turn is handed a reconstruction of it.
+        Measured on one app-owned session, that replay was 80,359 characters —
+        76% of the first turn's injected context — which is most of what
+        discarding the conversation was meant to reclaim.
+
+        Pass ``replay=False`` when a fresh conversation is the point rather than
+        a side effect (an app rotating a long-running session at a clean
+        boundary). The transcript is untouched either way: this suppresses the
+        RE-INJECTION, it does not delete history, so the conversation stays
+        readable in the dashboard and on disk.
         """
         key = self._fold_key(key)
         async with self._lock:
             session = self._sessions.pop(key, None)
             self._compact_cooldown_until.pop(key, None)
             self._compact_pending_verdict.pop(key, None)
+            # Recorded under the same lock that pops the session, so the next
+            # turn cannot observe a torn-down session with the flag not yet set.
+            if replay:
+                self._suppress_replay.discard(key)
+            else:
+                self._suppress_replay.add(key)
         try:
             if session:
+                await asyncio.to_thread(_unlink_session_queue, session)
                 await session.provider.shutdown()
             # Reap any companion subagent runtime keyed by this parent (see remove()).
             await self.release_subagent_runtime(key)
@@ -4299,7 +4727,7 @@ class SessionManager:
         # next-startup orphan reaper.
         if self._bg_runtime is not None:
             try:
-                await self._bg_runtime.kill()
+                await self._bg_runtime.kill(expected=True)  # graceful shutdown
             except Exception:
                 logger.debug("close_all: _bg_runtime kill failed", exc_info=True)
             self._bg_runtime = None
@@ -4371,6 +4799,7 @@ class SessionManager:
             sessions = dict(self._sessions)
             self._sessions.clear()
             self._compact_cooldown_until.clear()
+            self._suppress_replay.clear()
             self._compact_pending_verdict.clear()
 
         # Bound concurrent shutdowns: each provider.shutdown() -> _kill_process()
@@ -5181,12 +5610,19 @@ class SessionManager:
     async def drain_all_providers(self) -> list:
         """Pop all sessions and return their providers. Thread-safe."""
         providers = []
+        popped: list["_Session"] = []
         async with self._lock:
             keys = list(self._sessions.keys())
             for key in keys:
                 sess = self._sessions.pop(key, None)
                 if sess:
                     providers.append(sess.provider)
+                    popped.append(sess)
+        # Unlink off the lock: a bulk drain (every gateway shutdown/restart)
+        # can pop many sessions at once, and os.unlink is blocking I/O that
+        # would otherwise stall every other coroutine waiting on self._lock.
+        for sess in popped:
+            await asyncio.to_thread(_unlink_session_queue, sess)
         return providers
 
     async def drain_warm_pool(self) -> list:

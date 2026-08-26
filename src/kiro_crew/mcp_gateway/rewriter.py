@@ -1415,6 +1415,7 @@ def rewrite_agents(
     # both overlays. Non-poolable / HTTP settings servers stay raw in settings.
     settings_src_spec: dict[str, Any] | None = None
     settings_poolable: dict[str, Any] = {}
+    settings_read_transient = False
     if kiro_settings_json.is_file():
         try:
             loaded = json.loads(kiro_settings_json.read_text())
@@ -1430,12 +1431,24 @@ def rewrite_agents(
         except OSError as exc:
             # Transient read failure: same reasoning as the per-agent site —
             # do not cache a pass that treated an existing settings file as
-            # absent (it would also have pruned the settings overlay).
+            # absent, and keep the previous settings overlay (#5328).
             notes.source_read_failed = True
+            settings_read_transient = True
             logger.warning("failed to read global mcp.json: %s", exc)
         except json.JSONDecodeError as exc:
             # Content problem — cacheable; a fix changes the stat signature.
             logger.warning("failed to read global mcp.json: %s", exc)
+
+    # Names of agents whose overlay could not be refreshed THIS PASS for a
+    # TRANSIENT reason (source read failure, overlay write failure). The prune
+    # keep-set is ``written | transient_keep``: a transient victim keeps its
+    # previous, healthy overlay (stale-but-working beats no overlay at all,
+    # #5328), while a deterministic skip (bad JSON, non-dict spec) prunes
+    # exactly as a deleted source does — those passes are cacheable, and the
+    # cached path's prune would sweep a kept-stale overlay one boot later
+    # anyway, so keeping it here would make two boots over identical inputs
+    # behave differently.
+    transient_keep: set[str] = set()
 
     for path in sorted(source_dir.glob("*.json")):
         try:
@@ -1444,9 +1457,16 @@ def rewrite_agents(
             # Transient: the file stat'ed fine for the fingerprint but could
             # not be read. Readability can return without size/mtime changing,
             # so caching this incomplete pass would serve overlays missing
-            # this agent forever. Mark the pass uncacheable.
+            # this agent forever. Mark the pass uncacheable, and keep the
+            # agent's previous overlay (#5328).
             notes.source_read_failed = True
-            logger.warning("skipping agent %s: %s", path.name, exc)
+            transient_keep.add(path.name)
+            logger.warning(
+                "skipping agent %s: %s (previous overlay, if any, stays in "
+                "effect until a later pass succeeds)",
+                path.name,
+                exc,
+            )
             continue
         except json.JSONDecodeError as exc:
             # Deterministic: the CONTENT is bad, and fixing it changes the
@@ -1485,35 +1505,84 @@ def rewrite_agents(
         _collect_target_env(new_spec.get("mcpServers", {}), target_env)
         target = overlay_dir / path.name
         try:
-            # Atomic + 0600: temp-file + os.replace (via atomic_write) so a
+            # Atomic + owner-only: temp-file + os.replace (via atomic_write) so a
             # live session reading this overlay through the bind-mount never
             # sees a truncated spec (which would make the agent's MCP servers
-            # vanish mid-run), and the passed-through non-poolable / HTTP-SSE
-            # env blocks (tokens / API keys) are never world-readable. Matches
-            # the env sidecar and settings overlay.
-            atomic_write(target, json.dumps(new_spec, indent=2) + "\n", mode=0o600)
-            if not platform_compat.IS_POSIX:
-                platform_compat.restrict_to_owner(target)
+            # vanish mid-run). ``restrict_to_owner=True`` locks the temp file
+            # down BEFORE the passed-through non-poolable / HTTP-SSE env blocks
+            # (tokens / API keys) reach it — POSIX mode bits are a no-op against
+            # NTFS ACLs, and the previous Windows-only post-rename lockdown left
+            # them readable under the inherited DACL for the write window
+            # (issue #5285). It implies 0o600 on POSIX. A lockdown failure now
+            # happens before the rename, so the OSError handler below skips the
+            # overlay without ever publishing an unprotected copy. Matches the
+            # env sidecar and settings overlay.
+            atomic_write(target, json.dumps(new_spec, indent=2) + "\n", restrict_to_owner=True)
         except OSError as exc:
-            logger.warning("failed to write overlay %s: %s", target, exc)
+            logger.warning(
+                "failed to write overlay %s: %s (previous overlay, if any, "
+                "stays in effect until a later pass succeeds)",
+                target,
+                exc,
+            )
             overlay_write_failed = True
+            transient_keep.add(path.name)
             continue
         written.add(path.name)
         if wrapped:
             results[path.name] = wrapped
 
-    # Prune stale overlay entries (user deleted or renamed an agent).
+    # Prune stale overlay entries (user deleted or renamed an agent). The
+    # keep-set answers "does this overlay's source still exist and did we
+    # either refresh it or fail TRANSIENTLY?" — never bare write success,
+    # which conflated a transient failure with a deleted source and unlinked
+    # the previous, healthy overlay (#5328). Deterministic skips (bad JSON,
+    # non-dict) stay OUT of the keep-set: their pass is cacheable, and the
+    # cached-path prune keys on the stored outputs, so keeping them here
+    # would let two boots over identical inputs disagree.
     for stale in overlay_dir.glob("*.json"):
-        if stale.name not in written:
+        if stale.name not in written and stale.name not in transient_keep:
             try:
                 stale.unlink()
             except OSError:
                 pass
 
+    # Every overlay that SURVIVES the prune must have its target mappings
+    # published, or a kept overlay's stub resolves through the bare
+    # server-name fallback — which, when two agents declare the same server
+    # name with different args, is another agent's command. Harvest the kept
+    # overlays' wrapped entries into ``target_env`` exactly as the cached
+    # path does (``_cached_rewrite_result`` reconstructs from overlay files),
+    # via ``setdefault`` inside ``_collect_target_env`` so entries from the
+    # freshly-rewritten specs always win and the kept overlay only fills the
+    # hash-keyed slots nothing else claimed. Unreadable/corrupt kept overlays
+    # are skipped — the stub then degrades to the same fallback as before.
+    for name in sorted(transient_keep):
+        kept = overlay_dir / name
+        try:
+            kept_spec = json.loads(kept.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(kept_spec, dict):
+            servers = kept_spec.get("mcpServers", {})
+            if isinstance(servers, dict):
+                _collect_target_env(servers, target_env)
+
     # Prune stale env sidecars (server removed / renamed / flipped
     # non-poolable) so old credential files don't accumulate on disk.
+    # ``written_sidecars`` is enumeration-keyed, not write-success-keyed:
+    # ``_build_stub_entry`` adds the sidecar name BEFORE attempting the write,
+    # so a transient sidecar write failure keeps the previous sidecar on disk
+    # (and ``notes.sidecar_write_failed`` makes the pass uncacheable). But on
+    # any pass that KEPT a previous overlay (source read failure — the
+    # victim's sidecar names are unknowable; overlay write failure — the kept
+    # overlay may reference sidecars of servers the new spec renamed away),
+    # the kept overlay still points ``--env-file`` at old names, and pruning
+    # them would spawn its backends credential-less for the rest of this
+    # gateway's lifetime. Skip the sidecar prune on such a pass: it is
+    # already uncacheable, so the next boot re-enumerates and sweeps.
     env_dir = env_sidecar_dir_for_stubs(stubs_dir)
-    if env_dir.is_dir():
+    if env_dir.is_dir() and not (notes.source_read_failed or overlay_write_failed):
         for stale in env_dir.glob("*.json"):
             if stale.name not in written_sidecars:
                 try:
@@ -1557,19 +1626,20 @@ def rewrite_agents(
                 # Malformed source (mcpServers not a dict): normalize rather
                 # than propagate the broken shape into a freshly-written overlay.
                 new_settings["mcpServers"] = {}
-            # Atomic + 0600: temp-file + os.replace (via atomic_write) so a
+            # Atomic + owner-only: temp-file + os.replace (via atomic_write) so a
             # live session reading this overlay through the bind-mount never
             # sees a truncated mcp.json (which would make its MCP servers
-            # vanish mid-run), and the passed-through non-poolable / HTTP-SSE
-            # env blocks (tokens / API keys) are never world-readable. Matches
-            # the env sidecar and per-agent overlay.
+            # vanish mid-run). ``restrict_to_owner=True`` locks the temp file
+            # down BEFORE the passed-through non-poolable / HTTP-SSE env blocks
+            # (tokens / API keys) reach it — the previous Windows-only
+            # post-rename lockdown left them readable under the inherited DACL
+            # for the write window (issue #5285). It implies 0o600 on POSIX.
+            # Matches the env sidecar and per-agent overlay.
             atomic_write(
                 settings_overlay_path,
                 json.dumps(new_settings, indent=2) + "\n",
-                mode=0o600,
+                restrict_to_owner=True,
             )
-            if not platform_compat.IS_POSIX:
-                platform_compat.restrict_to_owner(settings_overlay_path)
             logger.info(
                 "mcp-gateway rewriter: global mcp.json overlay written, "
                 "%d poolable server(s) relocated to per-agent overlays (overlay=%s)",
@@ -1580,10 +1650,26 @@ def rewrite_agents(
             settings_overlay_path = None
             overlay_write_failed = True
     else:
-        # Source settings/mcp.json absent (deleted between runs): prune any
-        # previously-written settings overlay, mirroring the per-agent
-        # stale-prune above so the overlay tree doesn't accumulate cruft.
-        if settings_overlay_file.is_file():
+        # ``settings_src_spec`` is None: the source is absent, was unreadable
+        # this pass, or carried bad content. Only CONFIRMED absence and
+        # deterministic bad content prune the previous overlay (matching the
+        # per-agent rule and the cached path's keying); a transient read
+        # failure keeps it (#5328). Classify with an explicit ``stat()``
+        # rather than ``is_file()``, which folds a stat fault (ACL hiccup,
+        # transient I/O error) into "absent" and would delete a healthy
+        # overlay — treat a stat fault as transient: keep, and mark the pass
+        # uncacheable so the next boot retries.
+        prune_settings = False
+        if not settings_read_transient:
+            try:
+                kiro_settings_json.stat()
+            except FileNotFoundError:
+                prune_settings = True  # confirmed absent: deleted between runs
+            except OSError:
+                notes.source_read_failed = True  # unknown: keep and retry
+            else:
+                prune_settings = True  # present but bad content: deterministic
+        if prune_settings and settings_overlay_file.is_file():
             try:
                 settings_overlay_file.unlink()
             except OSError:

@@ -95,7 +95,7 @@ export default function RepoSwitcher() {
             repoClassName="font-semibold text-text"
           />
           <ProviderHostTag repoRef={active} />
-          {isReadOnly(activeEntry?.permissions) && <ReadOnlyTag />}
+          {isReadOnly(activeEntry?.permissions) && <ReadOnlyTag repoRef={activeEntry} />}
           <ChevronDown size={15} className="text-muted flex-shrink-0" />
         </button>
       </DropdownMenuTrigger>
@@ -124,7 +124,7 @@ export default function RepoSwitcher() {
                   repoClassName="font-medium"
                 />
                 <ProviderHostTag repoRef={r} />
-                {isReadOnly(r.permissions) && <ReadOnlyTag />}
+                {isReadOnly(r.permissions) && <ReadOnlyTag repoRef={r} />}
               </div>
               {isActive && <Check size={13} className="text-accent flex-shrink-0" />}
             </DropdownMenuItem>

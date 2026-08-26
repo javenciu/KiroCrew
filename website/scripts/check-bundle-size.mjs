@@ -37,10 +37,21 @@ export const DEFAULT_BUDGET_BYTES = 500 * KB
  * is a bundle-size regression and needs to be justified in the PR that does it.
  */
 export const CHUNK_BUDGETS = {
-  // Eager i18n catalogs for all shipped languages (src/i18n). Grows a little
-  // with every translated string, which is expected and fine; what this ceiling
-  // catches is a NEW library or surface landing in the catalog chunk.
-  t: 9500 * KB, // measured 9029 KB
+  // Eager i18n catalogs for all shipped languages, reached through
+  // `src/i18n/all.ts` — Rolldown names the chunk after that entry. Grows a
+  // little with every translated string, which is expected and fine; what this
+  // ceiling catches is a NEW library or surface landing in the catalog chunk.
+  // The built-in App Store guidance adds one use-case and one configuration
+  // string for each of 23 apps across all 12 shipped catalogs.
+  all: 9750 * KB, // measured 9278 KB after built-in App Store guidance
+
+  // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
+  // named after `src/i18n/t.ts`. Held separately from `all` above because
+  // `src/i18n/index.ts` imports English alone, so the ~600 components that call
+  // `t()` no longer pull the other twelve catalogs in behind them. Sized for the
+  // English catalog plus headroom; a jump here means a non-English catalog, or a
+  // library, reached the runtime module.
+  t: 700 * KB, // measured 641 KB
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
@@ -60,7 +71,7 @@ export const CHUNK_BUDGETS = {
   // The app-core chunk: the dashboard shell plus everything eagerly imported
   // from it. The vendor split in vite.config.ts already extracts the heaviest
   // libraries; what remains is first-party code with no clean lazy boundary.
-  App: 3120 * KB, // measured 2969 KB
+  App: 3200 * KB, // measured 3121 KB
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `manualChunks` bucket, see vite.config.ts.
@@ -89,8 +100,10 @@ function fail(message, code = 1) {
 }
 
 // Exit-code mapping for this gate: 2 = report missing, 3 = report malformed or
-// unsupported version. The contract itself (existence/shape/version) lives in
-// the shared loadBundleSummary.
+// unsupported version, 4 = report valid but lists no chunks. The contract itself
+// (existence/shape/version) lives in the shared loadBundleSummary; 4 is checked
+// here rather than there because an empty report is legitimate for
+// bundle-report.mjs, which simply has nothing to render.
 function loadSummary(file) {
   const { summary, error } = loadBundleSummary(file, {
     hint:
@@ -108,6 +121,22 @@ export function main(argv = process.argv.slice(2)) {
     budgets: CHUNK_BUDGETS,
     defaultBudget: DEFAULT_BUDGET_BYTES,
   })
+
+  // A report that lists no chunks measured NOTHING, and the summary below would
+  // call that "0 chunks within budget" and exit 0 -- a green gate over an unbuilt
+  // tree. The build steps that feed it can fail this way silently: an analyze
+  // build whose plugin stops emitting, a config change that empties the chunk
+  // list, or a report written before the bundle exists. Refuse ahead of the
+  // unused-budget warnings, so the actionable line is not buried under one
+  // warning per allowlist entry (11 of them today).
+  if (checkedCount === 0) {
+    fail(
+      `no chunks in ${reportPath} -- the gate measured nothing, so it cannot ` +
+        'certify anything. Re-run `vite build --mode analyze` and check it ' +
+        'emitted a bundle.',
+      4
+    )
+  }
 
   for (const name of unusedBudgets) {
     process.stderr.write(

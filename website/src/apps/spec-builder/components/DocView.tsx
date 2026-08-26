@@ -3,15 +3,18 @@
 // FOOTER below the scroll area (never overlaps the text). Submitting stacks the
 // comment (with file attribution) into the parent's tray — nothing is sent to
 // the agent until "Send all to agent".
-import { useEffect, useRef } from 'react'
-import { MessageSquare, Plus, X, FileText } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { MessageSquare, Plus, X, FileText, ListChecks } from 'lucide-react'
 import MarkdownRenderer from '../../../components/MarkdownRenderer'
 import { Input } from '../../../components/ui'
-import type { SpecDetail } from '../api'
+import type { SpecDetail, SpecTask } from '../api'
 import { ACCENT, SEL_BG, Btn } from './shared'
 import { DocSkeleton } from './Shimmer'
+import TaskList from './TaskList'
 
 import { i18nT } from '../../../i18n/t'
+import { useImeGuard } from '../../../hooks/useImeGuard'
+
 export interface Selection {
   text: string
   x: number
@@ -50,13 +53,37 @@ export interface DocViewProps {
    *  empty state, so an in-flight document reads as pending, not absent. */
   running?: boolean
   addComment: (c: { file: string; quote: string; note: string }) => void
-  composer: DocComposer
+  /** Lifted by SpecDetail so an overlay transition preserves a draft. Direct
+   *  hosts may omit it and use this view's local composer state. */
+  composer?: DocComposer
+  /** Dispatch a single task. Absent = the run controls are not offered. */
+  runTask?: (task: SpecTask) => void
+  pendingTaskIndex?: number | null
 }
 
-export default function DocView({ detail, tab, addComment, running = false, composer }: DocViewProps) {
-  const content = detail?.files?.[tab + '.md']
+export default function DocView({
+  detail,
+  tab,
+  addComment,
+  running = false,
+  composer,
+  runTask,
+  pendingTaskIndex = null,
+}: DocViewProps) {
+  const ime = useImeGuard()
+  const fname = tab + '.md'
+  const content = detail?.files?.[fname]
   const boxRef = useRef<HTMLDivElement>(null)
-  const { sel, setSel, note, setNote, draft, setDraft } = composer
+  const [localSel, setLocalSel] = useState<Selection | null>(null)
+  const [localNote, setLocalNote] = useState<Selection | null>(null)
+  const [localDraft, setLocalDraft] = useState('')
+  const sel = composer?.sel ?? localSel
+  const setSel = composer?.setSel ?? setLocalSel
+  const note = composer?.note ?? localNote
+  const setNote = composer?.setNote ?? setLocalNote
+  const draft = composer?.draft ?? localDraft
+  const setDraft = composer?.setDraft ?? setLocalDraft
+  const [taskDocument, setTaskDocument] = useState(false)
 
   const submit = () => {
     if (!draft.trim() || !note) return
@@ -89,12 +116,37 @@ export default function DocView({ detail, tab, addComment, running = false, comp
       el.removeEventListener('mouseup', onSelectionSettled)
       el.removeEventListener('keyup', onSelectionSettled)
     }
-  }, [tab])
+  }, [tab, setSel])
+
+  const hasTaskControls = tab === 'tasks' && !!runTask && !!detail?.tasks?.length
+  const showTasks = hasTaskControls && !taskDocument
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
+      {hasTaskControls && (
+        <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-border">
+          <Btn
+            primary={!taskDocument}
+            onClick={() => setTaskDocument(false)}
+            label={<><ListChecks className="lucide-inline" /> {i18nT('apps.specBuilder.components.taskList.task_progress')}</>}
+          />
+          <Btn
+            primary={taskDocument}
+            onClick={() => setTaskDocument(true)}
+            label={<><FileText className="lucide-inline" /> {i18nT('apps.specBuilder.components.docView.document_file_name', { name: 'tasks' })}</>}
+          />
+        </div>
+      )}
       <div ref={boxRef} className="flex-1 min-h-0 overflow-y-auto text-[13px] relative">
-        {content ? (
+        {showTasks ? (
+          <TaskList
+            tasks={detail?.tasks ?? []}
+            progress={detail?.task_progress}
+            pendingIndex={pendingTaskIndex}
+            busy={running || detail?.status === 'executing'}
+            onRun={(t) => runTask?.(t)}
+          />
+        ) : content ? (
           <div className="px-5 py-[18px]">
             <MarkdownRenderer content={content} />
           </div>
@@ -149,7 +201,7 @@ export default function DocView({ detail, tab, addComment, running = false, comp
               autoFocus
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') { setNote(null); setDraft('') } }}
+              {...ime.bindEnter({ onEnter: submit, onEscape: () => { setNote(null); setDraft('') } })}
               placeholder={i18nT('apps.specBuilder.components.docView.your_feedback_on_this_passage_enter_adds_it_to_t')}
               aria-label={i18nT('apps.specBuilder.components.docView.your_feedback_on_the_passage_in', { document: note.tab + '.md' })}
               className="flex-1"

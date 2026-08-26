@@ -130,6 +130,19 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "redacts at the source rather than at either boundary.",
     ),
     (
+        "Azure DevOps comment bodies",
+        "apps/builtins/issue_radar/backend/azure_client.py",
+        "The text Issue Radar posts as a work-item or pull-request comment on Azure "
+        "DevOps. A comment body is frequently model-authored -- a crew's reply, or an "
+        "AI summary the user accepted -- and publishing it is irreversible: it lands "
+        "somewhere public and permanent on the customer's own organization, so a "
+        "credential or an exfiltration URL cannot be walked back. `_comment_text` "
+        "therefore runs the two-pass chain at the client, immediately before the body "
+        "reaches `az devops invoke`, rather than trusting each caller to have "
+        "redacted; the crew path already redacts and loses nothing, because both "
+        "passes are idempotent.",
+    ),
+    (
         "Session intent summaries",
         "session_summary.py",
         "Intent-summary payloads persisted to the `.intents` sidecar and served by "
@@ -138,6 +151,24 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "reproduced inside it; `normalize_payload` runs the whole nested payload "
         "through the credential + exfiltration-URL chain before the write, because "
         "the sidecar is durable and read straight back to the panel.",
+    ),
+    (
+        "Cross-session turn delivery",
+        "dashboard/chat_delivery.py",
+        "The text a steer or a queued message carries into a turn, on the path "
+        "`POST /api/chat` uses. Two boundaries in one call: the text is persisted "
+        "into the slot's transcript and broadcast to every connected browser as a "
+        "`steer_push` / `queue_push` card, so the scan happens here, before either "
+        "boundary.",
+    ),
+    (
+        "Session control read",
+        "dashboard/session_control.py",
+        "Another session's transcript tail, served by "
+        "`GET /api/session-control/read` to the calling agent. Conversation "
+        "content read off a live slot, so it can carry a credential a tool "
+        "printed — the same output-boundary reason as the session-storage inventory "
+        "below, with the reader being an LLM rather than the browser.",
     ),
     (
         "Session storage inventory",
@@ -514,6 +545,21 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "channel inherits redaction from this one egress.",
     ),
     (
+        "Hook auto-replies (shared channel pipeline)",
+        "messaging/dispatch.py",
+        "A user-defined `on_message` hook can answer a turn instead of the model, "
+        "which SHORT-CIRCUITS the turn and so never reaches the redactor in "
+        "messaging/driver.py that every other reply on this pipeline inherits. "
+        "The hook's text is arbitrary (it is user code, and it may quote the "
+        "inbound message or a command's output back), so it goes through the "
+        "shared credential + exfiltration-URL chain here, at the one point the "
+        "reply leaves for a channel. This module also carries a NON-egress site, "
+        "the session-directive consumer's confirmation log line, which scrubs the "
+        "same LLM-derived text before it reaches the gateway log; it is named here "
+        "rather than allowlisted separately because a module gets one "
+        "classification and the egress one is the load-bearing half.",
+    ),
+    (
         "Outbound raster payloads",
         "messaging/outbound_files.py",
         "Exact raster bytes pass both credential and exfiltration-URL scanners " "before upload.",
@@ -528,6 +574,40 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "discord/renderer.py",
         "Image-markup removal can join previously separated text into a credential; "
         "the transformed body is re-scanned before Discord receives it.",
+    ),
+    (
+        "Teams rendered message text",
+        "teams/renderer.py",
+        "Every LLM-authored string this channel sends, re-scanned in the form Teams "
+        "will RENDER rather than the bytes handed over: the answer body, an "
+        "`[OPTIONS:]` chip label, the tool-progress bubble, and an approval card's "
+        "tool title and purpose. Teams markdown-renders all of them, so markup the "
+        "platform removes can rejoin a credential the TurnDriver's byte-level stream "
+        "scan saw as broken -- `AKIA**...**` is two fragments to the scanner and one "
+        "key on screen. Card text matters as much as message text here, because a "
+        "card's TextBlock is rendered the same way.",
+    ),
+    (
+        "Teams attachment name",
+        "teams/attachments.py",
+        "The display name on an inline image, whose two sources are BOTH "
+        "LLM-authored: the markdown alt text and, when that is empty, the "
+        "basename of the model-written path. Extraction has already cut the path "
+        "out of the answer body, so for an empty caption this name is the only "
+        "surviving sink -- and the sanitizer preserves `[A-Za-z0-9._-]`, every "
+        "character an `AKIA...` key id or a `ghp_...` token needs. Both the source "
+        "and the finished name are scanned, because the length cap can slice a "
+        "token down to a prefix the scanner no longer matches.",
+    ),
+    (
+        "Telegram rendered widget text",
+        "telegram/renderer.py",
+        "The two LLM-authored strings this channel renders outside the answer "
+        "body: an approval prompt's tool title (sent as markdown) and every "
+        "`[OPTIONS:]` inline-keyboard label. Both are rendered, so markup the "
+        "platform removes can rejoin a credential the TurnDriver's byte-level "
+        "stream scan saw as broken. Scanned at the one keyboard builder both "
+        "callers pass through.",
     ),
     (
         "Discord attachment description",
@@ -545,6 +625,51 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "text rather than stream output, so it bypasses the shared TurnDriver "
         "redaction and is scanned (credentials, exfiltration URLs, local "
         "paths) at this egress before the renderer posts it.",
+    ),
+    (
+        "Telegram rendered-form seal",
+        "telegram/renderer.py",
+        "Every text this channel posts, scanned against the form Telegram RENDERS "
+        "rather than the bytes sent. The TurnDriver's stream scan runs before this "
+        "renderer introduces any markup, so it cannot see a credential the markup "
+        "then reassembles: `AKIA**...**` matches nothing at the byte level, and "
+        "`_md_to_telegram_html` turns it into `AKIA<b>...</b>`, which the client "
+        "displays as an intact key. A link and a zero-width character between the "
+        "halves do the same. Both live-frame and seal run "
+        "`display_safety.redact_for_display` ahead of any tag being introduced, "
+        "covering the HTML, Rich-Message and plaintext branches at once; the "
+        "reasoning blockquote and the restored upload markup run it too.",
+    ),
+    (
+        "Recent-sessions read audit",
+        "messaging/sessions_view.py",
+        "The exception text recorded when the collector fails to read the sessions "
+        "directory, which goes into a SEL audit record every surface's session list "
+        "shares. The message is filesystem error text and can quote a path or an "
+        "environment value, so it is redacted before truncation — truncating first "
+        "would let a cut split a credential pattern out of the matcher's reach.",
+    ),
+    (
+        "LLM-generated session title",
+        "messaging/auto_title.py",
+        "The 3-6 word title a background turn proposes for a session. The model "
+        "writes it FROM the conversation, so it can quote a credential or a beacon "
+        "URL the user pasted, and the title then lands in three places at once — "
+        "the conversation log, the channel's own thread/chat title, and the "
+        "dashboard sidebar. Redacted here, before the cap, because the cap is what "
+        "would otherwise split a credential pattern out of the matcher's reach; and "
+        "here rather than at each caller, because a title reaching one surface "
+        "unredacted is the whole failure.",
+    ),
+    (
+        "Channel keyword-command replies",
+        "messaging/commands.py",
+        "The reply text of the path-independent chat commands — a cron job's name, "
+        "schedule and message, a subagent's task, a task-runner spec path and a "
+        "start failure. Each is free-form text a user typed or the agent proposed, "
+        "and every reply is posted to a channel AND persisted to the conversation "
+        "log, so the credential + exfiltration-URL pair runs before the string "
+        "leaves the module rather than at each channel's own boundary.",
     ),
     (
         "Discord session-resume replay",
@@ -615,6 +740,23 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "shared code: a channel cannot forget what it does not call.",
     ),
     (
+        "Webex delivery",
+        "webex/renderer.py",
+        "The Webex DELIVERY boundary. Webex renders markdown, so it reassembles a "
+        "credential the driver's literal-byte scan of the provider stream could "
+        "not match contiguously (`AKIA**IOSF**ODNN7EXAMPLE`, a link target broken "
+        "by emphasis) -- and this channel adds two egress paths of its own that "
+        "carry the same text: the numbered `[OPTIONS:]` fallback posted when an "
+        "Adaptive Card send fails, and the local-path references restored when an "
+        "upload fails. The final answer is therefore re-scanned through "
+        "redact_for_display (messaging/display_safety.py) on the DISPLAYED form, "
+        "with the same redactor pair TurnDriver streams through. Deliberately "
+        "without the mention defang the shared `display_safe` adds: that "
+        "neutralizes `@everyone`-style broadcast grammars, Webex has none, and "
+        "this channel's allow-list is email addresses -- so defanging would mangle "
+        "every address the agent legitimately prints.",
+    ),
+    (
         "iMessage delivery",
         "imessage/renderer.py",
         "The iMessage DELIVERY boundary. This channel is the one that collapses "
@@ -628,6 +770,78 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "only form that actually ships. Elsewhere in this package "
         "`redact_handle` appears solely in log lines, which is why the sibling "
         "modules are listed as non-egress and this one is not.",
+    ),
+    (
+        "WeCom reasoning blocks",
+        "wecom/renderer.py",
+        "The reasoning WeCom renders inside its native `<think></think>` block. "
+        "`TurnDriver` redacts each thinking chunk, but with a plain per-chunk pass "
+        "rather than the rolling `StreamRedactor` it uses for the answer -- so a "
+        "credential split across two chunks passes both halves and is reconstituted "
+        "by the renderer when it joins them for the frame. The assembled string "
+        "therefore goes through the shared credential + exfiltration-URL chain at "
+        "the send boundary, which is the only form that ships and also covers a "
+        "credential that was never split. The ANSWER text needs no pass here: it "
+        "reaches this renderer already through the driver's rolling redactor.",
+    ),
+    (
+        "Slack attachment titles and filenames",
+        "slack/files.py",
+        "The two upload sinks that are NOT the message body: an attachment's "
+        "title comes from LLM-authored alt text, and its filename from a local "
+        "path the model chose. Both reach Slack as their own fields, so neither "
+        "is covered by the body's render pipeline, and a filename is re-scanned "
+        "AFTER sanitizing because collapsing the unsafe characters can rejoin a "
+        "credential the original had broken up.",
+    ),
+    (
+        "Typed-reply approval prompt",
+        "messaging/approval.py",
+        "The numbered tool-approval prompt for a channel with no interactive "
+        "widget (max_buttons=0). Both fields it interpolates are AGENT-AUTHORED: "
+        "the model chooses the tool name and writes the purpose, so either can "
+        "carry a credential or an exfiltration URL, and the prompt puts them "
+        "straight into a chat message. The screen runs in build_approval_prompt "
+        "rather than at each channel's sink because that is why the helper is "
+        "shared: a channel adopting the ladder inherits the guarantee instead of "
+        "re-deriving it, and a caller that forgets it leaks on a security prompt. "
+        "A channel that screens again at its own sink is merely redundant.",
+    ),
+    (
+        "WhatsApp render pipeline",
+        "whatsapp/renderer.py",
+        "The WhatsApp RENDERING boundary. This is the only markup-CONSUMING "
+        "channel whose own converter rewrites the delimiters: `to_whatsapp_text` "
+        "turns `AKIA**I**OSFODNN7EXAMPLE` into `AKIA*I*OSFODNN7EXAMPLE`, which "
+        "matches no credential pattern as written while the reader's client "
+        "strips the markers and shows an intact key. It strips ANSI and then runs "
+        "redact_for_display (messaging/display_safety.py) over the "
+        "redact_exfiltration_urls + redact_credentials pair, and the pass that "
+        "carries the guarantee is the one AFTER the conversion: the module also "
+        "reduces `<thinking>` blocks, pipe tables and mermaid fences, each of "
+        "which deletes a span and so joins whatever sat on either side of it, "
+        "which a scan of the authored form cannot see. A second pass runs before "
+        "the conversion as a belt. `render_chunks` runs the whole pipeline before "
+        "the splitter, so a credential cannot be cut into an unmatchable prefix. "
+        "`display_safe_text` is the same screen without the conversion, for the "
+        "already-dialect sinks (a file-rejection note, an image caption, the "
+        "approval prompt) that `whatsapp/turn_renderer.py` puts on the wire.",
+    ),
+    (
+        "Weixin steer receipts",
+        "weixin/turn_renderer.py",
+        "The in-answer steer chip (`> \u21aa\ufe0f {summary}`). A steer arrives "
+        "separately from the provider stream, so it never passes `TurnDriver`'s "
+        "rolling redactor, and it is interpolated into the message BODY -- which "
+        "the platform markdown-parses, so a credential split by a code span or "
+        "emphasis is whole on screen while a byte-level scan saw it broken. The "
+        "summary therefore goes through the shared DISPLAY-form redactor at the "
+        "point of interpolation: `Renderer.redact_for_target`, which is only the "
+        "`redact_for_display` pass -- it re-scans the markdown-rendered form with "
+        "the credential + exfiltration-URL chain, and deliberately does not repeat "
+        "the driver's rolling stream scan, which a one-shot summary has no split "
+        "chunks to need. The ANSWER text needs no pass here at all: it reaches this "
+        "renderer already redacted by the driver.",
     ),
     (
         "Slack render pipeline",
@@ -800,6 +1014,18 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "reports. Every text member and the user-typed note run the credential and "
         "exfiltration-URL scanners plus a sensitive-header pass before anything is "
         "written into the archive.",
+    ),
+    (
+        "Connections L1 smoke report",
+        "connections/l1_smoke.py",
+        "The authorized-grant sweep's JSON verdict report: written to disk by "
+        "`_persist_report`, echoed to stdout by `_echo`, and uploaded by the "
+        "nightly lane as a build artifact — so it reaches CI logs and every "
+        "reader of the repository, not just the operator who ran it. The "
+        "credential-bearing part is the provider's own error text, scrubbed by "
+        "`redact_mcp_error` as it enters a verdict row (both site-wide scanners "
+        "plus the configured header-value pass), at the write rather than at a "
+        "read, because the report outlives the process that made it.",
     ),
     (
         "Tag definitions (HTTP + auto-tag)",
@@ -1393,6 +1619,8 @@ _AUDIT_SURFACE_DETAIL: dict[str, str] = {
     "telegram": "Telegram messages, approvals, and owner-authorization decisions",
     "wecom": "WeCom messages, approvals, and owner-authorization decisions",
     "weixin": "Weixin messages, approvals, and owner-authorization decisions",
+    "whatsapp": "WhatsApp messages, approvals, and owner-authorization decisions",
+    "feishu": "Feishu messages, approvals, and owner-authorization decisions",
     "webex": "Webex messages, approvals, and owner-authorization decisions",
     "teams": "Microsoft Teams messages, approvals, and owner-authorization decisions",
     "imessage": "iMessage messages, approvals, and owner-authorization decisions",

@@ -90,6 +90,7 @@ except ImportError:  # Python 3.10, which this project still supports
     except ImportError:
         _toml = None  # type: ignore[assignment]
 
+
 #: How a caller receives this module's own messages: ``(message, is_error)``.
 #: Positional rather than keyword so a caller can pass a plain two-argument
 #: function without importing anything from here.
@@ -369,13 +370,59 @@ def requires_python(repo: Path) -> str | None:
     return cfg.get("options", "python_requires").strip() or None
 
 
-def interpreter_version(target_py: Path) -> tuple[int, int, int] | None:
-    """``(major, minor, micro)`` of *target_py*, or ``None`` if it cannot be asked."""
-    proc = subprocess.run(
-        [str(target_py), "-c", "import sys;print('%d.%d.%d' % sys.version_info[:3])"],
+def _probe_interpreter(
+    target_py: Path, code: str, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run *code* under *target_py*, isolated from the caller's CWD and env.
+
+    Every probe here asks a question about the VENV -- where it resolves this
+    package, which interpreter version it runs, what its console script
+    dispatches to -- so the answer must not depend on the process asking.
+    Without isolation it does, by two routes: ``python -c`` puts the child's
+    CWD at ``sys.path[0]``, so a caller running from a checkout's ``src/``
+    (the Dev Fleet backend does) makes ``find_spec`` resolve this package from
+    that directory for ANY target interpreter; and the child inherits
+    ``PYTHONPATH``, which shadows site-packages the same way.
+
+    ``-I`` closes both routes at once -- no CWD entry on ``sys.path``, no
+    ``PYTHONPATH``, no user-site -- while still honoring the venv's own
+    site-packages, where an editable install's ``.pth`` lives. Because ``-I``
+    implies ``-E``, an encoding request must ride the argv rather than the
+    environment: ``-X utf8`` pins the child's stdout to UTF-8 (matching the
+    decode below) where a ``PYTHONIOENCODING`` entry would be ignored,
+    keeping a non-ASCII checkout path from mangling -- or crashing -- the
+    answer on a non-UTF-8 locale. ``cwd`` is pinned to the interpreter's own
+    directory as well: under ``-I`` the working directory is never on
+    ``sys.path``, whatever it contains, so the pin exists to keep the child's
+    working directory valid even when the caller's has been deleted. The
+    interpreter path is absolutized first (without resolving symlinks, which
+    would erase a venv's identity), because a relative path -- which
+    ``shutil.which`` can return for a relative ``PATH`` entry -- would
+    otherwise be re-resolved against the changed cwd and spawn nothing.
+
+    ``code`` MUST be a fixed literal owned by the caller: this helper is the
+    spawn-audit allowlist's designated isolated-probe entry point, and its
+    "fixed argv" justification stops holding the moment caller-derived text
+    reaches the child. ``timeout`` is forwarded to :func:`subprocess.run`
+    for callers on an interactive path (the doctor, the STT toolchain scan)
+    that must not hang on a wedged interpreter; ``None`` keeps the sync
+    path's unbounded wait.
+    """
+    target = Path(os.path.abspath(target_py))
+    return subprocess.run(
+        [str(target), "-I", "-X", "utf8", "-c", code],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=target.parent,
+        timeout=timeout,
     )
+
+
+def interpreter_version(target_py: Path) -> tuple[int, int, int] | None:
+    """``(major, minor, micro)`` of *target_py*, or ``None`` if it cannot be asked."""
+    proc = _probe_interpreter(target_py, "import sys;print('%d.%d.%d' % sys.version_info[:3])")
     if proc.returncode != 0:
         return None
     try:
@@ -430,6 +477,12 @@ def installed_package_origin(target_py: Path) -> str | None:
     what the installed dependencies will be imported alongside, so it is the thing
     worth checking.
 
+    Runs through :func:`_probe_interpreter`, so the answer describes the venv
+    rather than the caller: an unisolated probe resolves the package from the
+    calling process's CWD (or a ``PYTHONPATH`` entry) ahead of the venv's
+    site-packages, and the consumer then refuses a perfectly healthy venv as
+    "serving a different checkout".
+
     Returns ``None`` when the package cannot be located at all -- including when
     the interpreter itself cannot be run. That case is not theoretical: the caller
     resolved this path by a filesystem check, and a venv deleted between that check
@@ -443,11 +496,7 @@ def installed_package_origin(target_py: Path) -> str | None:
         "print(os.path.abspath(s.origin) if s and s.origin else '')"
     )
     try:
-        proc = subprocess.run(
-            [str(target_py), "-c", probe],
-            capture_output=True,
-            text=True,
-        )
+        proc = _probe_interpreter(target_py, probe)
     except OSError:
         return None
     if proc.returncode != 0:
@@ -645,11 +694,7 @@ def installed_console_script_target(target_py: Path, script: str) -> str | None:
         "print(next((e.value for e in d.entry_points"
         f" if e.group=='console_scripts' and e.name=={script!r}), ''))"
     )
-    proc = subprocess.run(
-        [str(target_py), "-c", probe],
-        capture_output=True,
-        text=True,
-    )
+    proc = _probe_interpreter(target_py, probe)
     if proc.returncode != 0:
         return None
     return proc.stdout.strip() or None

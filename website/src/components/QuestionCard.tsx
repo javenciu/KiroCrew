@@ -4,6 +4,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, MessageSquare } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 interface QuestionOption {
   label: string
   description?: string
@@ -36,6 +37,7 @@ interface QuestionCardProps {
 }
 
 function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftChange }: QuestionCardProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const [selections, setSelections] = useState<Record<number, Set<string>>>({})
   const [customInputs, setCustomInputs] = useState<Record<number, string>>({})
@@ -236,7 +238,6 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
                     setSelections(prev => ({ ...prev, [qIdx]: new Set() }))
                   }}
                   {...ime.bindComposition()}
-                  onFocus={() => ime.reset()}
                   onKeyDown={e => {
                     if (e.key !== 'Enter') return
                     // Rule 1: single-line input; the readiness test stays outside.

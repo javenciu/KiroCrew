@@ -78,8 +78,15 @@ def _slot(restricted: bool) -> Any:
 
 # fmt: off
 def _restricted(key: str, slot: Any = None) -> bool:
+    """Drive Discord's gate with a fake dashboard state holding *slot*.
+
+    Injects the STATE rather than stubbing the slot lookup, so the real
+    ``get_slot`` path in ``messaging/upload_gate.py`` is what answers.
+    """
     from kiro_crew.discord.transport_dispatch import DiscordDispatcher
-    dispatcher = SimpleNamespace(_live_dashboard_slot=lambda _key: slot)
+
+    state = SimpleNamespace(get_slot=lambda _name: slot)
+    dispatcher = SimpleNamespace(_session_resume=SimpleNamespace(dashboard_state=state))
     return asyncio.run(DiscordDispatcher._uploads_restricted(dispatcher, key))
 
 
@@ -239,9 +246,9 @@ class TestRestrictedGate:
 
     @pytest.mark.parametrize("restricted,events", [(True, 1), (False, 0)])
     def test_only_a_denied_upload_is_sel_audited(self, monkeypatch: pytest.MonkeyPatch, restricted: bool, events: int) -> None:
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
         seen: list[dict] = []
-        monkeypatch.setattr(td, "sel", lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw)))
+        monkeypatch.setattr(ug, "sel", lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw)))
         assert _restricted("dashboard:abc", _slot(restricted)) is restricted
         assert len(seen) == events
         if events:
@@ -249,39 +256,59 @@ class TestRestrictedGate:
             assert tuple(seen[0][key] for key in keys) == ("denied", "discord", "restricted_session", "dashboard:abc")
 
     def test_no_live_slot_falls_through_to_the_persisted_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from kiro_crew.discord import transport_dispatch as td
-        monkeypatch.setattr(td, "_persisted_mode_is_restricted", lambda key: key == "dashboard:ghost")
+        from kiro_crew.messaging import upload_gate as ug
+        monkeypatch.setattr(
+            ug, "_persisted_mode_is_restricted", lambda key, probe: key == "dashboard:ghost"
+        )
         assert _restricted("dashboard:ghost") is True
         assert _restricted("dashboard:kept") is False
 
     @pytest.mark.parametrize("mode,restricted", [("incognito", True), ("temporary", True), ("persistent", False), (None, True)])
     def test_the_persisted_mode_decides(self, monkeypatch: pytest.MonkeyPatch, mode: Any, restricted: bool) -> None:
         from kiro_crew.dashboard.handlers import _shared
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
+
+        # Injected, not imported: `messaging` may not reach `dashboard`, so the
+        # probe travels as an argument and the test supplies it directly.
+        probe = _shared._probe_persisted_session
         monkeypatch.setattr(_shared, "_probe_persisted_session", lambda name: (True, mode))
-        assert td._persisted_mode_is_restricted("dashboard:abc") is restricted
+        assert ug._persisted_mode_is_restricted("dashboard:abc", lambda n: (True, mode)) is restricted
+        assert probe is not None
 
     def test_an_ambiguous_stem_denies_instead_of_taking_the_first_match(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from kiro_crew.dashboard.handlers import _shared
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
         _stage_sessions(monkeypatch, tmp_path, abc="persistent", dashboard_abc="incognito")
         assert _shared._persisted_session_memory_mode("abc") == "persistent"
         assert _shared._probe_persisted_session("abc") == (True, None)
-        assert td._persisted_mode_is_restricted("dashboard:abc") is True
+        assert (
+            ug._persisted_mode_is_restricted(
+                "dashboard:abc", _shared._probe_persisted_session
+            )
+            is True
+        )
 
     def test_a_single_unambiguous_persistent_transcript_still_allows(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.dashboard.handlers import _shared
+        from kiro_crew.messaging import upload_gate as ug
+
         _stage_sessions(monkeypatch, tmp_path, dashboard_solo="persistent")
-        assert td._persisted_mode_is_restricted("dashboard:solo") is False
+        assert (
+            ug._persisted_mode_is_restricted(
+                "dashboard:solo", _shared._probe_persisted_session
+            )
+            is False
+        )
 
     def test_an_unreadable_probe_denies(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.dashboard.handlers import _shared
-        from kiro_crew.discord import transport_dispatch as td
+        from kiro_crew.messaging import upload_gate as ug
 
         def _boom(name: str) -> Any:
             raise OSError("sessions dir gone")
-        monkeypatch.setattr(_shared, "_probe_persisted_session", _boom)
-        assert td._persisted_mode_is_restricted("dashboard:abc") is True
+
+        assert ug._persisted_mode_is_restricted("dashboard:abc", _boom) is True
+        assert _shared is not None  # the real probe is unused here, by design
 
 
 class TestDescriptionRedaction:
@@ -418,3 +445,100 @@ async def _done(value: Any) -> Any:
 
 async def _noop_sleep(_seconds: float) -> None:
     return None
+
+
+class TestDisplayRedactionIsAFloor:
+    """Display-form redaction runs on every send, not only the upload path.
+
+    ``TurnDriver`` redacts the LITERAL form of every chunk upstream. The display
+    pass exists for the credential that is invisible until Discord renders the
+    markdown away, so gating it on the upload path left a restricted session, an
+    unset upload root, and every length rotation sending model text that only the
+    literal-form redactor had seen.
+    """
+
+    #: A credential split by Markdown that Discord strips when it renders. The
+    #: literal bytes carry ``**``, so a literal-form scan does not match; the
+    #: rendered form is one contiguous key.
+    SPLIT_SECRET = "AKIA**IOSFODNN7**EXAMPLE"
+
+    @pytest.mark.asyncio
+    async def test_a_restricted_session_still_gets_the_display_pass(self) -> None:
+        cli = await _turn(f"here it is {self.SPLIT_SECRET}", uploads_allowed=False)
+        body = cli.final_text()
+        assert "IOSFODNN7" not in body, body
+
+    @pytest.mark.asyncio
+    async def test_no_upload_root_still_gets_the_display_pass(self) -> None:
+        cli = await _turn(f"here it is {self.SPLIT_SECRET}", upload_root="")
+        assert "IOSFODNN7" not in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_a_channel_without_files_outbound_still_gets_the_display_pass(self) -> None:
+        caps = replace(DISCORD_CAPABILITIES, files_outbound=False)
+        cli = await _turn(f"here it is {self.SPLIT_SECRET}", capabilities=caps)
+        assert "IOSFODNN7" not in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_a_length_rotated_segment_still_gets_the_display_pass(self) -> None:
+        """Length seals pass ``extract_uploads=False``, which was the widest of
+        the ungated routes: it is reached on any reply long enough to rotate."""
+        r, cli = _renderer()
+        await r.on_text_chunk("y" * (r._limit() + 50) + f"\n\n{self.SPLIT_SECRET}\n")
+        await r.on_done()
+        assert all("IOSFODNN7" not in text for text in _bodies(cli))
+
+    @pytest.mark.asyncio
+    async def test_mentions_are_defanged_on_an_ungated_send_too(self) -> None:
+        cli = await _turn("ping @everyone now", uploads_allowed=False)
+        # The text survives; only the ping is broken (the zero-width space is the
+        # renderer's half, `allowed_mentions` is the transport's).
+        assert "@​everyone" in cli.final_text()
+
+
+class TestDeliveryAccountingCountsEverySink:
+    """`delivery_failed` answers "the user saw NOTHING", so every sink must report.
+
+    The dispatcher records a turn's outcome from what the provider produced, which
+    says nothing about whether anything arrived; `delivery_failed` is the
+    observable that separates them, and a cron turn acts on it (it re-alerts over
+    Slack and refuses to advance its dedup hash). So a sink that delivers without
+    reporting turns a success into a duplicate alert, and a sink that fails
+    without reporting turns a silent turn into a recorded success.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_markup_recovery_that_lands_is_not_a_failed_delivery(self, tmp_path: Path) -> None:
+        """The upload failed and the seal with it, but the recovery post arrived."""
+        path, (r, cli) = _png(tmp_path), _renderer()
+        cli.edit_ok, cli.fail_uploads = False, True
+        await r.on_text_chunk(f"Here it is.\n\n![Revenue]({path})")
+        await r.on_done()
+        assert cli.uploads, "premise: the upload was attempted"
+        assert [t for t, _ in cli.sent], "premise: the recovery post went out"
+        assert r.delivery_failed is False
+
+    @pytest.mark.asyncio
+    async def test_a_recovery_that_also_fails_is_a_failed_delivery(self, tmp_path: Path) -> None:
+        path, (r, cli) = _png(tmp_path), _renderer()
+        cli.edit_ok, cli.fail_uploads, cli.fail_sends = False, True, True
+        await r.on_text_chunk(f"Here it is.\n\n![Revenue]({path})")
+        await r.on_done()
+        assert r.delivery_failed is True
+
+    @pytest.mark.asyncio
+    async def test_a_placeholder_that_fails_is_a_failed_delivery(self) -> None:
+        """An empty-bodied turn's placeholder IS the whole delivery."""
+        r, cli = _renderer()
+        cli.fail_sends = True
+        await r.on_text_chunk("   ")
+        await r.on_done()
+        assert [t for t, _ in cli.sent], "premise: a placeholder was attempted"
+        assert r.delivery_failed is True
+
+    @pytest.mark.asyncio
+    async def test_a_placeholder_that_lands_is_not_a_failed_delivery(self) -> None:
+        r, cli = _renderer()
+        await r.on_text_chunk("   ")
+        await r.on_done()
+        assert r.delivery_failed is False

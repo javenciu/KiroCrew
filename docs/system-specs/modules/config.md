@@ -46,8 +46,9 @@ interpreter.
 repository preserves the KiroCrew data home by default. `kirocrew service
 uninstall` removes only its service definition; the Python/npm packages define
 no uninstall lifecycle hook; and the desktop shell's generated NSIS uninstaller
-removes only its install directory and shortcuts (`deleteAppDataOnUninstall`
-stays false), without
+removes only installed program state: its install directory, shortcuts,
+channel-scoped updater cache, and any legacy “start with Windows” registry entry
+(`deleteAppDataOnUninstall` stays false), without
 resolving or removing the KiroCrew home. App Kit uninstall also preserves the
 app's `data/` subtree unless the dedicated `purge_data=true` API action (CLI
 `--purge-data`, or an explicit dashboard choice) is supplied. The API checks
@@ -192,6 +193,52 @@ The parent directory is created on first call if it doesn't exist.
 4. Bundled fallback — `config/defaults.json` and `builtin_skills/` inside the package
 
 The CLI (`cli.py:main()`) auto-detects and sets the env var at startup.
+
+## Superseded Defaults (reported, never rewritten)
+
+`config.json` is a full materialization of the schema -- every field is written to
+disk, including fields the operator never set -- and each field is resolved as
+`data.get(key, DEFAULT)`. A stored value therefore always beats the dataclass
+default, so **changing a shipped default reaches only installs created after the
+change**; a pre-existing install keeps whatever value was materialized last.
+
+`config/superseded_defaults.py` holds an append-only registry
+(`SUPERSEDED_DEFAULTS`) of default changes existing installs should be told about,
+each entry naming the dotted key, the old default, the new default, and the
+release that changed it. `superseded_default_drift(base_data)` returns the entries
+whose stored value equals the old default, comparing type as well as value so a
+stored `0` is not read as `False`.
+
+Registered so far: `mcp_gateway.forward_declared_env` (False -> True, #4566) and
+`session.autocompact_pct` (90.0 -> 70.0, #4388).
+
+Both sides of an entry are **history**, so both are literals: a later change to
+the same key APPENDS a new entry rather than editing an existing one, which keeps
+the older row a true record of the change it describes. What must stay current is
+the END of each key's chain --
+`test_every_registered_key_ends_at_the_live_default` asserts the newest entry per
+key names the default the loader actually applies, so moving a default without
+appending a row fails rather than leaving the report telling operators to adopt a
+value that no longer exists.
+
+Two surfaces render it, and neither writes:
+
+- The load path warns once per key per process, evaluated on the **stored base
+  document before the `config.local.json` merge** -- an overlay value is the
+  operator's live choice and says nothing about what the base materialized, so a
+  base drift is still reported when an overlay masks it, and an overlay-only value
+  is not reported at all.
+- `kirocrew doctor` prints a `Stored Defaults` section reading `config.json`
+  directly. Drift is informational and does NOT become an issue; an unreadable or
+  malformed config does.
+
+**Why nothing is corrected automatically.** At least one registered key also has a
+documented escape hatch (`mcp_gateway.forward_declared_env`, whose stored `false`
+is pinned as honoured by `test_a_real_false_still_turns_it_off`). On disk that
+escape hatch and a stale materialized default are the same bytes, so a rewrite
+cannot correct one without overriding the other. Telling them apart needs per-key
+provenance -- a record of which keys the operator actually set -- which this layer
+does not have.
 
 ## Config Overlay (config.local.json)
 
@@ -619,7 +666,7 @@ class SessionConfig:
     timeout_secs: int = 3600       # 60 min idle timeout (DEFAULT_SESSION_TIMEOUT)
     empty_response_auto_continue: bool = True  # after TWO consecutive empty model responses, auto-send ONE synthetic "continue" nudge on the same live session (transcript-visible notice; bounded to once per user message; the config gate fails OPEN to the default so a config-load hiccup cannot disable self-healing). See session.md "Empty-response recovery ladder".
     autocompact_pct: float = 70.0  # context usage % at which auto-compaction triggers (DEFAULT_AUTOCOMPACT_PCT). Load-time clamped to [5.0, 90.0] (one constant pair shared with the dashboard write gate)
-    pool_size: int = 2             # pre-warmed kiro-cli processes kept ready for instant session start; 0 disables. Load-time clamped to [0, 10]
+    pool_size: int = 0             # pre-warmed kiro-cli processes kept ready for instant session start; 0 (the default) disables. Single source of truth: DEFAULT_POOL_SIZE, read by both the field default and load()'s file-parse fallback. Load-time clamped to [0, 10]
     watchdog_rss_max_mb: int = 0   # recycle a session when its process tree RSS exceeds this many MiB; 0 disables (default). Busy sessions (turn in flight) are never recycled.
 
 @dataclass
@@ -903,7 +950,7 @@ membership: `context.ui_language_tag()` checks the tag against
 to a language the chrome cannot render (#1130). Adding a language is therefore
 the three frontend edits — add `locales/<tag>.json`, register the picker entry
 in `SUPPORTED_LANGUAGES`, and add the static import plus `AUTHORED_CATALOGS`
-entry in `i18n/index.ts` — **plus one mechanical backend entry** in
+entry in `i18n/catalogs.ts` — **plus one mechanical backend entry** in
 `_UI_LANGUAGE_CATALOGS`, which the drift gate in
 `test/test_context_ui_language.py` names explicitly on failure.
 
@@ -926,10 +973,12 @@ load regardless of the language they read.
 
 The documented next step is therefore to keep `en` static and lazily fetch the
 active non-English catalog. That seam is already isolated to
-`website/src/i18n/index.ts` plus a `<Suspense>` boundary in `main.tsx`; no call
-site changes. **Catalog #13 belongs behind that seam**: Korean is #12 and the last
-one this chunk absorbs in front of it. Re-measure when the seam lands — the figure
-above is what says whether it worked.
+`website/src/i18n/catalogs.ts` — the module that owns every catalog import — plus
+a `<Suspense>` boundary in `main.tsx`; no call site changes, and
+`registerCatalogs()` is where a fetching backend hands its catalog over.
+**Catalog #13 belongs behind that seam**: Korean is #12 and the last one this
+chunk absorbs in front of it. Re-measure when the seam lands — the figure above
+is what says whether it worked.
 
 #### The tag reaches the agent, too
 

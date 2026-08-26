@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.loop_lock import LoopBoundLock
+
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider  # noqa: F811
 
@@ -22,6 +24,7 @@ from aiohttp import web
 # binds via sys.modules and defers attribute access to call time, which also
 # keeps tests' monkeypatching of handlers.redact_* effective (late binding).
 import kiro_crew.dashboard.handlers as _h
+from kiro_crew import session_ledger
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.handlers import kiro_usage_api
@@ -36,6 +39,7 @@ from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
     create_subprocess_limited,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
@@ -88,15 +92,13 @@ async def api_sessions_memory(request: web.Request) -> web.Response:
 
 _health_cache: dict[str, dict] = {}
 _health_cache_ts: float = 0.0
-_health_lock: asyncio.Lock | None = None
+_health_lock = LoopBoundLock()
 _HEALTH_REFRESH_SECS = 15
 
 
 async def api_sessions_health(request: web.Request) -> web.Response:
     """GET /api/sessions/health — slots flagged as stalled from log scan."""
-    global _health_cache, _health_cache_ts, _health_lock
-    if _health_lock is None:
-        _health_lock = asyncio.Lock()
+    global _health_cache, _health_cache_ts
     now = time.monotonic()
     if now - _health_cache_ts > _HEALTH_REFRESH_SECS:
         async with _health_lock:
@@ -127,9 +129,7 @@ _MAX_BONUS_NAME_CHARS = 100
 _MAX_BONUS_CREDITS = 1_000_000.0
 _MAX_BONUS_DAYS_LEFT = 3_650
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-_BONUS_DASH_RE = re.compile(
-    r"^([\d.]+)/([\d.]+)\s+used\s+\((\d+)\s+days?\s+left\)$"
-)
+_BONUS_DASH_RE = re.compile(r"^([\d.]+)/([\d.]+)\s+used\s+\((\d+)\s+days?\s+left\)$")
 _BONUS_COLON_RE = re.compile(
     r"^(.+?):\s*([\d.]+)/([\d.]+)\s*\(expires\s+in\s+(\d+)\s+days?\)$",
     re.IGNORECASE,
@@ -371,9 +371,7 @@ def _parse_usage(raw: str) -> dict[str, object]:
             or not name.isprintable()
         ):
             continue
-        bonus_credits.append(
-            {"name": name, "used": used, "total": total, "days_left": days_left}
-        )
+        bonus_credits.append({"name": name, "used": used, "total": total, "days_left": days_left})
         if len(bonus_credits) >= _MAX_BONUS_GRANTS:
             break
     # Preserve an observed empty section as an explicit empty list, so callers
@@ -557,11 +555,10 @@ def _wrap_argv_at_configured_tier(argv: list[str]) -> tuple[list[str], str | Non
     ``is_kiro_cli=True`` is explicit because ``_spawns_kiro_cli``'s basename test
     only matches a literal ``kiro-cli``: a Windows ``kiro-cli.exe``, a wrapper
     shim, or a ``KIROCREW_KIRO_BIN`` pointing at a nonstandard launch path all
-    read as "not kiro-cli". On macOS with ``agent.sandbox="off"`` that
-    misclassification skips the delegation branch — and with it the credential-env
-    scrub — so the child would inherit the sensitive environment. Both callers
-    here spawn kiro-cli by construction, and both ACP spawn paths pass the same
-    flag for the same reason.
+    read as "not kiro-cli". The positive classification is also the security gate
+    for default Windows delegation to Kiro's internal sandbox; basename inference
+    cannot grant it. Both callers here spawn kiro-cli by construction, and both ACP
+    spawn paths pass the same flag for the same reason.
     """
     return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
 
@@ -600,10 +597,10 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
         # Configured tier, not a hardcoded "standard": this is the same binary
         # chat spawns, so it must not demand stricter isolation than chat does.
         # Where the operator set agent.sandbox="off" (isolation deferred to
-        # kiro-cli's own internal sandbox) on a host with no backend, the pinned
-        # "standard" fail-closed and silently dropped the identity this readout
-        # labels the credit numbers with — failure here is non-fatal by design,
-        # so the symptom is a permanently blank email, not an error.
+        # kiro-cli's own internal sandbox), the pinned "standard" tier could
+        # silently diverge from chat and drop the identity this readout labels the
+        # credit numbers with. The explicit Kiro classification also lets the
+        # default Windows tier delegates through Kiro's internal sandbox.
         # Off the loop: see _wrap_argv_at_configured_tier for the two blocking reads.
         argv, cleanup = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), _wrap_argv_whoami, kiro_bin
@@ -613,6 +610,7 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrub_agent_subprocess_env(),
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
         raw = (out or err or b"").decode(errors="replace")
@@ -652,7 +650,7 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
         if m:
             out_map["_profile_arn"] = m.group(0)[:200]
         return out_map
-    except (asyncio.TimeoutError, json.JSONDecodeError, ValueError, OSError):
+    except (asyncio.TimeoutError, ValueError, OSError):
         logger.debug("whoami identity fetch failed", exc_info=True)
         return {}
     except Exception:
@@ -725,6 +723,23 @@ async def _fetch_usage_bg() -> None:
         # credential from a signed-out profile supplying the numbers. Fetched
         # once here and reused by both the API and text branches below.
         identity = await _fetch_whoami(kiro_bin)
+        # Fail fast on API-key auth. kiro-cli's whoami reports the AuthMethod
+        # enum variant ``ApiKey``; the compare normalizes case and strips
+        # separators so an upstream respelling (``API_KEY``, ``Api-Key``)
+        # still fails fast instead of silently regressing to the slow path —
+        # such accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits``
+        # would spend its full timeout walking credential stores that cannot
+        # contain one, and the billed text scrape is no better a source. The
+        # ``reason`` rides the existing unavailable-marker shape so the
+        # frontend can say WHY instead of hiding the pill without explanation.
+        account_type = identity.get("account_type")
+        if (
+            isinstance(account_type, str)
+            and re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
+        ):
+            _publish_usage({"available": False, "reason": "api_key_auth"})
+            logger.info("Kiro usage: not available under API key auth; skipping fetch")
+            return
         raw_arn = identity.get("_profile_arn")
         expected_arn = raw_arn if isinstance(raw_arn, str) and raw_arn else None
         # Primary source: the real GetUsageLimits API. It reads the live bearer
@@ -811,6 +826,7 @@ async def _fetch_usage_bg() -> None:
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrub_agent_subprocess_env(),
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
         raw = (out or err or b"").decode(errors="replace")
@@ -1145,9 +1161,7 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
         try:
             await loop.run_in_executor(
                 None,
-                functools.partial(
-                    log.set_cached_summary, key, summary, sig, generation
-                ),
+                functools.partial(log.set_cached_summary, key, summary, sig, generation),
             )
         except Exception:
             logger.debug("Failed to persist summary cache for %s", key, exc_info=True)
@@ -1307,8 +1321,7 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             try:
                 await crew.purge_slot(candidate)
             except Exception:
-                logger.warning("History delete: crew purge failed for %s",
-                               candidate, exc_info=True)
+                logger.warning("History delete: crew purge failed for %s", candidate, exc_info=True)
     try:
         await state.remove_chat_pins_for_slots(pin_slot_keys)
     except Exception:
@@ -1345,6 +1358,43 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             await state.sessions.destroy(effective_session_key(slot))
         except Exception:
             pass
+    # The work ledger persists independently of the transcript too, and its
+    # content is disposable intermediate state (nothing reconstructs from it),
+    # so a permanent delete reaps it unconditionally. Runs LAST — after the
+    # slot's turn is cancelled and its session destroyed — so an in-flight
+    # ledger write from the dying turn cannot land after the purge; a write
+    # racing in from another process can at worst recreate an orphan directory
+    # the next delete sweeps (see session_ledger.purge). Tab close
+    # (api_chat_slot_delete) deliberately does NOT reach here: the ledger is
+    # part of a session's resumable state.
+    ledger_candidates = set(pin_slot_keys)
+    if slot is not None:
+        # The AUTHORITATIVE session key: a channel-born slot runs the
+        # channel's own session, whose exact key (the ledger's identity) may
+        # appear in pin_slot_keys only as a folded spelling.
+        try:
+            from kiro_crew.dashboard.chat_utils import effective_session_key
+
+            ledger_candidates.add(effective_session_key(slot))
+        except Exception:
+            pass
+    exact_keys = {session_ledger.ledger_key(k) for k in ledger_candidates if k}
+    for candidate in exact_keys:
+        try:
+            await asyncio.to_thread(session_ledger.purge, candidate)
+        except Exception:
+            logger.warning("History delete: ledger purge failed for %s", candidate, exc_info=True)
+    # Breadcrumb sweep: a channel session's ledger is keyed by its EXACT
+    # session key, but a slotless delete only holds the folded transcript
+    # spelling — match each ledger's breadcrumb under the same fold so the
+    # exact-key ledger cannot outlive its session.
+    folded_keys = {_normalize_slot_key(k) for k in ledger_candidates if k}
+    try:
+        await asyncio.to_thread(
+            session_ledger.purge_matching, exact_keys, folded_keys, _normalize_slot_key
+        )
+    except Exception:
+        logger.warning("History delete: ledger sweep failed for %s", key, exc_info=True)
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:
@@ -1697,6 +1747,11 @@ def _read_managed_tool_policy_sync(agent_path: Path) -> dict[str, Any] | None:
         config = json.loads(agent_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(config, dict):
+        # Valid JSON that is not an object (a list, a scalar, null) parses
+        # fine, but `.get` on it would raise. It is a malformed spec, so it
+        # takes the same disposition as the unparseable case above.
+        return None
     policy = config.get("managedToolPolicy", {})
     return policy if isinstance(policy, dict) else None
 
@@ -1874,9 +1929,7 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
     synced = 0
     sync_ok = True
     try:
-        to_sync = await asyncio.wait_for(
-            asyncio.to_thread(sync_discovered_servers), timeout=30
-        )
+        to_sync = await asyncio.wait_for(asyncio.to_thread(sync_discovered_servers), timeout=30)
         synced = len(to_sync)
     except Exception:
         # The restart still proceeds (it applies whatever IS on disk), but the

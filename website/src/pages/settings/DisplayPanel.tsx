@@ -35,6 +35,7 @@ import { isFontInstalled, monospaceFontStack } from '../../utils/fontDetect'
 import { i18nT } from '../../i18n/t'
 import { ThemeDroppedRulesNotice } from './ThemeDroppedRulesNotice'
 import ErrorNotice from '../../components/ErrorNotice'
+import { useImeGuard } from '../../hooks/useImeGuard'
 /**
  * Lightweight inline spinner (no modal / progress bar — matches the "status,
  * not ceremony" preference). Colors come from theme CSS vars via Tailwind
@@ -69,6 +70,7 @@ function StatusIndicator({ label }: { label: string }) {
 }
 
 export function DisplayPanel() {
+  const ime = useImeGuard()
   const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed } = useLanguage()
   const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
   // Shortcut label for the zoom hint/description: ⌘ on macOS, Ctrl elsewhere.
@@ -460,7 +462,7 @@ export function DisplayPanel() {
                   and sat visibly shorter and darker than the picker. */}
               <Input aria-label={i18nT('pages.settings.displayPanel.theme_source_location')} value={installValue}
                 onChange={e => setInstallValue(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handleInstall() }}
+                {...ime.bindEnter({ onEnter: () => handleInstall() })}
                 placeholder={installType === 'github' ? 'https://github.com/user/theme' : '/path/to/theme'}
                 className="min-w-0" />
               <button onClick={handleInstall} disabled={installBusy || !installValue.trim()}
@@ -520,7 +522,7 @@ export function DisplayPanel() {
             onReset={() => setTintCount(RECENT_TINT_COUNT)}
           />
           {/* Color swatches use raw buttons — circular color dots don't fit SettingsButtonGroup's text-button pattern */}
-          <div className="flex flex-col gap-1.5 py-1.5">
+          <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.displayPanel.default_for_new_sessions')}>
             <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
             <div className="text-[12px] text-muted">{i18nT('pages.settings.displayPanel.none_auto_cycle_or_pick_a_fixed_color')}</div>
             <div className="flex flex-wrap items-center gap-1.5">

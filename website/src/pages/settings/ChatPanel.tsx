@@ -160,6 +160,7 @@ export function ChatPanel() {
       soft_stop_budget_secs?: number
       completion_keep?: CompletionKeepMode
       completion_keep_chars?: number
+      fallback_model?: string
     }
     dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
   }>({
@@ -239,6 +240,36 @@ export function ChatPanel() {
     },
   })
 
+  // ── Throttle-fallback model (agent.fallback_model) ──
+  // Single-select dropdown fed by the same advertised-model list as the
+  // role-model rows (no free text — a typo'd id can't exist). "" = disabled,
+  // "auto" (default) = backend availability-aware routing, concrete id =
+  // tried first with "auto" as the final fallthrough.
+  const fallbackModel = mcCfg?.agent?.fallback_model ?? 'auto'
+  const fallbackMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.fallback_model', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: (err: unknown) => {
+      // Surface the backend's actual deny reason (e.g. an unentitled id)
+      // next to the generic failure line.
+      const reason = err instanceof Error && err.message ? `: ${err.message}` : ''
+      setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_fallback_model') + reason)
+    },
+  })
+  const fallbackModelOptions = (current: string): string[] => {
+    const opts = ['', 'auto', ...availableModels.map(m => m.name).filter(m => m !== 'auto')]
+    if (current && !opts.includes(current)) opts.splice(2, 0, current)
+    return opts
+  }
+  const fallbackModelLabels = (opts: string[]): string[] =>
+    opts.map(m =>
+      m === ''
+        ? i18nT('pages.settings.chatPanel.fallback_disabled')
+        : m === 'auto'
+          ? i18nT('pages.settings.chatPanel.fallback_auto')
+          : m,
+    )
+
   const [localKeepChars, setLocalKeepChars] = useState('')
   const keepCharsInitRef = useRef(false)
   useEffect(() => {
@@ -297,9 +328,12 @@ export function ChatPanel() {
   })
 
   // ── Per-role model defaults (agent.role_models) ──
-  // Same picker as the chat default above; "auto" (or unset) means "inherit the
-  // chat default". Lets an operator run background (lite / heartbeat) or
-  // sub-agent work on a cheaper model without changing the interactive default.
+  // Same picker as the chat default above, but NOT the same precedence:
+  // `RoleModels.resolve_model` returns the role's own pin or "auto" and
+  // deliberately never falls back to `agent.model`, so unattended work cannot
+  // silently ride the interactive flagship on every cycle. "auto" therefore
+  // means "the provider picks", not "inherit the chat default" — which is why
+  // these rows label it differently from the chat row's Default (auto).
   const backgroundModel = mcCfg?.agent?.role_models?.background || 'auto'
   const subagentModel = mcCfg?.agent?.role_models?.subagent || 'auto'
   // A pinned model the live backend no longer advertises must stay selectable
@@ -310,7 +344,7 @@ export function ChatPanel() {
     return opts
   }
   const roleModelLabels = (opts: string[]): string[] =>
-    opts.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))
+    opts.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.role_model_auto') : m))
   const backgroundModelMut = useMutation({
     mutationFn: (v: string) => api.patchConfig('agent.role_models.background', v),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
@@ -323,9 +357,15 @@ export function ChatPanel() {
   })
 
   // Per-role reasoning effort, paired with each role's model. Empty inherits the
-  // chat default. The effort row is only meaningful on a reasoning-capable
-  // model, so it disables against the role's RESOLVED model (its pin, else the
-  // chat default) — mirroring the chat effort row's gate.
+  // the MODEL's own default: `RoleModels.resolve_effort` does not fall back to
+  // `agent.reasoning_effort` either. The effort row is only meaningful on a
+  // reasoning-capable model, so it disables against a resolved model.
+  //
+  // KNOWN GAP: the two gates below resolve `auto` to the CHAT default, which
+  // `resolve_model` never does — so a role on auto can offer an effort control
+  // for a model that role will not run on. Changing it is a behaviour change
+  // with a test asserting the current answer, so it is tracked separately
+  // rather than folded into this copy fix.
   const backgroundEffort = mcCfg?.agent?.role_efforts?.background ?? ''
   const subagentEffort = mcCfg?.agent?.role_efforts?.subagent ?? ''
   const bgEffortSupported = modelSupportsEffort(backgroundModel !== 'auto' ? backgroundModel : defaultModel)
@@ -396,7 +436,7 @@ export function ChatPanel() {
             hint={
               effortSupported
                 ? i18nT('pages.settings.chatPanel.model_default_applies_no_override_the_model_pick')
-                : i18nT('pages.settings.chatPanel.role_effort_hint')
+                : i18nT('pages.settings.chatPanel.effort_needs_reasoning_model')
             }
             value={defaultEffort}
             options={[...EFFORT_LEVELS]}
@@ -449,6 +489,21 @@ export function ChatPanel() {
             optionLabels={effortLabels}
             onChange={v => subagentEffortMut.mutate(v)}
             disabled={!mcQ.isSuccess || !subEffortSupported}
+          />
+        </SettingsCard>
+
+        <SettingsCard>
+          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.chatPanel.throttle_fallback')}</div>
+          <div className="text-[12px] text-muted -mt-0.5">{i18nT('pages.settings.chatPanel.model_tried_when_your_current_model_stays_rate_li')}</div>
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.fallback_model')}
+            hint={i18nT('pages.settings.chatPanel.fallback_auto_hint')}
+            value={fallbackModel}
+            options={fallbackModelOptions(fallbackModel)}
+            optionLabels={fallbackModelLabels(fallbackModelOptions(fallbackModel))}
+            onChange={v => fallbackMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+            configKey="agent.fallback_model"
           />
         </SettingsCard>
       </SettingsSection>

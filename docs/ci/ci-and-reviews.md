@@ -88,14 +88,15 @@ Every job here is blocking.
 |---|---|
 | `scrub-lint` | `scripts/scrub-lint.sh --no-history`. Fails on any internal marker in this public tree, so a sync cannot reintroduce a coupling |
 | `vendor-manifest` | `scripts/verify_vendor_manifest.py`. Hashes every file under `src/kiro_crew/_vendor` against the committed `scripts/vendor_manifest.sha256` — the tree is excluded from semgrep and the AI reviewers' diff, so this checksum is its only content review. Always-on (not behind the `changes` path filter) |
-| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink |
+| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
+| `loop-bound-locks` | `scripts/check_loop_bound_locks.py`, self-test first. Fails on any module-global `asyncio.Lock()`/`Event()`/`Queue()` declaration — those bind to the import-time (or first-use) event loop and raise `RuntimeError` when acquired from another loop (Python 3.10+). #4800 converted the tree to `kiro_crew.loop_lock.LoopBoundLock`; whole-tree, since the backlog is zero |
 | `backend-test` | 2 Python versions x 4 duration-balanced pytest-split shards (8 jobs), `-n auto` within each. Coverage only on 3.12 (3.10 passes `--no-cov` for a trace-free run) |
 | `backend-test-windows` | windows-latest, 4 shards, `--no-cov`, 180s per-test timeout. The backend supports Windows natively via `platform_compat`, and nothing else in CI holds that line |
 | `backend-test-macos` | macos-14, deliberately SCOPED (gateway, socketsec, platform-compat, pod and MCP-apps suites via a glob). A full macOS run needs its own exclusion burn-down first, and a job that is red on arrival trains people to ignore it |
 | `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block) |
-| `frontend-lint` | `tsc -b`, `eslint --max-warnings 1116`, `jscpd`, and `npm run i18n:check` |
+| `frontend-lint` | `tsc -b`, `eslint --max-warnings <measured count>`, `jscpd`, and `npm run i18n:check` |
 | `electron-test` | The Electron shell's own node:test suite (`website/electron`) |
 | `frontend-test` | `vitest run --coverage` |
 | `cfn-lint` | Lints the artifact-deploy templates with a pinned `cfn-lint` |
@@ -135,8 +136,11 @@ Details worth knowing:
   places. Per-file enforcement is skipped for a lane whose suite ran as a
   coverage-free subset, because subset rates are not comparable to a baseline
   recorded on the full suite.
-- **`eslint --max-warnings 1116` is a ratchet baseline.** Burn it down, never raise
-  it.
+- **`eslint --max-warnings <n>` is a ratchet baseline, and `<n>` is the measured
+  count.** Burn it down, never raise it, and never leave it above what
+  `npx eslint src/` reports: the difference is a budget new warnings land inside
+  without anyone seeing them. `test_eslint_warning_ceiling.py` keeps the number in one place so a
+  burn-down cannot leave a stale copy behind.
 - **The i18n gates split into three tiers,** and only two can fail: diff-scoped
   zero-tolerance checks (a user-visible literal on a line this branch wrote, a
   file holding more than it did at the base, new English key shape, changed catalog
@@ -215,8 +219,10 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
   closed on **high or critical production** vulnerabilities. Time-boxed exceptions
   live in `.vulnerability-exceptions.json`.
 - **`pr-hygiene`** enforces a Conventional-Commits PR title (it becomes the
-  squash-merge message) and exactly one commit (`git rev-list --count == 1`). Both
-  blocking.
+  squash-merge message) and at most two commits (`git rev-list --count <= 2`).
+  One commit stays the norm; the second is there so a mechanical follow-up (a
+  regenerated artifact, a formatting sweep) can stay separable from the change
+  it accompanies. Both blocking.
 
 Separately, **`dependency-review.yml`** fails a PR that adds or changes a
 dependency whose license is off the curated allowlist in
@@ -375,7 +381,7 @@ observable outcome itself from code it opened in that pass. Pass 2 may also *add
 defect discovery missed, in both lanes, but only under that same three-part
 grounding and the same confidence floor — killing a candidate stays its primary
 job, and a self-found finding gets no second opinion, so it earns no cheaper path
-in. In the Opus lane such a finding is tagged `(origin: validation)` in the posted
+in. In both lanes such a finding is tagged `(origin: validation)` in the posted
 review, because it is un-falsified by construction: the tag is what lets a reader
 weight it accordingly, and what lets the precision of self-added findings be
 compared against survivors' rather than assumed equal. Pass 2 is the only
@@ -475,7 +481,15 @@ characters, then posts a **bot-authored** marker comment that the reviewer workf
 trust. Raw PR comments can never turn a gate green directly; only that marker can.
 The scope is **this commit only**, so a new push needs a new judgment. The workflow
 then re-runs the affected reviewer, cancelling an in-flight run first so its stale
-verdict cannot race the human decision.
+verdict cannot race the human decision. On a fork PR the affected reviewer is the
+`workflow_run`-triggered Stage-2 lane, whose run objects are keyed to the default
+branch — the handler locates the lane run through the run URL the lane stamps into
+the `details_url` of the check-run it posts on the PR head, verifies the resolved
+run belongs to the expected fork workflow, and re-runs it. The fork lanes consume
+no override marker, so that re-run is a fresh review roll rather than a forced
+pass. A rerun failure after the judgment has recorded is reported as a warning
+annotation plus a PR notice naming the lane to re-run manually — never as a failed
+run, which would make a recorded judgment look rejected.
 
 ## `pr-readiness.yml`: the aggregator
 

@@ -43,7 +43,7 @@ The bulk stub action consults whichever of the two the global sharing switch mak
 
 ## Session-bound by construction, which is not the same as "ours"
 
-The `disqualified` reason `first_party_session_scoped` names a server that resolves the calling session from its own PROCESS — an env var, a pid walk — so one backend can only ever serve one session correctly. It is decided by which servers actually consume the injected caller block, not by matching a name against Kiro Crew's managed set: `kirocrew-core` advertises the caller-identity extension and consumes that block, while `kirocrew-cron` does not. Keying it on authorship disqualified the first for a property only the second has.
+The `disqualified` reason `first_party_session_scoped` names a server that resolves the calling session from its own PROCESS — an env var, a pid walk — so one backend can only ever serve one session correctly. It is decided by which servers actually consume the injected caller block, not by matching a name against Kiro Crew's managed set: keying it on authorship once disqualified `kirocrew-core` — which advertised the extension and consumed the block from the start — for a property only its unadopted siblings had. All four managed servers now advertise and consume the block (`kirocrew-core` from the start, `kirocrew-cron` since #4622's fix, `kirocrew-computer` and `kirocrew-dashboard` since #4659). Advertising is necessary but not sufficient for the shareable classification: `kirocrew-computer` stays session-bound deliberately, because a caller the gateway cannot name proceeds under `unresolved:<pid>` and unnamed co-tenants on a pooled backend would share that one snapshot namespace (#5322) — see `_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD` in `mcp_discovery.py`. The classification stays per-server because the next managed server starts unadopted, exactly as these did.
 
 `mcp_discovery.managed_server_is_session_bound` answers from a module-level set, `_MANAGED_SERVERS_CALLER_AWARE`, and deliberately imports nothing: the assessment must answer WITHOUT a handshake (the probe cannot spawn on every host — Windows, macOS >= 26 — and has not run at all before the first probe cycle), and it is consulted on every render, so importing a server module to read its `ADVERTISE_CALLER_IDENTITY` would execute package code from an editable checkout on a path the sandbox never confines. `test/test_mcp_managed_caller_identity.py::test_the_classification_reads_no_module_at_import_time` pins that refusal.
 
@@ -184,9 +184,9 @@ That split is also the export contract. The telemetry layer requires low-cardina
 | `observed_hazard` | refuted | Ledger entry; detail is the hazard code. **One of only two durable grounds for refusing to share, because it happened rather than being inferred.** |
 | `not_stdio` | disqualified | No stdio pipe — out of scope, not unsafe. **The other durable ground, and the only remaining `disqualified` code.** |
 | `handshake_not_reproducible` | note | Pre-flight saw a divergent replayed surface (capabilities, protocol version, `serverInfo` shape, or the tool list). Reported and gates nothing: see below. |
-| `session_bound_by_construction` | disqualified | A managed server that resolves its caller from its own process rather than the injected caller block. Kept gating because `mcp_cron._check_cron_job_ownership` treats a falsy session key as *allow*, so a pooled backend reading EMPTY skips the ownership check rather than merely losing a feature -- and no routing-shaped hazard code would ever record it. |
+| `session_bound_by_construction` | disqualified | A managed server that resolves its caller from its own process rather than the injected caller block -- or that consumes the block yet is deliberately withheld from the shareable classification. Kept gating because `mcp_cron._check_cron_job_ownership` treats a falsy session key as *allow*, so a pooled backend reading EMPTY skips the ownership check rather than merely losing a feature -- and no routing-shaped hazard code would ever record it. Current producer: `kirocrew-computer` (advertises, but unnamed co-tenants share one `unresolved:<pid>` snapshot namespace, #5322). |
 | `rotating_secret_env` | note | Declares an env name excluded from the pool key. Detail is the name. Not emitted for a name in `mcp_gateway.pool_identity_env`, which IS in the pool key. |
-| `degrades_when_shared` | note | `resources.subscribe` or `logging`; detail names which. |
+| `degrades_when_shared` | note | `logging`; detail is `logging_level`. |
 | `not_probed` | unknown | No handshake was observed. |
 | `declares_caller_identity` | declared | Advertises the caller-identity extension. |
 | `preflight_passed` / `preflight_not_run` | declared | Whether the declaration has actually been tested. `preflight_passed` is emitted only when the pass ran AND found no divergence, so it never appears beside `handshake_not_reproducible`. |
@@ -212,14 +212,16 @@ Measured against that, four codes were disqualifying on an inference:
   co-tenant of one process the same answer, exactly as an unpooled process does
   within its lifetime. The row is also re-derived every pass rather than frozen, so
   a wrong one lives until the next measurement instead of for ever.
-- `degrades_when_shared` — neither capability leaks, because
+- `degrades_when_shared` — the capability does not leak, because
   `backend._notification_owner` already DROPS an unattributable request-scoped
-  notification rather than broadcasting it. And neither is a property of the
-  server: both are gaps in this broker. `notifications/resources/updated` is
-  attributable without a request id, since the broker saw which stub subscribed to
-  which URI; it simply keeps no subscription table. Log verbosity is likewise
-  fixable by emitting at the finest level any tenant asked for and filtering down
-  per stub.
+  notification rather than broadcasting it. And it is not a property of the
+  server: it is a gap in this broker. Log verbosity is fixable by emitting at the
+  finest level any tenant asked for and filtering down per stub.
+  `notifications/resources/updated` carries no entry here because it needs none:
+  the broker keeps the `uri -> {stub_uuid}` subscription table
+  (`backend._resource_subscriptions`) and delivers each update to exactly the
+  stubs subscribed to its URI. The table's contract is delete-not-relax — an
+  entry leaves the moment the broker learns to attribute the frames it covers.
 - `rotating_secret_env` — a secret-prefixed key is never forwarded into a shared
   backend at all (`gatewayd._declared_non_secret_env`), so a pooled backend
   receives *nobody's* secret rather than the wrong session's. What pooling costs is
@@ -238,16 +240,30 @@ and `mcp_cron._check_cron_job_ownership` returns *allow* on a falsy session key,
 a pooled cron skips ownership entirely. That is a cross-session authorization
 failure, and it is the one case the retreat cannot backstop: both hazard codes
 describe frames that could not be routed, so serving the wrong session's data
-produces no record. It stays a disqualifier until the managed servers it names
-consume the injected caller block (#4622).
+produces no record. The producers have narrowed as managed servers adopted the
+caller block (#4622, #4659); today the code has one deliberate producer --
+`kirocrew-computer`, which advertises and consumes the block but whose UNNAMED
+co-tenants would share one `unresolved:<pid>` snapshot namespace on a pooled
+backend (#5322) -- and it remains the conservative default for the next managed
+server, which starts unadopted exactly as the others did.
 
 `*.listChanged` is deliberately absent from all of the above: those notifications
 are global broadcasts (`backend._GLOBAL_BROADCAST_NOTIFICATIONS`) and are safe to
 fan out to every attached stub.
 
-Two DIFFERENT detection modes, because a capability and a flag inside one are different claims:
-
-- `resources.subscribe` is a **flag** — `{"subscribe": false}` is the server explicitly saying it does not subscribe, so truthiness is the right test and an explicit `false` must not count against it.
-- `logging` is a **capability** — in MCP an empty object is the standard way to advertise one that takes no sub-options, so `{"logging": {}}` means `logging/setLevel` IS supported. Presence is the right test; truthiness read a server that advertises logging as one that does not. What it costs on a shared backend is that the last caller's level wins and a log line tied to one caller's in-flight call is dropped — noisier logs and missing lines, which is why it is a note.
+Degradation detection is by PRESENCE of the capability key: in MCP an empty
+object is the standard way to advertise a capability that takes no sub-options,
+so `{"logging": {}}` means `logging/setLevel` IS supported, and truthiness would
+read a server that advertises logging as one that does not. What logging costs on
+a shared backend is that the last caller's level wins and a log line tied to one
+caller's in-flight call is dropped — noisier logs and missing lines, which is why
+it is a note. A flag-leaf entry — one whose leaf can be `false`, the server
+explicitly declining the capability — needs a truthiness test instead, and adding
+one to `_SHARED_BACKEND_DEGRADATIONS` means adding a per-entry detection mode
+alongside it. `resources.subscribe` is deliberately NOT in the table: the broker
+keeps a `uri -> {stub_uuid}` subscription table (`backend._resource_subscriptions`)
+and delivers each `notifications/resources/updated` to exactly the stubs
+subscribed to its URI, so subscriptions survive pooling and there is nothing to
+warn the operator about.
 
 Tool annotations (`readOnlyHint` and friends) exist only from MCP 2025-03-26 onward, while the handshake negotiates `2024-11-05`. They are therefore treated as opportunistic positive evidence: present means something, absent means nothing. The negotiated version is deliberately unchanged — raising it alters real handshake semantics with third-party servers, which is a separate decision that should be made with data (the recorded `protocolVersion` is what will supply it).

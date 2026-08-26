@@ -65,7 +65,7 @@ from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
 from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
-from kiro_crew.learn import Lesson, LessonStore
+from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
 from kiro_crew.port_resolution import resolve_client_port_ex
@@ -87,7 +87,7 @@ from kiro_crew.validation import (
     WORKSPACE_NAME_RE,
     normalize_lesson_category,
 )
-from kiro_crew.vector_memory import VectorMemoryStore, _lesson_display_text
+from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore, _lesson_display_text
 
 # Workspace dirs are confined to the data home: a workspace is agent-writable
 # working state, so letting --dir escape would let it be pointed at ~/.ssh or the
@@ -602,9 +602,15 @@ def _run_app_mcp_server(app_name: str) -> None:
     module_name = f"kiro_crew.apps.builtins.{app_name.replace('-', '_')}.mcp_server"
     try:
         mod = importlib.import_module(module_name)
-    except ImportError as exc:
-        print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
-        sys.exit(1)
+    except ModuleNotFoundError as exc:
+        # Only the TARGET module (or one of its parent packages) missing means
+        # "this app has no MCP server". A missing dependency imported INSIDE
+        # mcp_server.py — or any other ImportError — is a real defect and must
+        # keep its traceback rather than exit with a misleading diagnosis.
+        if exc.name and (exc.name == module_name or module_name.startswith(exc.name + ".")):
+            print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
+            sys.exit(1)
+        raise
     runner = getattr(mod, "run_mcp_server", None)
     if runner is None:
         print(f"{module_name} defines no run_mcp_server()", file=sys.stderr)
@@ -1097,7 +1103,8 @@ def _cron(args: argparse.Namespace) -> None:
             print(f"Job not found: {args.job_id}")
 
     elif action == "remove":
-        if svc.remove_job(args.job_id):
+        removed = svc.remove_job(args.job_id, actor="cli", source="cli")
+        if removed:
             print(f"Removed job: {args.job_id}")
         else:
             print(f"Job not found: {args.job_id}")
@@ -1391,14 +1398,35 @@ def _security(args: argparse.Namespace) -> None:
                 print(f"    downstream: {e['downstream_service']}")
     elif action == "verify":
 
-        total, valid = sel().verify_integrity()
-        if total == 0:
+        # detailed=True: a segment dir that refused to pin (or was swapped
+        # mid-verification) leaves the ROTATED segments unchecked, and the
+        # command whose job is to surface tampering must not call that run
+        # "intact" over the live log alone (#5051 review).
+        result = sel().verify_integrity(detailed=True)
+        if not result.history_verifiable:
+            # The live-log clause is derived from the SAME pass's counts, so
+            # it can never claim "intact" over entries that did not verify.
+            if result.total and result.total != result.valid:
+                live = (
+                    f"the live log shows tampered entries: "
+                    f"{result.valid}/{result.total} entries valid"
+                )
+            elif result.total:
+                live = f"the live log verified intact: {result.valid}/{result.total} entries"
+            else:
+                live = "no events to verify"
+            print(
+                f"⚠️  Audit history UNVERIFIABLE: {result.reason}. "
+                f"Rotated segments were not checked — {live}."
+            )
+        elif result.total == 0:
             print("No security events to verify.")
-        elif total == valid:
-            print(f"✅ HMAC chain intact: {total} entries verified.")
+        elif result.total == result.valid:
+            print(f"✅ HMAC chain intact: {result.total} entries verified.")
         else:
             print(
-                f"⚠️  HMAC chain COMPROMISED: {valid}/{total} entries valid, {total - valid} tampered."
+                f"⚠️  HMAC chain COMPROMISED: {result.valid}/{result.total} entries "
+                f"valid, {result.total - result.valid} tampered."
             )
     else:
         print("Usage: kirocrew security {audit|deny-list|events|verify}")
@@ -1666,6 +1694,33 @@ async def _run_eval(args: argparse.Namespace) -> None:
     print(f"\nResults saved to:\n  {report_path}\n  {json_path}")
 
 
+# Appended to every `learn add` output that wrote something. This command builds
+# its store with no embed_fn (loading the embedding model would add its startup
+# cost to every CLI invocation), so an insert lands with a NULL vector and an
+# enrichment CLEARS the stored one (the upsert keeps a vector only when the value
+# is unchanged). Either way the row is repaired by the gateway's boot-time
+# re-embed sweep, not by this process — an unqualified success message would
+# overstate what happened, and a user searching semantically before the next
+# gateway start would not find the lesson they were just told was saved.
+# "once its embedding backend is ready" is the sweep's own guarantee, not
+# hedging: _wait_then_backfill defers the sweep to a later boot when the
+# embedding model has not landed, so "on its next start" would over-promise.
+_LEARN_EMBED_NOTE = (
+    "  Stored and keyword-searchable now; the embedding vector is filled by the\n"
+    "  gateway's re-embed sweep after it next starts, once its embedding backend\n"
+    "  is ready."
+)
+
+# INSERTED only. An enrichment resolves against the ONE existing row it rewrites
+# (write_lesson pass 1 sets ``matched`` and pass 2's generic scan runs over
+# ``[] if matched else lesson_rows``), so the substring/topic-overlap claim is
+# true only for an insert — printing it on ENRICHED would report checks that
+# never ran, the same defect this change fixes.
+_LEARN_DEDUP_NOTE = (
+    "  (Semantic dedup did not run at write time; substring/topic-overlap dedup\n" "  still did.)"
+)
+
+
 def _learn(args: argparse.Namespace) -> None:
     """Save, list, or remove learned corrections."""
 
@@ -1680,23 +1735,62 @@ def _learn(args: argparse.Namespace) -> None:
             rule = args.rule
             category = args.category
             negative = getattr(args, "negative", None)
-            if vs.write_lesson(rule, category, negative):
-                neg = f" ({negative})" if negative else ""
-                print(f"Saved: {rule}{neg} [{category}]")
-            else:
-                lesson = Lesson(
-                    ts=datetime.now(timezone.utc).isoformat(),
-                    rule=rule,
-                    category=category,
-                    negative=negative,
+            # The reporting form, not the bool. This command used to read EVERY falsy
+            # return as "the vector store did not take it" and write a second record
+            # into lessons.jsonl. Most of those returns mean the opposite -- the
+            # lesson is already stored exactly as submitted -- so the fallback wrote a
+            # redundant record for a lesson that was fine, and printed "Saved:" when
+            # nothing needed saving.
+            #
+            # The one return that really does mean "nothing was stored" is a REFUSAL,
+            # and routing that into the JSONL store was worse than redundant: that
+            # store validates no content at all, so a value this store rejected (an
+            # injection-pattern clause) landed there anyway, and the context builder
+            # reads lessons.jsonl whenever the vector store holds no lessons.
+            #
+            # So the fallback is REMOVED, not narrowed. There is no "vector store
+            # unavailable" state to fall back from here: ``vs`` is constructed and
+            # ``init()``-ed unconditionally above, which means a falsy return was the
+            # only way into that branch.
+            result = vs.write_lesson(rule, category, negative)
+            neg = f" ({negative})" if negative else ""
+            # The category is echoed ONLY where the store adopted the submitted one.
+            # It is write-once (vector_memory.py builds an enrichment with the STORED
+            # category, falling back to the submitted one only when the row has none),
+            # so an insert is the single outcome where what was typed is what is held.
+            # Anything else printing it would show a value the store may not have --
+            # the same defect this PR fixes on the reporting side. `learn list` is
+            # where stored values belong.
+            if result.outcome is LessonWriteOutcome.INSERTED:
+                print(f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n{_LEARN_DEDUP_NOTE}")
+            elif result.outcome is LessonWriteOutcome.ENRICHED:
+                # No _LEARN_DEDUP_NOTE here: an enrichment matched its existing row in
+                # pass 1, which SKIPS the generic dedup scan. Instead say what the
+                # rewrite cost — the upsert cleared the vector the row already had.
+                print(
+                    f"Updated the stored lesson with this clause: {rule}{neg}\n"
+                    "  The stored category is kept; `learn list` shows it.\n"
+                    "  This rewrite cleared the row's existing embedding vector.\n"
+                    + _LEARN_EMBED_NOTE
                 )
-                # save_or_enrich, not save: `learn add --negative` is explicit user
-                # intent, so a re-submitted rule should get the clause attached
-                # rather than be skipped as a duplicate. save() keeps the skip
-                # semantics for automatic writers.
-                jsonl_store.save_or_enrich(lesson)
-                neg = f" ({lesson.negative})" if lesson.negative else ""
-                print(f"Saved: {lesson.rule}{neg} [{lesson.category}]")
+            elif result.outcome is LessonWriteOutcome.UNCHANGED:
+                # Nothing was written, and the store keeps the stored category and
+                # NOT-clause rather than rewriting them on a re-submit.
+                print(
+                    f"Already stored, nothing written: {rule}\n"
+                    "  A re-submit keeps the stored category and NOT-clause; "
+                    "changing one means `learn remove` then `learn add`."
+                )
+            elif result.outcome is LessonWriteOutcome.DEDUPED:
+                print(f"Not saved: an existing lesson already covers this ({result.reason})")
+            else:
+                # REFUSED -- and any outcome a later change adds, which is deliberate:
+                # every branch above names ONE outcome, so a new one lands here and
+                # exits non-zero rather than being silently reported as a success. A
+                # non-zero exit so a script driving this command sees the failure.
+                reason = f" ({result.reason})" if result.reason else ""
+                print(f"NOT saved: the memory store refused this lesson{reason}", file=sys.stderr)
+                sys.exit(1)
 
         elif action == "list":
             vs_lessons = vs.get_lessons()

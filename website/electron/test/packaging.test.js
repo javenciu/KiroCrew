@@ -11,6 +11,24 @@ it("Linux BrowserWindows carry the packaged application icon", () => {
 const ROOT = path.resolve(__dirname, "..");
 const REPO_ROOT = path.resolve(ROOT, "..", "..");
 const INSTALLER_ASSETS = path.join(REPO_ROOT, "packaging", "installer-assets");
+const ASSISTED_INSTALLER_TEMPLATE = path.join(
+  ROOT,
+  "node_modules",
+  "app-builder-lib",
+  "templates",
+  "nsis",
+  "assistedInstaller.nsh"
+);
+
+function normalizedNsisBlock(source, pattern) {
+  const match = source.match(pattern);
+  assert.ok(match, `expected NSIS block matching ${pattern}`);
+  return match[0]
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
 
 function tiffPages(file) {
   const bytes = fs.readFileSync(file);
@@ -68,6 +86,29 @@ function bmpInfo(file) {
   };
 }
 
+function bmpDarkPixelCount(file, { left, top, right, bottom }) {
+  const bytes = fs.readFileSync(file);
+  assert.equal(bytes.toString("ascii", 0, 2), "BM");
+  const offset = bytes.readUInt32LE(10);
+  const width = bytes.readInt32LE(18);
+  const signedHeight = bytes.readInt32LE(22);
+  const height = Math.abs(signedHeight);
+  assert.equal(bytes.readUInt16LE(28), 24);
+  const stride = Math.ceil((width * 3) / 4) * 4;
+  let count = 0;
+  for (let y = top; y < bottom; y += 1) {
+    const row = signedHeight > 0 ? height - 1 - y : y;
+    for (let x = left; x < right; x += 1) {
+      const pixel = offset + row * stride + x * 3;
+      const blue = bytes[pixel];
+      const green = bytes[pixel + 1];
+      const red = bytes[pixel + 2];
+      if (red < 96 && green < 96 && blue < 96) count += 1;
+    }
+  }
+  return count;
+}
+
 describe("electron-builder files list", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   const bundledFiles = pkg.build.files;
@@ -120,6 +161,15 @@ describe("first-download installer design contract", () => {
   const background = path.join(INSTALLER_ASSETS, "dmg-background.tiff");
   const sidebar = path.join(INSTALLER_ASSETS, "windows-installer-sidebar.bmp");
   const header = path.join(INSTALLER_ASSETS, "windows-installer-header.bmp");
+  const installer = fs.readFileSync(path.join(ROOT, "build", "installer.nsh"), "utf8");
+  const buildWorkflow = fs.readFileSync(
+    path.join(REPO_ROOT, ".github", "workflows", "build.yml"),
+    "utf8"
+  );
+  const runtimeScript = fs.readFileSync(
+    path.join(REPO_ROOT, ".github", "scripts", "test-windows-installer.ps1"),
+    "utf8"
+  );
 
   it("positions the macOS app and Applications target on the branded background", () => {
     assert.equal(pkg.build.dmg.background, "../../packaging/installer-assets/dmg-background.tiff");
@@ -148,10 +198,89 @@ describe("first-download installer design contract", () => {
     );
     assert.deepEqual(bmpInfo(sidebar), { width: 164, height: 314, bitsPerPixel: 24 });
     assert.deepEqual(bmpInfo(header), { width: 150, height: 57, bitsPerPixel: 24 });
+    for (const eyeRegion of [
+      { left: 84, top: 15, right: 96, bottom: 29 },
+      { left: 106, top: 8, right: 119, bottom: 23 },
+      { left: 98, top: 32, right: 114, bottom: 47 },
+    ]) {
+      assert.ok(bmpDarkPixelCount(header, eyeRegion) >= 6);
+    }
     assert.equal(pkg.build.nsis.oneClick, false);
     assert.equal(pkg.build.nsis.perMachine, false);
     assert.equal(pkg.build.nsis.allowToChangeInstallationDirectory, false);
     assert.equal(pkg.build.nsis.runAfterFinish, true);
+  });
+
+  it("cross-fades native pages without stalling extraction and enforces an install-time ceiling", () => {
+    const assistedInstallerTemplate = fs.readFileSync(ASSISTED_INSTALLER_TEMPLATE, "utf8");
+    assert.doesNotMatch(installer, /Page custom/);
+    assert.doesNotMatch(installer, /NSD_(?:Create|Kill)Timer|Sleep\s+\d+/);
+    assert.match(installer, /KIRO_SPI_GETCLIENTAREAANIMATION/);
+    assert.match(installer, /SystemParametersInfoW/);
+    assert.match(installer, /AnimateWindow\(p \$HWNDPARENT, i \$\{KIRO_FADE_IN_MS\}, i \$0/);
+    assert.match(installer, /AnimateWindow\(p \$HWNDPARENT, i \$\{KIRO_FADE_OUT_MS\}, i \$0/);
+    assert.match(installer, /Function \.onGUIEnd[\s\S]*?Call KiroFadeOutPage[\s\S]*?FunctionEnd/);
+    assert.match(
+      installer,
+      /!macro customWelcomePage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage[\s\S]*?!insertmacro MUI_PAGE_WELCOME/
+    );
+    assert.match(
+      installer,
+      /!macro customInstallMode[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroInstallModeLeave/
+    );
+    assert.match(
+      installer,
+      /!macro customPageAfterChangeDir[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage/
+    );
+    assert.match(
+      installer,
+      /!macro customFinishPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage[\s\S]*?!insertmacro MUI_PAGE_FINISH/
+    );
+    const startAppContract = /Function StartApp[\s\S]*?!define MUI_FINISHPAGE_RUN_FUNCTION "StartApp"/;
+    assert.equal(
+      normalizedNsisBlock(installer, startAppContract),
+      normalizedNsisBlock(assistedInstallerTemplate, startAppContract),
+      "customFinishPage must retain electron-builder's locked StartApp contract"
+    );
+    assert.match(buildWorkflow, /test-windows-installer\.ps1/);
+    assert.match(runtimeScript, /^\$MaxInstallSeconds = 300$/m);
+    assert.match(runtimeScript, /silent-install-seconds=/);
+    assert.match(runtimeScript, /WaitForExit\(\$MaxInstallSeconds \* 1000\)/);
+    assert.match(runtimeScript, /native-install-mode\.png/);
+  });
+
+  it("keeps install-root ownership and legacy startup cleanup without custom pages", () => {
+    assert.match(installer, /Function KiroEnsureAppInstallDir[\s\S]*?FunctionEnd/);
+    assert.match(installer, /!macro customInit[\s\S]*?Call KiroEnsureAppInstallDir/);
+    assert.match(
+      installer,
+      /!macro customPageAfterChangeDir[\s\S]*?Function KiroValidateInstallDirAfterMode/
+    );
+    assert.match(
+      installer,
+      /Function KiroInstallModeLeave[\s\S]*?Call KiroValidateInstallDirAfterMode[\s\S]*?Call KiroFadeOutPage[\s\S]*?FunctionEnd/
+    );
+    assert.doesNotMatch(installer, /Page custom KiroValidateInstallDirAfterMode/);
+    assert.match(
+      installer,
+      /Function KiroValidateInstallDirAfterMode[\s\S]*?Call KiroEnsureAppInstallDir[\s\S]*?StrCpy \$INSTDIR \$KiroInstallDir[\s\S]*?FunctionEnd/
+    );
+    assert.doesNotMatch(
+      installer,
+      /Function KiroValidateInstallDirAfterMode[\s\S]*?Abort[\s\S]*?FunctionEnd/
+    );
+    assert.match(installer, /GetFileAttributesW/);
+    assert.match(installer, /KiroCheckFreshInstallDir/);
+    assert.match(
+      installer,
+      /\$\{ifNot\} \$\{isUpdated\}[\s\S]*?DeleteRegValue SHELL_CONTEXT "\$\{KIRO_RUN_KEY\}" "\$\{PRODUCT_NAME\}"/
+    );
+    assert.match(installer, /MessageBox MB_OK\|MB_ICONSTOP "\$\(\^CantWrite\)\$KiroInstallDir"/);
+    assert.doesNotMatch(installer, /MessageBox[^\r\n]*\$\(\^DirBrowseText\)/);
+    assert.match(runtimeScript, /pre-existing-user-file\.txt/);
+    assert.match(runtimeScript, /existing-install-file/);
+    assert.match(runtimeScript, /invalidProcess\.ExitCode -ne 2/);
+    assert.equal(pkg.devDependencies["electron-builder"], "26.15.3");
   });
 
   it("reuses the shipped logo and opening-animation ghost artwork", () => {
@@ -172,12 +301,25 @@ describe("first-download installer design contract", () => {
 
     const openingGhost = "M398.554 818.914C316.315 1001.03";
     const logoGhost = "M84.76 266.62c-19.2 42.53";
+    const logoEyes = [
+      "M140.41 203.27c-7.67 0",
+      "M171.94 203.27c-7.67 0",
+      "M61.06 92.87c-1.57-4.01",
+      "M67.53 109.37c-1.57-4.01",
+      "M194.79 60.97c3.96 2.55",
+      "M178.51 50.47c3.96 2.55",
+    ];
     assert.ok(loading.includes(openingGhost));
     assert.ok(dmgSource.includes(openingGhost));
     assert.ok(sidebarSource.includes(openingGhost));
     assert.ok(siteLogo.includes(logoGhost));
     assert.ok(sidebarSource.includes(logoGhost));
     assert.ok(headerSource.includes(logoGhost));
+    for (const eye of logoEyes) {
+      assert.ok(siteLogo.includes(eye));
+      assert.ok(sidebarSource.includes(eye));
+      assert.ok(headerSource.includes(eye));
+    }
   });
 
   it("applies the branded layout again after signing and stapling", () => {

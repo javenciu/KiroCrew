@@ -11,6 +11,7 @@ import InfoTip from '../components/InfoTip'
 import Modal from '../components/Modal'
 import Clickable from '../components/Clickable'
 import { useNavigate } from 'react-router-dom'
+import { useDocumentImeLatch } from '../hooks/useImeGuard'
 import { useAppDispatch } from '../store'
 import { addNotification } from '../store/notificationsSlice'
 import { setPendingInput } from '../store/chatSlice'
@@ -392,6 +393,10 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
   const popRef = useRef<HTMLDivElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
   const confirmRef = useRef<HTMLButtonElement>(null)
+  // Shared IME latch for the boundary-Tab trap below (see the comment on the
+  // Tab branches): the trap listens at document capture, so it receives
+  // NATIVE KeyboardEvents that the synthetic-only guard cannot consume.
+  const imeLatch = useDocumentImeLatch(open)
 
   const close = useCallback(() => {
     setOpen(false)
@@ -409,11 +414,25 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
     }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // An Escape the IME owns is cancelling a candidate, not the popover —
+        // and `close()` also yanks focus back to the trigger, the same harm
+        // as the Tab wrap below. Same claim, same reason.
+        if (!imeLatch.claimKey(e)) return
         close()
       } else if (e.key === 'Tab' && e.shiftKey && document.activeElement === cancelRef.current) {
+        // A boundary Tab the IME owns must not cycle focus — the user is
+        // choosing a candidate, not leaving the field. `claimKey` owns the
+        // whole decline (native-event contract in useImeGuard.ts) and must
+        // run before the preventDefault() and focus move. Both ring
+        // boundaries are buttons today, so no composition can start on them —
+        // the guard pins that this stays safe if the popover ever grows a
+        // text field. Mid-popover Tabs fall through: they are the browser's
+        // to move, so they are also not the trap's to claim.
+        if (!imeLatch.claimKey(e)) return
         e.preventDefault()
         confirmRef.current?.focus()
       } else if (e.key === 'Tab' && !e.shiftKey && document.activeElement === confirmRef.current) {
+        if (!imeLatch.claimKey(e)) return
         e.preventDefault()
         cancelRef.current?.focus()
       }
@@ -433,7 +452,7 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
       window.removeEventListener('scroll', onScrollOrResize, true)
       window.removeEventListener('resize', onScrollOrResize)
     }
-  }, [close, open])
+  }, [close, open, imeLatch])
 
   const toggle = () => {
     if (!open && triggerRef.current) setRect(triggerRef.current.getBoundingClientRect())
@@ -608,7 +627,7 @@ function ToastHost() {
   }, [])
   if (!toasts.length) return null
   return (
-    <div role="status" aria-live="polite" style={{ position: 'fixed', top: 14, left: '50%', transform: 'translateX(-50%)', zIndex: 9997, display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'center', pointerEvents: 'none' } as CSSProperties}>
+    <div role="status" aria-live="polite" className="fixed top-safe-offset-3.5" style={{ left: '50%', transform: 'translateX(-50%)', zIndex: 9997, display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'center', pointerEvents: 'none' } as CSSProperties}>
       {toasts.map((t) => (
         <div key={t.id} style={{ background: 'var(--card)', color: 'var(--card-fg)', border: '1px solid ' + (t.type === 'error' ? 'var(--danger)' : t.type === 'success' ? 'var(--ok)' : 'var(--border)'), borderRadius: 8, padding: '7px 14px', fontSize: 12.5, boxShadow: '0 4px 14px rgba(0,0,0,0.25)', maxWidth: 520 } as CSSProperties}>
           {t.msg}
@@ -690,6 +709,13 @@ export default function DevFleetPage() {
   // so the fleet-driven reattach below never starts a second poll loop for a
   // run this session is already polling.
   const provAttachedRef = useRef<Set<string>>(new Set())
+  // Synchronous per-worktree in-flight guard for the provision() entry point.
+  // React state updates are asynchronous: setProv({ status: 'starting' })
+  // does not disable the Provision button until the next render commit.
+  // A rapid double-click therefore sends two POST requests before any re-render.
+  // This ref is checked and set BEFORE the first `await`, so the second click
+  // in the same render turn is blocked synchronously rather than racing the DOM.
+  const provInFlightRef = useRef<Set<string>>(new Set())
   // Poll-loop lifecycle: loops exit when the component unmounts or a run is
   // explicitly dismissed — otherwise navigation would leak up-to-900-request
   // closures, and dismissing the stepper would be undone by the next tick.
@@ -1045,6 +1071,20 @@ export default function DevFleetPage() {
   }
 
   async function provision(name: string) {
+    // Synchronous guard: blocks re-entry before React re-renders the button into
+    // its disabled state. A rapid double-click fires both event handlers in the
+    // same render turn (before any setState takes effect), so checking React state
+    // here would NOT catch the second click.  provInFlightRef is updated
+    // synchronously and persists across renders, so it reliably blocks the second
+    // invocation whether it arrives in the same turn or in a later one while the
+    // request is still awaited. The finally block releases the guard after the
+    // request/polling lifecycle exits; remounting creates a fresh ref.
+    if (provInFlightRef.current.has(name)) {
+      // The first invocation already owns the API request, polling, and UI state.
+      // Returning here prevents both a duplicate POST and a second poll loop.
+      return
+    }
+    provInFlightRef.current.add(name)
     const startedAt = Date.now()
     clearTimeout(provDoneTimersRef.current[name])
     setProvLogOpen((o) => { const n = { ...o }; delete n[name]; return n })
@@ -1072,6 +1112,11 @@ export default function DevFleetPage() {
       notify(msg, { type: 'error' })
       setProv((p) => ({ ...p, [name]: { status: 'failed', failed: true, lines: [msg], startedAt, exit: null } }))
       setProvLogOpen((o) => ({ ...o, [name]: true }))
+    } finally {
+      // Release the per-name guard so a retry after failure or dismissal can
+      // re-enter.  pollProvisionRun already owns its completion lifecycle;
+      // this only gates the entry point.
+      provInFlightRef.current.delete(name)
     }
   }
 

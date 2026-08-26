@@ -936,6 +936,122 @@ def test_installed_package_origin_fails_closed_on_an_unrunnable_interpreter(tmp_
     assert dep_sync.venv_not_mapped_to(None, tmp_path) is not None
 
 
+def _decoy_package(tmp_path):
+    """A directory holding a decoy ``kiro_crew`` package, as a checkout's src/ does."""
+    decoy = tmp_path / "decoy-src"
+    (decoy / "kiro_crew").mkdir(parents=True)
+    (decoy / "kiro_crew" / "__init__.py").write_text("", encoding="utf-8")
+    return decoy
+
+
+def test_origin_probe_ignores_a_decoy_package_in_the_callers_cwd(tmp_path, monkeypatch):
+    """The probe describes the venv, never the caller's working directory.
+
+    The reproduction from the field: the caller (the Dev Fleet backend) runs
+    with its CWD inside a checkout's ``src/``, which contains ``kiro_crew/``.
+    An unisolated ``python -c`` puts that CWD at ``sys.path[0]``, so
+    ``find_spec`` resolves the decoy for ANY target interpreter and the guard
+    refuses a healthy venv. The probe's answer must not be the decoy.
+    """
+    decoy = _decoy_package(tmp_path)
+    monkeypatch.chdir(decoy)
+
+    origin = dep_sync.installed_package_origin(Path(sys.executable))
+
+    # Whatever this interpreter genuinely serves (an editable install, or no
+    # install at all -> None), it is not the package sitting in the caller's CWD.
+    assert origin is None or not origin.startswith(str(decoy))
+
+
+def test_origin_probe_ignores_pythonpath(tmp_path, monkeypatch):
+    """The second route to the same false positive: an inherited PYTHONPATH.
+
+    PYTHONPATH entries rank ahead of site-packages, so a decoy on the caller's
+    PYTHONPATH shadows the venv's own install exactly like the CWD does. The
+    probe runs the interpreter isolated, so the inherited value is ignored.
+    """
+    decoy = _decoy_package(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(decoy))
+
+    origin = dep_sync.installed_package_origin(Path(sys.executable))
+
+    assert origin is None or not origin.startswith(str(decoy))
+
+
+def test_every_interpreter_probe_runs_isolated_with_a_neutral_cwd(tmp_path):
+    """All three venv probes share the isolation, not just the origin one.
+
+    ``interpreter_version`` and ``installed_console_script_target`` ask the
+    same kind of question of the same interpreter; a probe left unisolated
+    would re-open the CWD/PYTHONPATH route this module just closed.
+    """
+    target = tmp_path / "venv" / "bin" / "python"
+    target.parent.mkdir(parents=True)
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append((cmd, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(dep_sync.subprocess, "run", side_effect=fake_run):
+        dep_sync.interpreter_version(target)
+        dep_sync.installed_package_origin(target)
+        dep_sync.installed_console_script_target(target, "kirocrew")
+
+    assert len(seen) == 3
+    for cmd, kwargs in seen:
+        assert cmd[0] == str(target)
+        assert cmd[1] == "-I", "probe must run the interpreter isolated"
+        assert cmd[2:4] == ["-X", "utf8"], (
+            "-I implies -E, so the UTF-8 pin must ride the argv -- an env "
+            "PYTHONIOENCODING is ignored and a non-ASCII path would come "
+            "back locale-mangled"
+        )
+        assert kwargs.get("cwd") == target.parent, "probe needs a neutral cwd"
+
+
+def test_probe_forwards_a_timeout_to_the_child(tmp_path):
+    """Interactive callers (the doctor's deps check, the STT toolchain scan)
+    bound the probe so a wedged interpreter cannot hang them; the sync path's
+    default ``None`` keeps its unbounded wait."""
+    target = tmp_path / "venv" / "bin" / "python"
+    target.parent.mkdir(parents=True)
+    seen: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(dep_sync.subprocess, "run", side_effect=fake_run):
+        dep_sync._probe_interpreter(target, "print(1)", timeout=7)
+        dep_sync._probe_interpreter(target, "print(1)")
+
+    assert seen[0].get("timeout") == 7
+    assert seen[1].get("timeout") is None
+
+
+def test_probe_absolutizes_a_relative_interpreter_path(tmp_path, monkeypatch):
+    """A relative target -- ``shutil.which`` returns one for a relative PATH
+    entry -- must not be re-resolved against the probe's own cwd pin: spawning
+    ``tools/python3`` from ``cwd=tools`` would look for ``tools/tools/python3``
+    and report a healthy interpreter as unprobeable."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "python3").touch()
+    monkeypatch.chdir(tmp_path)
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["argv0"] = cmd[0]
+        seen["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(dep_sync.subprocess, "run", side_effect=fake_run):
+        dep_sync._probe_interpreter(Path("tools/python3"), "print(1)")
+
+    assert seen["argv0"] == str(tmp_path / "tools" / "python3")
+    assert seen["cwd"] == tmp_path / "tools"
+
+
 def test_sync_captures_pip_output_instead_of_writing_it_to_stderr(tmp_path, capsys):
     """pip's output must reach ``emit``, never the inherited stderr.
 

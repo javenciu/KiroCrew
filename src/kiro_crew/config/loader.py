@@ -77,6 +77,10 @@ from kiro_crew.config.paths import (  # noqa: F401, kiro_agents_dir
     kiro_agents_dir,
 )
 
+# Superseded-default reporting (#5244). Leaf module: stdlib only, so importing it
+# here creates no cycle.
+from kiro_crew.config.superseded_defaults import drift_summary, superseded_default_drift
+
 # Schema validation + the validated-data cache live in ``config.validation``.
 # Re-exported here for backward compatibility — callers and tests still
 # reference these as ``kiro_crew.config.loader.X`` (e.g. the cache tests patch
@@ -148,6 +152,8 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "webex",
         "wecom",
         "weixin",
+        "whatsapp",
+        "feishu",
         "teams",
         "imessage",
         "dashboard",
@@ -194,6 +200,8 @@ CRED_MICROSOFT_APP_ID = "MICROSOFT_APP_ID"
 CRED_MICROSOFT_APP_PASSWORD = "MICROSOFT_APP_PASSWORD"
 CRED_MICROSOFT_APP_TENANT_ID = "MICROSOFT_APP_TENANT_ID"
 CRED_WEIXIN_TOKEN = "WEIXIN_TOKEN"  # iLink bot credential from the Settings QR flow
+CRED_FEISHU_APP_ID = "FEISHU_APP_ID"  # Feishu custom-app id (developer console)
+CRED_FEISHU_APP_SECRET = "FEISHU_APP_SECRET"
 CRED_JIRA_API_TOKEN = "JIRA_API_TOKEN"  # Jira Cloud/Server API token (resolved from .env)
 # kiro-cli's OWN model credential. Unlike the gateway-owned channel tokens
 # above, its rightful consumer is the agent subprocess itself (and the whoami
@@ -214,6 +222,8 @@ _CREDENTIAL_KEYS = (
     CRED_MICROSOFT_APP_PASSWORD,
     CRED_MICROSOFT_APP_TENANT_ID,
     CRED_WEIXIN_TOKEN,
+    CRED_FEISHU_APP_ID,
+    CRED_FEISHU_APP_SECRET,
     CRED_JIRA_API_TOKEN,
     CRED_KIRO_API_KEY,
 )
@@ -232,8 +242,9 @@ DEFAULT_SESSION_TIMEOUT = 3600  # 60 min
 # Auto-compaction threshold, as a percentage of the context window. Named
 # because two code paths need it — the dataclass field default (used only when
 # there is no config file) and the dict-load fallback in ``load()`` (used when
-# a config file omits the key). Restating the number in both is how
-# ``pool_size`` came to have a field default of 0 and a load fallback of 2.
+# a config file omits the key). Restating the number in both lets them disagree
+# with nothing on disk to show it, which is why ``pool_size`` is named the same
+# way (``DEFAULT_POOL_SIZE``) rather than written twice.
 DEFAULT_AUTOCOMPACT_PCT = 70.0
 # Margin BELOW the configured compaction threshold at which the "context is
 # getting large" warning fires. A margin rather than an absolute percentage
@@ -242,7 +253,29 @@ DEFAULT_AUTOCOMPACT_PCT = 70.0
 # absolute warn level at or above the configured threshold makes the warning arm
 # unreachable and the early signal disappears for whoever did not change the
 # default. Kept here rather than in either consumer so the two cannot drift.
-CONTEXT_WARN_MARGIN_PCT = 20.0
+#
+# 10 points, so the warning carries one fixed meaning — "within 10 points of
+# compaction" — whatever threshold the operator configures. Width is what makes
+# the signal readable: at 20 the warning covers the top 20 of the 70 usable
+# points on the default threshold and fires on every turn from half the context
+# window onward, which is where an always-on warning stops being read.
+# ``test_the_warning_stays_a_minority_of_the_usable_range`` holds the band under
+# a quarter of the range so it cannot widen back into noise.
+CONTEXT_WARN_MARGIN_PCT = 10.0
+# session.pool_size — warm pool OFF by default. Each pooled slot is a full
+# kiro-cli process plus the MCP stdio servers its agent spec spawns (~109 MB per
+# backend), and a non-zero value is also reserved out of the memory term that
+# sizes the subagent cap (subagent.compute_max_subagents), so the cost is paid on
+# every host whether or not the pool is ever claimed. Cold start is instead
+# hidden by session.eager_spawn, which is on by default and pre-creates a slot's
+# session behind user think-time.
+#
+# Read by BOTH the SessionConfig field default and load()'s file-parse fallback,
+# because those are two independent paths to the same value: a home with no
+# config.json takes the field default, and a config.json that omits the key takes
+# the parse fallback. A literal in either place lets the two disagree, which is
+# invisible on disk — this constant is the only place the value is written.
+DEFAULT_POOL_SIZE = 0
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
 )
@@ -311,6 +344,31 @@ def coerce_role_efforts(raw: object) -> dict[str, str]:
         if isinstance(val, str) and val.strip() and is_valid_effort(val.strip()):
             out[role] = val.strip()
     return out
+
+
+def coerce_fallback_model(raw: object) -> str:
+    """Normalize the throttle-fallback model (agent.fallback_model).
+
+    Single value with three shapes: ``"auto"`` (the default — defer to the
+    backend's availability-aware routing when the active model stays
+    throttled), ``""`` (feature explicitly disabled: fail loudly, pre-feature
+    behavior), or a concrete model id normalized through
+    :func:`model_registry.to_provider_id` for the ``acp`` provider (registry
+    canonical keys and aliases land as the kiro-cli id the wire needs;
+    unregistered ids pass through unchanged — existing registry behavior).
+    Absent/junk input (``None``, non-string) collapses to the ``"auto"``
+    default. ``"auto"`` is matched case-insensitively; an unregistered id that
+    the registry maps to ``""`` also collapses to ``"auto"`` rather than
+    silently disabling the feature.
+    """
+    if raw is None or not isinstance(raw, str):
+        return "auto"
+    s = raw.strip()
+    if not s:
+        return ""
+    if s.lower() == "auto":
+        return "auto"
+    return model_registry.to_provider_id(s, "acp") or "auto"
 
 
 _DEFAULT_PORT = 5476
@@ -409,14 +467,18 @@ def _safe_nonnegative_int(value: object, default: int) -> int:
     return result if result >= 0 else default
 
 
-def _clamp_pct(value: int) -> int:
-    """Clamp an integer context-threshold percentage to 1..100.
+#: Bounds of a context-threshold percentage, and the single statement of the range.
+#: The floor is 1, not 0, because a 0% threshold means "always over" and would fire the
+#: notice/compaction on every turn. Public because the dashboard's channel-config
+#: handlers validate an inbound percentage against exactly this range, and a validator
+#: that restated the numbers would drift from what the loader will actually accept.
+THRESHOLD_PCT_MIN = 1
+THRESHOLD_PCT_MAX = 100
 
-    The single statement of the range: the floor is 1, not 0, because a 0%
-    threshold means "always over" and would fire the notice/compaction on
-    every turn.
-    """
-    return max(1, min(100, value))
+
+def _clamp_pct(value: int) -> int:
+    """Clamp an integer context-threshold percentage to the shared range."""
+    return max(THRESHOLD_PCT_MIN, min(THRESHOLD_PCT_MAX, value))
 
 
 def _threshold_pct(raw: object, default: int) -> int:
@@ -808,6 +870,87 @@ def read_config_for_update(path: Path | None = None) -> dict:
     return raw
 
 
+#: Marker used in :attr:`KiroCrewConfig.degraded_sections` for "a whole config
+#: FILE could not be read" (unparseable, or a top level that is not a JSON
+#: object), as opposed to one named section being malformed. A gate that reads
+#: any security value must treat it exactly like its own section being
+#: degraded: the operator's settings are unknown either way.
+DEGRADED_WHOLE_CONFIG = "*"
+
+#: Sections observed malformed by ANY read in this process, remembered for its
+#: lifetime.
+#:
+#: Stickiness is the point, not an optimization. ``load()`` runs a migration
+#: that REWRITES ``config.json`` in normalized form, so the very first load
+#: repairs the file: a second load — including the one a security gate makes
+#: moments later in the same request — sees a clean file with the malformed
+#: section silently gone, and an empty allowlist that reads as "operator
+#: configured nothing". Remembering keeps the answer truthful for as long as the
+#: process could still act on that value.
+#:
+#: The operator's fix is to correct the file and restart the gateway, which is
+#: the same ceremony every other boot-time config decision already requires.
+_OBSERVED_DEGRADED_SECTIONS: set[str] = set()
+
+
+def reset_degraded_observations() -> None:
+    """Forget every degradation this process has observed.
+
+    The observations are deliberately sticky for the life of a gateway (see
+    :data:`_OBSERVED_DEGRADED_SECTIONS`), so the ONLY legitimate callers are
+    tests, which share one interpreter and would otherwise let one case's
+    malformed config deny in the next. Production clears it by restarting,
+    which is the same ceremony every other boot-time config decision requires.
+    """
+    _OBSERVED_DEGRADED_SECTIONS.clear()
+
+
+def _mark_file_degraded(path: Path) -> None:
+    """Record that a whole config FILE could not be read as a JSON object.
+
+    Adds both the generic marker (so a gate can ask one question) and the file's
+    name (so the refusal can tell the operator which file to go and fix).
+    """
+    _OBSERVED_DEGRADED_SECTIONS.add(DEGRADED_WHOLE_CONFIG)
+    _OBSERVED_DEGRADED_SECTIONS.add(f"{DEGRADED_WHOLE_CONFIG}{path.name}")
+
+
+def degraded_config_files(sections: frozenset[str]) -> list[str]:
+    """The config file names inside a ``degraded_sections`` set."""
+    return sorted(
+        s[len(DEGRADED_WHOLE_CONFIG) :]
+        for s in sections
+        if s.startswith(DEGRADED_WHOLE_CONFIG) and s != DEGRADED_WHOLE_CONFIG
+    )
+
+
+def _coerced_section(data: dict, key: str, degraded: set[str]) -> dict:
+    """Return ``data[key]`` as a dict, RECORDING the coercion when it is not one.
+
+    The loader must keep degrading — a malformed section cannot be allowed to
+    take the whole process down — but it must stop doing so SILENTLY. Every
+    section read goes through here so the "was this value real, or invented by
+    the parser" question has one answer for every consumer, instead of each
+    security gate growing its own shadow parser beside the loader (#4057).
+
+    An ABSENT section is not degraded: that is the genuine unconfigured state.
+    """
+    if key not in data:
+        return {}
+    value = data[key]
+    if isinstance(value, dict):
+        return value
+    degraded.add(key)
+    _OBSERVED_DEGRADED_SECTIONS.add(key)
+    logger.warning(
+        "config: '%s' section is not a JSON object (got %s) — using defaults; "
+        "any setting it carried is NOT in effect",
+        key,
+        type(value).__name__,
+    )
+    return {}
+
+
 def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> None:
     """Write a config dict to *path* atomically, PRESERVING its permissions.
 
@@ -871,10 +1014,12 @@ def update_config_locked(
 
     The locked primitive for the converted config.json writers and the required
     path for new config.json mutations.  Legacy writers that pre-date this
-    function (dashboard agents endpoint, updates.py, memory.py, security.py,
+    function (dashboard agents endpoint, updates.py, security.py,
     messaging.py, mcp.py, core.py STT) still use
     :func:`write_config_atomically` directly and rely on the in-process asyncio
-    ``_get_config_lock()`` only.
+    ``_get_config_lock()`` only.  ``memory.py`` was in that list and has been
+    converted; it now reaches this function through
+    ``dashboard/chat_utils.run_config_write``.
 
     Contract:
 
@@ -970,6 +1115,36 @@ def update_config_locked(
             return result
     finally:
         os.close(fd)
+
+
+# Keys already warned about in this process. The gateway loads config repeatedly
+# and a superseded default is per-install information, not per-load, so it is
+# said once; ``doctor`` is the surface that renders it again on demand.
+_REPORTED_SUPERSEDED_KEYS: set[str] = set()
+
+
+def _report_superseded_defaults(base_data: dict) -> None:
+    """Warn once per key when a stored base value still holds a superseded default.
+
+    *base_data* is the ``config.json`` document as read, BEFORE the
+    ``config.local.json`` overlay is merged over it. Reporting on the base is the
+    point: the overlay is a separate user-owned file whose value is the operator's
+    live choice, so it neither proves nor disproves what the base has materialized.
+
+    Reads only. This deliberately does NOT correct the value -- for a key that also
+    has a documented escape hatch, a stored old default and a deliberate opt-out
+    are the same bytes on disk, so a rewrite cannot correct one without overriding
+    the other. Telling the operator is the part that can be done without guessing.
+
+    Warned at most once per key per process. The gateway loads config repeatedly,
+    and a line the operator has already read is noise that trains them to ignore
+    the next one; the durable, re-readable rendering lives in ``doctor``.
+    """
+    for entry in superseded_default_drift(base_data):
+        if entry.dotted_key in _REPORTED_SUPERSEDED_KEYS:
+            continue
+        _REPORTED_SUPERSEDED_KEYS.add(entry.dotted_key)
+        logger.warning("Superseded default in stored config: %s", drift_summary(entry))
 
 
 def stamp_config_meta(data: dict) -> dict:
@@ -1306,6 +1481,21 @@ class AgentConfig:
             "(keys: 'background', 'subagent'). Empty for a role inherits the chat "
             "default (agent.reasoning_effort) and then the provider/model default. "
             "Only applies on reasoning-capable models.",
+        ),
+    )
+    fallback_model: str = field(
+        default="auto",
+        metadata=_meta(
+            "Fallback model",
+            "Model tried when the active model's transient-retry budget is "
+            "exhausted (throttle/capacity). Default 'auto' defers to the "
+            "backend's availability-aware routing; a concrete model id (as "
+            "advertised by the provider, e.g. 'claude-opus-4.8') is tried "
+            "first with 'auto' as the final fallthrough; empty ('') disables "
+            "fallback entirely (fail loudly, pre-feature behavior). A fallback "
+            "swap is announced in chat, sticks until the primary recovers, and "
+            "the serving model is recorded in every turn's stats — never "
+            "silent.",
         ),
     )
     reasoning_effort: str = field(
@@ -1655,6 +1845,21 @@ class AgentConfig:
             "and additionally to 60s below the turn ceiling at load time.",
         ),
     )
+    session_control: bool = field(
+        default=False,
+        metadata=_meta(
+            "Session Control",
+            "Let one chat session open a new session, and stop or read another "
+            "session of yours. No session writes into another session's "
+            "conversation: reading returns a transcript tail, stopping cancels an "
+            "in-flight turn, and a created session starts empty for you to type "
+            "into. Off by default: the three tools ride on a server you may "
+            "already have assigned for other work, so reaching another session "
+            "waits for you to grant it here rather than arriving with an upgrade. "
+            "Sessions can only reach peers in the same workspace; incognito, "
+            "app-scoped and scheduled sessions are never addressable.",
+        ),
+    )
     subagent_cost_gb: float = field(
         default=0.5,
         metadata=_meta(
@@ -1790,6 +1995,9 @@ class AgentConfig:
         # feeds coerced input.
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
+        # Same defensive coercion for the throttle-fallback model: normalize to
+        # ""/"auto"/acp id, so consumers can trust the stored shape.
+        self.fallback_model = coerce_fallback_model(self.fallback_model)
 
     def resolve_model(self, role: str) -> str:
         """Effective model id for a task ``role`` — INDEPENDENT of the chat model.
@@ -1838,7 +2046,7 @@ class SessionConfig:
         ),
     )
     pool_size: int = field(
-        default=0,
+        default=DEFAULT_POOL_SIZE,
         metadata=_meta(
             "Warm Pool Size",
             "Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables.",
@@ -2601,6 +2809,18 @@ class TailscaleConfig:
             "effect on the next gateway start.",
         ),
     )
+    keep_awake: bool = field(
+        default=True,
+        metadata=_meta(
+            "Keep Awake While Published",
+            "Keep this machine's SYSTEM awake while the dashboard is published "
+            "on the tailnet, so a phone does not lose the dashboard when the "
+            "laptop idles. The display is still allowed to sleep. Publishing is "
+            "the opt-in — this exists to opt back OUT of the awake half without "
+            "unpublishing. Independent of dashboard.prevent_sleep, which keeps "
+            "the host awake only while a turn is in flight.",
+        ),
+    )
 
 
 def _tailscale_config_from(raw: object) -> TailscaleConfig:
@@ -2644,6 +2864,7 @@ def _tailscale_config_from(raw: object) -> TailscaleConfig:
         trust_identity=trust_identity,
         allowed_logins=allowed_logins,
         pin_scope=pin_scope,
+        keep_awake=_safe_bool(data.get("keep_awake"), True),
     )
 
 
@@ -2695,6 +2916,22 @@ class DashboardConfig:
         metadata=_meta(
             "Restore Sessions",
             "Re-open recently active sessions on startup.",
+        ),
+    )
+    qr_session_until_restart: bool = field(
+        default=True,
+        metadata=_meta(
+            "Phone Sign-In Lasts Until Restart",
+            "Keep a phone signed in for as long as this gateway process runs. "
+            "The QR code still has to be scanned within its short window; after "
+            "that the phone is not signed out for being idle in ordinary use, "
+            "and a gateway restart signs it out. The one remaining idle limit is "
+            "the refresh credential's own 30-day lifetime, which each visit "
+            "renews, so a phone that goes untouched for 30 days re-scans. Turn "
+            "this OFF to go back to a timed session that expires on a clock "
+            "whether or not the gateway is still running. Either way `kirocrew "
+            "logout` ends the session immediately, and the session stays pinned "
+            "to the peer it was established from.",
         ),
     )
     restore_window_minutes: int = field(
@@ -2965,6 +3202,17 @@ class DashboardConfig:
             "Recent Session Tint Count",
             "Number of most-recently-active sessions to highlight in the sidebar with a "
             "graded accent stripe (0-10; 0 = off).",
+        ),
+    )
+    update_nudge: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Update Nudge",
+            "Per-version state for the proactive update popup. Written by the "
+            "dashboard when the user snoozes or skips a release; a record only "
+            "suppresses the popup for the version it names. Validated as one "
+            "atomic record by the PATCH allowlist (dashboard.update_nudge); "
+            "no Settings control reads it, so it carries no schema properties.",
         ),
     )
     onboarded: bool = field(
@@ -3394,6 +3642,18 @@ class SkillsConfig:
             "Additional directories to scan for skills. Supports ~ expansion. "
             "Skills from extra_paths are read-only (trigger matching + loading). "
             "Local ~/.kiro/crew/skills/ takes precedence for duplicate names.",
+        ),
+    )
+    project_skills_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Project Skills",
+            "Whether a chat session may load skills from its own project's "
+            "<project>/.kiro/skills directory. Enabled by default, but a project's "
+            "skills are still only loaded after the operator grants that specific "
+            "directory trust, because a SKILL.md enters the agent's context and can "
+            "instruct it to run anything. Set false to make project skills "
+            "impossible regardless of any grant already recorded.",
         ),
     )
 
@@ -3959,6 +4219,37 @@ def _clamp_security_bounds(data: dict) -> None:
             )
 
 
+def _fail_closed_project_skills_config(
+    data: dict, *, config_source_unreadable: bool = False
+) -> None:
+    """Preserve the project-skills off-switch's fail-closed semantics.
+
+    Optional JSON Schema validation removes invalid fields before dataclass
+    construction. Normalizing this security switch first keeps an invalid
+    value distinct from an absent value, whose documented default is enabled.
+    """
+    if config_source_unreadable:
+        skills = data.get("skills")
+        if not isinstance(skills, dict):
+            skills = {}
+            data["skills"] = skills
+        skills["project_skills_enabled"] = False
+        return
+
+    if "skills" not in data:
+        return
+
+    skills = data["skills"]
+    if not isinstance(skills, dict):
+        data["skills"] = {"project_skills_enabled": False}
+        return
+
+    if "project_skills_enabled" in skills and not isinstance(
+        skills["project_skills_enabled"], bool
+    ):
+        skills["project_skills_enabled"] = False
+
+
 def _config_fingerprint() -> tuple:
     """Cheap signature of the config files — changes whenever either is edited.
 
@@ -4190,6 +4481,48 @@ def _normalize_acp_backend(value: object) -> str:
 def _validate_activation(value: str) -> str:
     """Return *value* if it is a valid activation mode, else ``mention`` (deny-by-default)."""
     return value if value in _VALID_ACTIVATIONS else ACTIVATION_MENTION
+
+
+#: The activation modes a Telegram forum Topic can express. A subset of
+#: ``_VALID_ACTIVATIONS`` on purpose, and the subset is the point rather than an
+#: omission: ``observe`` needs a channel-history buffer only Slack populates, and
+#: feeding it would put non-owner prose into the prompt unfenced; ``review`` is a
+#: whole second rendering mode built on Slack Block Kit ephemerals, which Telegram
+#: has no equivalent for. Declaring either here would advertise a mode that
+#: silently behaves like a different one.
+TELEGRAM_ACTIVATIONS = frozenset({ACTIVATION_ALWAYS, ACTIVATION_MENTION, ACTIVATION_OFF})
+
+
+def _validate_telegram_activation(value: str) -> str:
+    """*value* if Telegram can express it, else ``mention``.
+
+    Degrades to the NARROWER mode, matching ``WeixinTransport.authorize``'s
+    treatment of an unrecognized ``dm_policy``: a malformed value must not resolve
+    to the most permissive reading of itself. ``always`` starts a turn for every
+    message in an allow-listed Topic, and a Topic is a SHARED space, so agent
+    output lands in front of everyone in it. Widening that because a value failed
+    to parse would make a typo grant participation the operator never asked for,
+    and it fails silently in the direction nobody audits.
+
+    ``mention`` rather than ``off`` because it is fail-safe without being
+    fail-dead: an explicit ``@handle`` is an unambiguous request, so the operator
+    can still reach the bot while it is refusing to answer unaddressed messages.
+
+    Reached ONLY for a value that was present and unparseable. An ABSENT key is
+    resolved to ``always`` by the caller before this runs, and that stays: taking
+    the documented default is not the same act as asking for something specific
+    and being misunderstood.
+    """
+    if value in TELEGRAM_ACTIVATIONS:
+        return value
+    logger.warning(
+        "telegram.forum_activation=%r is not one of %s; using %r (the narrower mode, "
+        "so an unreadable value cannot widen who the bot answers).",
+        value,
+        ", ".join(repr(a) for a in sorted(TELEGRAM_ACTIVATIONS)),
+        ACTIVATION_MENTION,
+    )
+    return ACTIVATION_MENTION
 
 
 def _validate_tracking_channels(raw: list) -> list[dict]:
@@ -5056,6 +5389,72 @@ class WeComConfig:
         )
 
 
+@dataclass
+class FeishuConfig:
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Enable the Feishu (Lark/飞书) channel. Requires FEISHU_APP_ID and "
+            "FEISHU_APP_SECRET environment variables to be set.",
+            tags=["feishu"],
+        ),
+    )
+    allowed_open_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Open IDs",
+            "Feishu open_ids allowed to DM the bot (deny-by-default: empty list "
+            "authorises nobody). Find your open_id via the Feishu developer console.",
+            tags=["feishu"],
+        ),
+    )
+    allow_group: bool = field(
+        default=False,
+        metadata=_meta(
+            "Allow Group Chat",
+            "Serve messages from group chats whose chat_id is in allowed_group_ids. "
+            "The bot must be @-mentioned in a group to receive the message.",
+            tags=["feishu"],
+        ),
+    )
+    allowed_group_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Group IDs",
+            "Feishu group chat_ids allowed to drive a turn (requires allow_group=true).",
+            tags=["feishu"],
+        ),
+    )
+    soft_threshold_pct: int = field(
+        default=80,
+        metadata=_meta(
+            "Soft Context Threshold %",
+            "When a conversation's context passes this, prompt the user to /compact "
+            "or /new instead of auto-compacting.",
+            tags=["feishu"],
+        ),
+    )
+    hard_threshold_pct: int = field(
+        default=95,
+        metadata=_meta(
+            "Hard Context Threshold %",
+            "Force a compaction when context reaches this so the window never overflows.",
+            tags=["feishu"],
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable -- _maybe_notice
+        # checks ``pct >= hard`` first. Mirrors WeComConfig. The helper's floor
+        # is 1, not 0, because a 0% threshold reads as "always over" and would
+        # compact every turn -- a hand-rolled max(0, ...) admits exactly that.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
+
+
 def _coerce_int_ids(raw: object) -> list[int]:
     """Coerce a config value to a clean ``list[int]``, dropping anything invalid.
 
@@ -5094,6 +5493,49 @@ def _coerce_opaque_str_ids(raw: object) -> list[str]:
         s = str(u).strip()
         if s and s not in out:
             out.append(s)
+    return out
+
+
+_WHATSAPP_GROUP_MODES = ("mention", "rules", "off")
+_WHATSAPP_GROUP_COOLDOWN_DEFAULT = 120
+
+
+def _coerce_whatsapp_groups(raw: object) -> list[dict]:
+    """Coerce the whatsapp ``groups`` config value to sanitized rule entries.
+
+    Each entry needs at least a non-empty ``jid``; everything else gets a safe
+    default. Unknown ``mode`` values fall back to ``mention`` (never to an
+    unprompted-speech mode), and cooldown is clamped to >= 0. Fails closed on
+    shape: a non-list yields ``[]``, malformed entries are dropped, duplicate
+    JIDs keep the first entry.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        jid = str(entry.get("jid", "")).strip()
+        if not jid or jid in seen:
+            continue
+        seen.add(jid)
+        mode = str(entry.get("mode", "mention")).strip().lower()
+        if mode not in _WHATSAPP_GROUP_MODES:
+            mode = "mention"
+        try:
+            cooldown = int(entry.get("cooldown_s", _WHATSAPP_GROUP_COOLDOWN_DEFAULT))
+        except (TypeError, ValueError):
+            cooldown = _WHATSAPP_GROUP_COOLDOWN_DEFAULT
+        out.append(
+            {
+                "jid": jid,
+                "name": str(entry.get("name", "")).strip(),
+                "mode": mode,
+                "rules": str(entry.get("rules", "")).strip(),
+                "cooldown_s": max(0, cooldown),
+            }
+        )
     return out
 
 
@@ -5376,6 +5818,17 @@ class TelegramConfig:
             tags=["telegram"],
         ),
     )
+    show_thinking: bool = field(
+        default=False,
+        metadata=_meta(
+            "Show Thinking",
+            "Post the model's reasoning after each answer as a collapsed, "
+            "expandable quote. Off by default: Telegram's rate limit is per chat "
+            "and shared with the streaming edits the answer already spends, so "
+            "reasoning costs an extra message per turn.",
+            tags=["telegram"],
+        ),
+    )
     allow_forum: bool = field(
         default=False,
         metadata=_meta(
@@ -5392,6 +5845,31 @@ class TelegramConfig:
             "Allowed Forum Chat IDs",
             "Numeric supergroup chat_ids permitted to run forum-topic sessions. "
             "Empty = deny all groups (fail closed).",
+            tags=["telegram"],
+        ),
+    )
+    voice_replies: bool = field(
+        default=False,
+        metadata=_meta(
+            "Voice Replies",
+            "Speak each answer as a voice/audio message in addition to the text, "
+            "using the global voice_reply provider settings. Off by default: it "
+            "costs a second message per turn against Telegram's per-chat rate "
+            "budget, and TTS may not be configured. Toggle per conversation with "
+            "/voice on|off; this is the default for a new conversation.",
+            tags=["telegram"],
+        ),
+    )
+    forum_activation: str = field(
+        default=ACTIVATION_ALWAYS,
+        metadata=_meta(
+            "Forum Activation",
+            "When the bot answers inside an allow-listed forum Topic: 'always' "
+            "(every message), 'mention' (only when its @handle is used or one of "
+            "its own messages is replied to), or 'off' (never). Slack's channel "
+            "equivalent defaults to 'mention'; this defaults to 'always' so an "
+            "existing forum keeps working after an upgrade instead of going quiet. "
+            "Does not apply to a 1:1 DM, which is always served.",
             tags=["telegram"],
         ),
     )
@@ -5533,6 +6011,116 @@ class WeixinConfig:
 
 
 @dataclass
+class WhatsAppConfig:
+    """WhatsApp channel via a QR-linked personal account (WhatsApp Web protocol).
+
+    Pairs as a linked device on the operator's own WhatsApp account — there is
+    no bot token. Pairing state lives in a local session database under the
+    data home (``whatsapp/session.db``), created by the Settings > Channels QR
+    flow. Requires the optional ``whatsapp`` dependency extra
+    (``pip install 'kirocrew[whatsapp]'``).
+
+    Uses the unofficial WhatsApp Web protocol; automation on a personal
+    account is against WhatsApp's Terms of Service and carries a small risk
+    of the linked number being banned. Keep volumes personal-scale.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Enable the WhatsApp channel (QR-linked personal account over the "
+            "WhatsApp Web protocol). Pair a device from Settings > Channels; "
+            "needs the 'whatsapp' dependency extra installed.",
+            tags=["whatsapp"],
+        ),
+    )
+    dm_policy: str = field(
+        default="self",
+        metadata=_meta(
+            "DM Policy",
+            "Who may command the agent in direct chats: 'self' (only the linked "
+            "account itself — your own messages, the default), 'allowlist' "
+            "(yourself plus allowed_wa_ids), 'open' (any sender), or 'disabled'. "
+            "Unknown values deny everyone (fail closed).",
+            tags=["whatsapp"],
+        ),
+    )
+    allowed_wa_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed WhatsApp IDs",
+            "Phone numbers (digits only, country code, no '+') additionally "
+            "permitted to DM the agent when dm_policy='allowlist'. Empty adds "
+            "nobody beyond the linked account.",
+            tags=["whatsapp"],
+        ),
+    )
+    groups: list[dict] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Group Rules",
+            "Per-group participation rules. Each entry: {'jid': group JID "
+            "(…@g.us), 'name': display label, 'mode': 'mention' (reply only "
+            "when @-mentioned or quoted, the default) | 'rules' (also speak "
+            "unprompted when the entry's rules say the agent can genuinely "
+            "help) | 'off', 'rules': free-text guidance for when to speak, "
+            "'cooldown_s': minimum seconds between unprompted replies "
+            "(default 120)}. Groups not listed are ignored entirely.",
+            tags=["whatsapp"],
+        ),
+    )
+    db_path: str = field(
+        default="",
+        metadata=_meta(
+            "Session DB Path",
+            "Read-only. The pairing session database always lives at "
+            "<data home>/whatsapp/session.db, because that path is what the "
+            "sensitive-path protection matches: it holds the linked-device keys, "
+            "and moving it elsewhere would take the credential out from behind "
+            "the one control that stops an agent reading it.",
+            tags=["whatsapp"],
+        ),
+    )
+    soft_threshold_pct: int = field(
+        default=80,
+        metadata=_meta(
+            "Soft Context Threshold %",
+            "Prompt the user to /compact or /new when context passes this percentage.",
+            tags=["whatsapp"],
+        ),
+    )
+    hard_threshold_pct: int = field(
+        default=95,
+        metadata=_meta(
+            "Hard Context Threshold %",
+            "Force a compaction when context passes this percentage.",
+            tags=["whatsapp"],
+        ),
+    )
+    session_folder: str = field(
+        default="",
+        metadata=_meta(
+            "Session Folder",
+            "Optional sidebar folder for sessions that start on this channel. "
+            "Empty (the default) leaves them unfiled; any other value is the "
+            "folder name, created when these settings are saved and marked with "
+            "the channel's brand mark. A configured folder that no longer exists "
+            "leaves conversations unfiled until the next save recreates it.",
+            tags=["whatsapp"],
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable -- _maybe_notice
+        # checks ``pct >= hard`` first. Mirrors WeixinConfig.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
+
+
+@dataclass
 class DiscordConfig:
     enabled: bool = field(
         default=False,
@@ -5568,7 +6156,8 @@ class DiscordConfig:
         metadata=_meta(
             "Allowed Thread IDs",
             "Discord server thread IDs where approved users may run the agent. "
-            "Empty = DMs only. Normal server channels are always denied.",
+            "Empty = DMs only. A server channel is denied unless it is listed in "
+            "allowed_channel_ids, and a turn there still runs in a thread.",
             tags=["discord"],
         ),
     )
@@ -5593,6 +6182,23 @@ class DiscordConfig:
         metadata=_meta(
             "Soft Context Threshold %",
             "Prompt the user to !compact or !new when context passes this percentage.",
+            tags=["discord"],
+        ),
+    )
+    reactions_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Reactions Enabled",
+            "Show phase-aware emoji reactions on Discord messages during processing.",
+            tags=["discord"],
+        ),
+    )
+    show_thinking: bool = field(
+        default=False,
+        metadata=_meta(
+            "Show Thinking",
+            "Post the model's thinking/reasoning as a subtext note in Discord. "
+            "Off by default to keep responses concise.",
             tags=["discord"],
         ),
     )
@@ -5642,6 +6248,52 @@ class WebexConfig:
             "Allowed Emails",
             "Webex account emails permitted to DM the bot. Empty = deny all "
             "(fail closed): anyone in the org can message a Webex bot.",
+            tags=["webex"],
+        ),
+    )
+    allow_group_rooms: bool = field(
+        default=False,
+        metadata=_meta(
+            "Allow Group Spaces",
+            "Answer in group spaces as well as direct messages. Off by default: a "
+            "reply in a space is visible to every member, including people who are "
+            "not on the allow-list, so tool output would leave the DM. A Webex bot "
+            "only ever sees messages that @mention it in a space.",
+            tags=["webex"],
+        ),
+    )
+    allowed_room_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Room IDs",
+            "Webex space IDs the bot may answer in when group spaces are enabled. "
+            "Empty = deny all (fail closed), so turning the switch on alone grants "
+            "nothing; the sender must ALSO be on the email allow-list.",
+            tags=["webex"],
+        ),
+    )
+    reply_in_thread: bool = field(
+        default=True,
+        metadata=_meta(
+            "Reply in Thread",
+            "Reply under the message's own thread when it has one, keeping a space "
+            "readable. Webex threads are flat, so a reply always attaches to the "
+            "thread root.",
+            tags=["webex"],
+        ),
+    )
+    wdm_base: str = field(
+        default="",
+        metadata=_meta(
+            "Device Manager Base URL",
+            "Override the Webex Device Manager host used for the inbound "
+            "WebSocket. Empty (the default) discovers the org's own regional host "
+            "per token, which is what a non-US-resident org needs; set this only "
+            "to pin a REGIONAL WEBEX host for a network that reaches it but not "
+            "the service catalog. Must be an https Webex host (*.wbx2.com, "
+            "*.webex.com, *.ciscospark.com) — the bot token rides device "
+            "registration, so anything else is refused and discovery is used "
+            "instead. An outbound proxy belongs in HTTPS_PROXY, not here.",
             tags=["webex"],
         ),
     )
@@ -5984,6 +6636,22 @@ class KiroCrewConfig:
             "WeChat", "Weixin (iLink personal WeChat) integration settings.", tags=["weixin"]
         ),
     )
+    whatsapp: WhatsAppConfig = field(
+        default_factory=WhatsAppConfig,
+        metadata=_meta(
+            "WhatsApp",
+            "WhatsApp (QR-linked personal account) integration settings.",
+            tags=["whatsapp"],
+        ),
+    )
+    feishu: FeishuConfig = field(
+        default_factory=FeishuConfig,
+        metadata=_meta(
+            "Feishu",
+            "Feishu (Lark/飞书) channel configuration.",
+            tags=["feishu"],
+        ),
+    )
     discord: DiscordConfig = field(
         default_factory=DiscordConfig,
         metadata=_meta("Discord", "Discord bot integration settings.", tags=["discord"]),
@@ -6060,6 +6728,38 @@ class KiroCrewConfig:
         default=True,
         metadata=_meta("Auto Update", "Enable automatic update checks."),
     )
+    #: Top-level sections that were PRESENT on disk but not a JSON object, and
+    #: were therefore coerced to defaults by :meth:`load`.
+    #:
+    #: The loader's whole contract is to degrade rather than raise, which is
+    #: right for an ordinary consumer and dangerous for one reading a SECURITY
+    #: value out of a section: a coerced-away section is indistinguishable from
+    #: "the operator configured nothing", so a narrowing silently becomes
+    #: allow-all (#4057, and the same shape as #3945).
+    #:
+    #: A consumer cannot recover this by re-reading the file, which is why the
+    #: signal has to live here: ``load()`` runs a migration that REWRITES
+    #: ``config.json`` in normalized form, so by the time any gate looks, the
+    #: malformed section is gone from disk. The evidence only exists during the
+    #: parse that discarded it.
+    #:
+    #: Excluded from serialization (``repr=False``, and the config writers work
+    #: from explicit field lists) — it describes THIS read, not the operator's
+    #: settings, and must never be written back into their config. The leading
+    #: underscore keeps it out of the config schema/baseline machinery, which
+    #: skips private fields (same convention as ``_extra_sections``); consumers
+    #: read the :attr:`degraded_sections` property.
+    _degraded_sections: frozenset[str] = field(
+        default_factory=frozenset,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def degraded_sections(self) -> frozenset[str]:
+        """Sections this load discarded (see ``_degraded_sections``)."""
+        return self._degraded_sections
+
     timezone: str = field(
         default="",
         metadata=_meta(
@@ -6167,6 +6867,7 @@ class KiroCrewConfig:
             pre_read_fp = _config_fingerprint()
             data = {}
             loaded_base = False
+            config_source_unreadable = False
             if path.exists():
                 try:
                     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -6174,9 +6875,23 @@ class KiroCrewConfig:
                         data = raw
                         loaded_base = True
                     else:
+                        config_source_unreadable = True
                         logger.warning("Config is not a JSON object, using defaults")
+                        _mark_file_degraded(path)
                 except (json.JSONDecodeError, OSError) as e:
+                    config_source_unreadable = True
                     logger.warning("Failed to load config from %s: %s", path, e)
+                    _mark_file_degraded(path)
+
+            # Report -- never correct -- a stored BASE value that still holds a
+            # superseded default (issue #5244), before the overlay merge below:
+            # the overlay is the operator's live choice and says nothing about
+            # what the base materialized. Read-only by design; a key with a
+            # documented escape hatch cannot be corrected automatically, because
+            # a stale default and a deliberate opt-out are the same bytes.
+            # Skipped when no base file loaded -- nothing is stored to report on.
+            if loaded_base:
+                _report_superseded_defaults(data)
 
             # Deep-merge config.local.json overlay (user-owned, never touched by setup)
             local_data: dict = {}
@@ -6195,12 +6910,24 @@ class KiroCrewConfig:
                     if isinstance(raw_local, dict):
                         local_data = raw_local
                     else:
+                        config_source_unreadable = True
                         logger.warning("config.local.json is not a JSON object, ignoring")
+                        _mark_file_degraded(local_path)
                 except (json.JSONDecodeError, OSError) as e:
+                    config_source_unreadable = True
                     logger.warning("Failed to load config.local.json: %s", e)
+                    _mark_file_degraded(local_path)
 
             if local_data:
                 data = _deep_merge(data, local_data)
+
+            # A present source that cannot be read or parsed may contain the
+            # operator's hard-off switch. Preserve that unknown as disabled
+            # before either the defaults return or schema normalization can
+            # turn it into the enabled-by-default missing-field case.
+            _fail_closed_project_skills_config(
+                data, config_source_unreadable=config_source_unreadable
+            )
 
             # Return defaults only if neither file was successfully loaded. Seed
             # the default "kirocrew" agent in-memory (matching the on-disk
@@ -6210,7 +6937,15 @@ class KiroCrewConfig:
             # file to invalidate against, and the path is already cheap
             # (existence checks only, no read/parse/validate).
             if not loaded_base and not local_data:
-                cfg = cls()
+                # An UNREADABLE file reaches this same "no config" branch as a
+                # genuinely absent one, and the two are opposite claims for a
+                # security gate: "the operator configured nothing" versus "we
+                # could not read what they configured". Carry the observation
+                # through so the caller can tell them apart (#4057).
+                cfg = cls(_degraded_sections=frozenset(_OBSERVED_DEGRADED_SECTIONS))
+                cfg.skills.project_skills_enabled = (
+                    data.get("skills", {}).get("project_skills_enabled", True) is True
+                )
                 kiro = cfg.agent.default_agent or "kirocrew"
                 cfg.agents["default"] = KiroCrewAgentConfig(
                     kiro_agent=kiro,
@@ -6220,6 +6955,8 @@ class KiroCrewConfig:
                 cfg.default_agent = "default"
                 return cfg
 
+            # Preserve fail-closed security semantics before advisory schema
+            # validation can replace malformed input with a missing-field default.
             # Validate against JSON Schema (advisory — never fatal)
             _validate_config_data(data)
             # Clamp security-relevant resource-limit knobs to their API ceilings
@@ -6231,104 +6968,89 @@ class KiroCrewConfig:
             # a mid-read write self-heals (next load misses and re-reads).
             _store_validated_data(data, pre_read_fp)
 
-        agent_data = data.get("agent", {})
-        if not isinstance(agent_data, dict):
-            agent_data = {}
-        session_data = data.get("session", {})
-        if not isinstance(session_data, dict):
-            session_data = {}
-        taskrunner_data = data.get("taskrunner", {})
-        if not isinstance(taskrunner_data, dict):
-            taskrunner_data = {}
-        cron_history_data = data.get("cron_history", {})
-        if not isinstance(cron_history_data, dict):
-            cron_history_data = {}
-        memory_data = data.get("memory", {})
-        if not isinstance(memory_data, dict):
-            memory_data = {}
-        knowledge_data = data.get("knowledge", {})
-        if not isinstance(knowledge_data, dict):
-            knowledge_data = {}
-        telegram_data = data.get("telegram", {})
-        if not isinstance(telegram_data, dict):
-            telegram_data = {}
-        weixin_data = data.get("weixin", {})
-        if not isinstance(weixin_data, dict):
-            weixin_data = {}
-        discord_data = data.get("discord", {})
-        if not isinstance(discord_data, dict):
-            discord_data = {}
-        webex_data = data.get("webex", {})
-        if not isinstance(webex_data, dict):
-            webex_data = {}
-        teams_data = data.get("teams", {})
-        if not isinstance(teams_data, dict):
-            teams_data = {}
-        imessage_data = data.get("imessage", {})
-        if not isinstance(imessage_data, dict):
-            imessage_data = {}
-        slack_data = data.get("slack", {})
-        if not isinstance(slack_data, dict):
-            slack_data = {}
-        publish_data = data.get("publish", {})
-        if not isinstance(publish_data, dict):
-            publish_data = {}
+        # Collected during the parse that discards them — the only moment the
+        # evidence exists, since the migration below rewrites config.json in
+        # normalized form (see KiroCrewConfig.degraded_sections).
+        _degraded: set[str] = set()
+        agent_data = _coerced_section(data, "agent", _degraded)
+        session_data = _coerced_section(data, "session", _degraded)
+        taskrunner_data = _coerced_section(data, "taskrunner", _degraded)
+        cron_history_data = _coerced_section(data, "cron_history", _degraded)
+        memory_data = _coerced_section(data, "memory", _degraded)
+        knowledge_data = _coerced_section(data, "knowledge", _degraded)
+        telegram_data = _coerced_section(data, "telegram", _degraded)
+        weixin_data = _coerced_section(data, "weixin", _degraded)
+        whatsapp_data = _coerced_section(data, "whatsapp", _degraded)
+        feishu_data = _coerced_section(data, "feishu", _degraded)
+        discord_data = _coerced_section(data, "discord", _degraded)
+        webex_data = _coerced_section(data, "webex", _degraded)
+        teams_data = _coerced_section(data, "teams", _degraded)
+        imessage_data = _coerced_section(data, "imessage", _degraded)
+        slack_data = _coerced_section(data, "slack", _degraded)
+        publish_data = _coerced_section(data, "publish", _degraded)
+        # A malformed allowed_destinations is the same class as a malformed
+        # section one level down (#4057), in two shapes. A non-LIST value:
+        # iterating it either crashes load() with a TypeError (a scalar — a
+        # config typo must not abort gateway startup) or yields garbage (a
+        # dict iterates as its keys, a string as its characters). A list with
+        # non-string/empty ENTRIES: the parse filter drops them, so an
+        # all-invalid narrowing like [1, 2] parses to [] — indistinguishable
+        # from "no restriction configured", the exact silent widening this fix
+        # exists to stop. Both shapes record the degradation so the publish
+        # gate denies, and parse from what safely remains. Validation cannot
+        # repair these values (publish.allowed_destinations is fail-closed
+        # there — repairing an OPEN default silently widens), so the loader
+        # must be the layer that survives them.
+        _dests_raw = publish_data.get("allowed_destinations", [])
+        if not isinstance(_dests_raw, list):
+            _degraded.add("publish")
+            _OBSERVED_DEGRADED_SECTIONS.add("publish")
+            logger.warning(
+                "config: 'publish.allowed_destinations' is not a list (got %s) "
+                "— treating the publish section as degraded; publishing is "
+                "denied until the file is fixed and the gateway restarted",
+                type(_dests_raw).__name__,
+            )
+            _dests_raw = []
+        elif any(not (isinstance(_d, str) and _d) for _d in _dests_raw):
+            _degraded.add("publish")
+            _OBSERVED_DEGRADED_SECTIONS.add("publish")
+            logger.warning(
+                "config: 'publish.allowed_destinations' carries entr(y/ies) "
+                "that are not non-empty strings — treating the publish section "
+                "as degraded; publishing is denied until the file is fixed and "
+                "the gateway restarted",
+            )
+            _dests_raw = []
         # Back-compat: this channel's config section was renamed
         # "wechat" -> "wecom". Fall back to the legacy key so existing
         # installs keep their WeCom settings on upgrade (read-only alias;
         # no broader migration machinery).
-        wecom_data = data.get("wecom", data.get("wechat", {}))
-        if not isinstance(wecom_data, dict):
-            wecom_data = {}
-        dashboard_data = data.get("dashboard", {})
-        if not isinstance(dashboard_data, dict):
-            dashboard_data = {}
-        stt_data = data.get("stt", {})
-        if not isinstance(stt_data, dict):
-            stt_data = {}
-        computer_use_data = data.get("computer_use", {})
-        if not isinstance(computer_use_data, dict):
-            computer_use_data = {}
-        instances_data = data.get("instances", {})
-        if not isinstance(instances_data, dict):
-            instances_data = {}
+        # Alias-aware: record under whichever key the operator actually used, so
+        # the warning names the section they can go and fix.
+        _wecom_key = "wecom" if "wecom" in data else "wechat"
+        wecom_data = _coerced_section(data, _wecom_key, _degraded)
+        dashboard_data = _coerced_section(data, "dashboard", _degraded)
+        stt_data = _coerced_section(data, "stt", _degraded)
+        computer_use_data = _coerced_section(data, "computer_use", _degraded)
+        instances_data = _coerced_section(data, "instances", _degraded)
         connect_timeout_raw = instances_data.get("connect_timeout_secs")
         mint_timeout_raw = instances_data.get("mint_timeout_secs")
-        mcp_gateway_data = data.get("mcp_gateway", {})
-        if not isinstance(mcp_gateway_data, dict):
-            mcp_gateway_data = {}
-        mcp_data = data.get("mcp", {})
-        if not isinstance(mcp_data, dict):
-            mcp_data = {}
-        heartbeat_data = data.get("heartbeat", {})
-        if not isinstance(heartbeat_data, dict):
-            heartbeat_data = {}
+        mcp_gateway_data = _coerced_section(data, "mcp_gateway", _degraded)
+        mcp_data = _coerced_section(data, "mcp", _degraded)
+        heartbeat_data = _coerced_section(data, "heartbeat", _degraded)
         heartbeat_default_deliver = (
             str(heartbeat_data.get("default_deliver", "slack")).strip().lower()
         )
         if heartbeat_default_deliver not in ("slack", "dashboard"):
             heartbeat_default_deliver = "slack"
-        tunnel_data = data.get("tunnel", {})
-        if not isinstance(tunnel_data, dict):
-            tunnel_data = {}
-        skills_data = data.get("skills", {})
-        if not isinstance(skills_data, dict):
-            skills_data = {}
-        session_summary_data = data.get("session_summary", {})
-        if not isinstance(session_summary_data, dict):
-            session_summary_data = {}
-        messaging_data = data.get("messaging", {})
-        if not isinstance(messaging_data, dict):
-            messaging_data = {}
-        telemetry_data = data.get("telemetry", {})
-        if not isinstance(telemetry_data, dict):
-            telemetry_data = {}
-        orchestrator_data = data.get("orchestrator", {})
-        if not isinstance(orchestrator_data, dict):
-            orchestrator_data = {}
-        watchdog_data = data.get("watchdog", {})
-        if not isinstance(watchdog_data, dict):
-            watchdog_data = {}
+        tunnel_data = _coerced_section(data, "tunnel", _degraded)
+        skills_data = _coerced_section(data, "skills", _degraded)
+        session_summary_data = _coerced_section(data, "session_summary", _degraded)
+        messaging_data = _coerced_section(data, "messaging", _degraded)
+        telemetry_data = _coerced_section(data, "telemetry", _degraded)
+        orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
+        watchdog_data = _coerced_section(data, "watchdog", _degraded)
 
         # Parse agents section into dict[str, KiroCrewAgentConfig]
         raw_agents = data.get("agents", {})
@@ -6412,6 +7134,7 @@ class KiroCrewConfig:
                 model=agent_data.get("model", DEFAULT_MODEL),
                 role_models=coerce_role_models(agent_data.get("role_models")),
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
+                fallback_model=coerce_fallback_model(agent_data.get("fallback_model", "auto")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
@@ -6471,6 +7194,14 @@ class KiroCrewConfig:
                     TOOL_APPROVAL_TIMEOUT_MIN,
                     TOOL_APPROVAL_TIMEOUT_MAX,
                 ),
+                # Absent means OFF, and a malformed value falls to False too. This
+                # switch grants one session reach into another, and the three tools
+                # ride on the `kirocrew-dashboard` server an operator may already
+                # have assigned for folder work -- so an upgrade must not hand an
+                # existing assignment stop-and-read over peer sessions that nobody
+                # granted. Both directions fail closed: `{"session_control":
+                # "false"}` is a truthy string and must not load as enabled either.
+                session_control=_safe_bool(agent_data.get("session_control", False), False),
                 subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
                 subagent_cpu_cost_cores=_safe_float(
                     agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0
@@ -6532,7 +7263,12 @@ class KiroCrewConfig:
                     lo=AUTOCOMPACT_PCT_MIN,
                     hi=AUTOCOMPACT_PCT_MAX,
                 ),
-                pool_size=_safe_int(session_data.get("pool_size", 2), 2, 0, POOL_SIZE_MAX),
+                pool_size=_safe_int(
+                    session_data.get("pool_size", DEFAULT_POOL_SIZE),
+                    DEFAULT_POOL_SIZE,
+                    0,
+                    POOL_SIZE_MAX,
+                ),
                 pool_agent=str(session_data.get("pool_agent", "")),
                 pool_ttl_secs=_safe_int(session_data.get("pool_ttl_secs", 1800), 1800),
                 eager_spawn=bool(session_data.get("eager_spawn", True)),
@@ -6694,7 +7430,12 @@ class KiroCrewConfig:
                 bot_token=str(telegram_data.get("bot_token", "")),
                 allowed_user_ids=_coerce_int_ids(telegram_data.get("allowed_user_ids")),
                 soft_threshold_pct=_threshold_pct(telegram_data.get("soft_threshold_pct"), 80),
+                show_thinking=bool(telegram_data.get("show_thinking", False)),
                 allow_forum=bool(telegram_data.get("allow_forum", False)),
+                voice_replies=bool(telegram_data.get("voice_replies", False)),
+                forum_activation=_validate_telegram_activation(
+                    str(telegram_data.get("forum_activation", "") or ACTIVATION_ALWAYS)
+                ),
                 allowed_forum_chat_ids=_coerce_int_ids(telegram_data.get("allowed_forum_chat_ids")),
                 accounts=_parse_telegram_accounts(telegram_data.get("accounts")),
             ),
@@ -6709,6 +7450,16 @@ class KiroCrewConfig:
                 soft_threshold_pct=_threshold_pct(weixin_data.get("soft_threshold_pct"), 80),
                 hard_threshold_pct=_threshold_pct(weixin_data.get("hard_threshold_pct"), 95),
             ),
+            whatsapp=WhatsAppConfig(
+                session_folder=_coerce_session_folder(whatsapp_data.get("session_folder")),
+                enabled=bool(whatsapp_data.get("enabled", False)),
+                dm_policy=str(whatsapp_data.get("dm_policy", "self") or "self"),
+                allowed_wa_ids=_coerce_str_ids(whatsapp_data.get("allowed_wa_ids")),
+                groups=_coerce_whatsapp_groups(whatsapp_data.get("groups")),
+                db_path=str(whatsapp_data.get("db_path", "")),
+                soft_threshold_pct=_threshold_pct(whatsapp_data.get("soft_threshold_pct"), 80),
+                hard_threshold_pct=_threshold_pct(whatsapp_data.get("hard_threshold_pct"), 95),
+            ),
             discord=DiscordConfig(
                 session_folder=_coerce_session_folder(discord_data.get("session_folder")),
                 enabled=bool(discord_data.get("enabled", False)),
@@ -6721,6 +7472,8 @@ class KiroCrewConfig:
                 allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
                 auto_thread=bool(discord_data.get("auto_thread", True)),
                 soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),
+                reactions_enabled=bool(discord_data.get("reactions_enabled", True)),
+                show_thinking=bool(discord_data.get("show_thinking", False)),
             ),
             webex=WebexConfig(
                 session_folder=_coerce_session_folder(webex_data.get("session_folder")),
@@ -6731,6 +7484,20 @@ class KiroCrewConfig:
                     if isinstance(webex_data.get("allowed_emails", []), list)
                     else []
                 ),
+                # Group spaces are a SECURITY decision, so the read is as explicit
+                # as the write: a field the loader forgets is not merely lost, it
+                # silently reverts to the safe default on the next restart while
+                # the settings panel keeps showing the saved value it read from
+                # config.json — the operator sees an enabled space allow-list and
+                # the gateway answers nobody.
+                allow_group_rooms=bool(webex_data.get("allow_group_rooms", False)),
+                allowed_room_ids=[
+                    r
+                    for r in _safe_list(webex_data.get("allowed_room_ids"))
+                    if isinstance(r, str) and r
+                ],
+                reply_in_thread=bool(webex_data.get("reply_in_thread", True)),
+                wdm_base=str(webex_data.get("wdm_base", "") or ""),
                 soft_threshold_pct=_threshold_pct(webex_data.get("soft_threshold_pct"), 80),
                 hard_threshold_pct=_threshold_pct(webex_data.get("hard_threshold_pct"), 95),
             ),
@@ -6802,11 +7569,7 @@ class KiroCrewConfig:
                 ),
             ),
             publish=PublishConfig(
-                allowed_destinations=[
-                    d
-                    for d in publish_data.get("allowed_destinations", [])
-                    if isinstance(d, str) and d
-                ],
+                allowed_destinations=[d for d in _dests_raw if isinstance(d, str) and d],
                 relocate_roots=[
                     r
                     for r in publish_data.get("relocate_roots", [])
@@ -6815,21 +7578,40 @@ class KiroCrewConfig:
             ),
             wecom=WeComConfig(
                 session_folder=_coerce_session_folder(wecom_data.get("session_folder")),
-                enabled=bool(wecom_data.get("enabled", False)),
+                # _safe_bool, not bool(): `bool("false")` is True, so a JSON string
+                # would read the operator's "off" as "on" -- enabling a channel,
+                # or opening it to every org member, from a config value that says the
+                # opposite. A non-bool must read as the default, not as truthy.
+                enabled=_safe_bool(wecom_data.get("enabled"), False),
                 allowed_users=[
                     u
-                    for u in wecom_data.get("allowed_users", [])
+                    for u in _safe_list(wecom_data.get("allowed_users"))
                     if isinstance(u, dict) and u.get("userid")
                 ],
-                allow_all_users=bool(wecom_data.get("allow_all_users", False)),
+                allow_all_users=_safe_bool(wecom_data.get("allow_all_users"), False),
                 ws_url=str(wecom_data.get("ws_url", "wss://openws.work.weixin.qq.com")),
                 soft_threshold_pct=_threshold_pct(wecom_data.get("soft_threshold_pct"), 80),
                 hard_threshold_pct=_threshold_pct(wecom_data.get("hard_threshold_pct"), 95),
+            ),
+            feishu=FeishuConfig(
+                enabled=_safe_bool(feishu_data.get("enabled"), False),
+                allowed_open_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_open_ids")),
+                # Shape-safe coercion rather than bool() / a raw comprehension:
+                # the schema type check already substitutes the default for a
+                # wrong-typed value, and these helpers keep the guarantee local
+                # to the parse (and dedupe + strip the opaque ou_/oc_ ids).
+                allow_group=_safe_bool(feishu_data.get("allow_group"), False),
+                allowed_group_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_group_ids")),
+                soft_threshold_pct=_safe_int(feishu_data.get("soft_threshold_pct", 80), 80),
+                hard_threshold_pct=_safe_int(feishu_data.get("hard_threshold_pct", 95), 95),
             ),
             dashboard=DashboardConfig(
                 url=dashboard_data.get("url", ""),
                 tailscale=_tailscale_config_from(dashboard_data.get("tailscale")),
                 restore_sessions=dashboard_data.get("restore_sessions", False),
+                qr_session_until_restart=_safe_bool(
+                    dashboard_data.get("qr_session_until_restart"), True
+                ),
                 restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
                 surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
                 bot_name=dashboard_data.get("bot_name", ""),
@@ -6866,6 +7648,11 @@ class KiroCrewConfig:
                 theme_color=dashboard_data.get("theme_color", ""),
                 language=str(dashboard_data.get("language", "")),
                 recent_tint_count=_safe_int(dashboard_data.get("recent_tint_count", 0), 0),
+                update_nudge=(
+                    dashboard_data.get("update_nudge", {})
+                    if isinstance(dashboard_data.get("update_nudge"), dict)
+                    else {}
+                ),
                 onboarded=bool(dashboard_data.get("onboarded", False)),
                 import_onboarded=_safe_bool(
                     dashboard_data.get("import_onboarded"),
@@ -7009,6 +7796,7 @@ class KiroCrewConfig:
                 cursor_motion=_safe_bool(computer_use_data.get("cursor_motion", False), False),
             ),
             auto_update=data.get("auto_update", True),
+            _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
             timezone=data.get("timezone", ""),
             snapshot_dir=data.get("snapshot_dir", ""),
             registries=[
@@ -7171,6 +7959,9 @@ class KiroCrewConfig:
                 extra_paths=[
                     p for p in _safe_list(skills_data.get("extra_paths")) if isinstance(p, str)
                 ],
+                # Security off-switch: malformed values must not become truthy
+                # through Python coercion (for example, the string "false").
+                project_skills_enabled=(skills_data.get("project_skills_enabled", True) is True),
             ),
             session_summary=SessionSummaryConfig(
                 enabled=bool(session_summary_data.get("enabled", False)),
@@ -7236,9 +8027,25 @@ class KiroCrewConfig:
                     cfg.default_agent = "default"
                 needs_migration = True
 
-            if needs_migration:
+            if needs_migration and not cfg._degraded_sections:
                 _write_migration_backup(path)
                 cfg.save()
+            elif needs_migration:
+                # This load DISCARDED something (a malformed section, an
+                # unreadable file). cfg.save() serializes only the parsed
+                # fields, so writing back here would replace the operator's
+                # malformed narrowing with clean defaults — erasing the only
+                # on-disk evidence and turning the denial into silent
+                # allow-all at the next restart (#4057). Keep the malformed
+                # bytes; every future process re-observes and re-denies until
+                # the operator actually fixes the file. Migration re-runs on
+                # the first clean load.
+                logger.warning(
+                    "config: skipping write-back migration — this load "
+                    "degraded section(s) %s and writing back would erase the "
+                    "evidence; fix the file to clear",
+                    sorted(cfg._degraded_sections),
+                )
         except Exception as e:
             # Migration write-back is best-effort; never block startup.
             logger.warning("Config write-back failed: %s", e)
@@ -7260,6 +8067,8 @@ class KiroCrewConfig:
             "webex": asdict(self.webex),
             "wecom": asdict(self.wecom),
             "weixin": asdict(self.weixin),
+            "whatsapp": asdict(self.whatsapp),
+            "feishu": asdict(self.feishu),
             "teams": asdict(self.teams),
             "imessage": asdict(self.imessage),
             "dashboard": asdict(self.dashboard),
@@ -7348,23 +8157,29 @@ class KiroCrewConfig:
 
     @staticmethod
     def _resolve_agent_model() -> str:
-        """Read model from installed agent config, falling back to bundled defaults."""
-        # Installed agent config (generated by kirocrew setup)
+        """Read model from installed agent config, falling back to bundled defaults.
+
+        The installed spec is read through
+        ``agent_discovery._read_agent_spec`` — the one hardened reader for
+        agent configs — not a bare ``read_text``: the agents directory is
+        user-writable and shared with other tools, so an oversized file must
+        be refused at the read cap instead of slurped onto whatever surface
+        asked for its effective model, and a symlink resolving into a
+        sensitive path must not donate its target's JSON here.
+        """
         agent_json = kiro_agents_dir() / "kirocrew.json"
         if agent_json.is_file():
-            try:
-                data = json.loads(agent_json.read_text(encoding="utf-8"))
+            data = _read_hardened_agent_spec(agent_json)
+            if data:
                 model = data.get("model", "")
                 if model:
                     return model
-            except (json.JSONDecodeError, OSError):
-                pass
         # Bundled defaults.json
         bundled = config_package_dir() / "defaults.json"
         if bundled.is_file():
             try:
-                data = json.loads(bundled.read_text(encoding="utf-8"))
-                model = data.get("model", "")
+                bundled_data = json.loads(bundled.read_text(encoding="utf-8"))
+                model = bundled_data.get("model", "")
                 if model:
                     return model
             except (json.JSONDecodeError, OSError):
@@ -7386,9 +8201,8 @@ class KiroCrewConfig:
             return ""
         base = agents_dir if agents_dir is not None else kiro_agents_dir()
         for af in base.glob("*.json"):
-            try:
-                ad = json.loads(af.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
+            ad = _read_hardened_agent_spec(af)
+            if ad is None:
                 continue
             # Skip stray non-object JSON a user may have dropped in the dir.
             if isinstance(ad, dict) and (ad.get("name") == agent or af.stem == agent):
@@ -7404,9 +8218,19 @@ class KiroCrewConfig:
         creds: dict[str, str] = {}
         ep = env_path()
         if ep.exists():
-            # Enforce restrictive permissions on credential file
+            # Enforce restrictive permissions on the credential file. POSIX
+            # only: on Windows mode bits are meaningless (a chmod there
+            # toggles the read-only attribute and succeeds without narrowing
+            # who can read), and the real owner-only lockdown —
+            # ``platform_compat.restrict_to_owner`` — spawns ``icacls``, a
+            # blocking subprocess this reader must never run: it is called
+            # from async request handlers on the gateway's event loop (the
+            # same constraint ``write_config_atomically`` documents). Windows
+            # enforcement therefore lives where the file is WRITTEN — the
+            # setup wizard and the dashboard credential writers all apply
+            # ``restrict_to_owner`` off the loop at write time.
             try:
-                if ep.stat().st_mode & 0o077:
+                if platform_compat.IS_POSIX and ep.stat().st_mode & 0o077:
                     ep.chmod(0o600)
             except OSError:
                 logger.warning("Cannot enforce permissions on %s", ep)
@@ -7917,6 +8741,26 @@ def _materialized_kiro_agent(agent_name: str | None, project_dir: str | None = N
     if project_dir and _project_declares_agent(agent_name, project_dir):
         return agent_name
     return ""
+
+
+def _read_hardened_agent_spec(path: Path) -> dict | None:
+    """Read one agent spec through ``agent_discovery``'s hardened reader.
+
+    Thin wrapper so the model resolvers get the size cap, sensitive-symlink
+    rejection, and non-object filtering without each re-deriving them.
+
+    Deferred import so this module keeps its leaf-level import graph —
+    ``agent_discovery`` imports ``kiro_crew.hooks``, whose closure reaches
+    back into this module (see :func:`_project_declares_agent`). Any failure
+    to import or parse means "no usable spec here", never an exception into
+    model resolution.
+    """
+    try:
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        return _read_agent_spec(path)
+    except Exception:
+        return None
 
 
 def _project_declares_agent(agent_name: str, project_dir: str) -> bool:

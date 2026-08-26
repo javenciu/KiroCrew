@@ -6,6 +6,8 @@ import asyncio
 import os
 import pathlib
 import shutil
+import socket
+import struct
 import sys
 import warnings
 
@@ -15,6 +17,37 @@ from hypothesis import HealthCheck, settings
 from kiro_crew.safety_override import reset_singleton as _reset_safety_override
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.handler import _PHASE_EMOJIS, _build_phase_emojis
+
+if os.name == "nt":
+
+    class _WindowsTestProactorEventLoop(asyncio.ProactorEventLoop):
+        """Close the loop wakeup socket without filling Windows' TIME_WAIT table."""
+
+        def _close_self_pipe(self) -> None:
+            # Windows implements ``socketpair`` with a localhost TCP connection.
+            # pytest-asyncio 0.20 creates two fresh loops per async test, so this
+            # 62k-test suite can consume the 16,384-port dynamic range before
+            # TIME_WAIT entries expire.  Abortive close is safe for the loop's
+            # private wakeup socket (it carries no application data) and releases
+            # the port immediately while preserving a fresh Proactor loop per test.
+            linger = struct.pack("hh", 1, 0)
+            # Only the write end gets abortive close.  ``ProactorEventLoop``
+            # cancels the pending read and normally closes ``_ssock`` first;
+            # resetting that read end itself turns otherwise-clean async-test
+            # teardown into ``ConnectionResetError``.  Resetting the peer after
+            # the read end has closed still prevents a TIME_WAIT entry.
+            write_socket = self._csock
+            if write_socket is not None:
+                try:
+                    write_socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+                except OSError:
+                    pass
+            super()._close_self_pipe()
+
+    class _WindowsTestEventLoopPolicy(asyncio.WindowsProactorEventLoopPolicy):
+        _loop_factory = _WindowsTestProactorEventLoop
+
+    asyncio.set_event_loop_policy(_WindowsTestEventLoopPolicy())
 
 # ── Hypothesis profiles ─────────────────────────────────────────────────
 # Default (CI): fast iteration.  Run ``HYPOTHESIS_PROFILE=thorough python -m pytest``
@@ -63,6 +96,31 @@ requires_symlinks = pytest.mark.skipif(
     not _HAS_SYMLINKS,
     reason="creating a symlink needs SeCreateSymbolicLinkPrivilege on Windows",
 )
+
+
+def _find_posix_test_shell() -> str | None:
+    """Return a real POSIX shell without mistaking Windows' WSL launcher for one."""
+    if os.name != "nt":
+        return shutil.which("sh")
+
+    git = shutil.which("git")
+    candidates: list[pathlib.Path] = []
+    if git:
+        candidates.append(pathlib.Path(git).resolve().parents[1] / "bin" / "bash.exe")
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(pathlib.Path(root) / "Git" / "bin" / "bash.exe")
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+@pytest.fixture
+def posix_test_shell() -> str:
+    """Provide a shell for POSIX command-plumbing tests on every supported host."""
+    shell = _find_posix_test_shell()
+    if shell is None:
+        pytest.skip("a POSIX test shell is not available")
+    return shell
 
 
 # ── Windows CI ──────────────────────────────────────────────────────────
@@ -340,6 +398,67 @@ def _reset_safety_override_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _reset_degraded_config_observations():
+    """Forget the loader's process-sticky malformed-config observations.
+
+    ``kiro_crew.config.loader`` remembers every malformed config section it has
+    ever seen for the LIFE OF THE PROCESS (deliberately: ``load()``'s migration
+    repairs the file on first read, so the observation is the only surviving
+    evidence, and the publish gate fails closed on it). Tests share one
+    interpreter, so without this reset any test that writes a malformed
+    ``config.json`` — loader error-path tests do — makes the publish/deploy
+    gate deny in every LATER test in the same worker, failing tests in files
+    that never touched the config (seen as ``TestPending`` 4xx refusals in
+    ``test_deploy_handlers_coverage.py`` under random orderings).
+
+    ``reset_degraded_observations`` documents tests as its only legitimate
+    caller; this fixture is that caller.
+    """
+    from kiro_crew.config.loader import reset_degraded_observations
+
+    reset_degraded_observations()
+    yield
+    reset_degraded_observations()
+
+
+@pytest.fixture(autouse=True)
+def _restore_autonudge_singleton():
+    """Floor under ``autonudge._INSTANCE`` — the process-global service reference.
+
+    ``AutoNudgeService.start()`` publishes itself here and ``stop()`` clears it, so a test
+    that starts the service (or drives a dashboard handler that does) leaves a live
+    instance behind, holding timer TASKS created on that test's event loop. Every later
+    test in the same worker then reaches those tasks through the singleton, on a loop that
+    has since closed — which is how `test_dashboard_chat.py`'s
+    ``TestCloseBroadcastDurability`` came to answer 500 with no production-code change,
+    from a leak in a file that has nothing to do with it.
+
+    Restores what the test INHERITED rather than a pristine ``None``, so a leak from an
+    earlier test is not re-reported against every test after it. Restores silently rather
+    than failing: production really does publish this singleton, and a test driving that
+    code cannot avoid inheriting it — the damage is to other tests, and stopping it
+    propagating is the part that is never optional.
+
+    Retiring the leaked instance's timers goes through ``_cancel_timer``, which is the one
+    place that knows a task on a closed loop must be dropped rather than cancelled.
+    """
+    from kiro_crew import autonudge as _an
+
+    inherited = _an._INSTANCE
+    try:
+        yield
+    finally:
+        leaked = _an._INSTANCE
+        if leaked is not None and leaked is not inherited:
+            for loop_id in list(getattr(leaked, "_timers", {})):
+                try:
+                    leaked._cancel_timer(loop_id)
+                except Exception:  # noqa: BLE001 - teardown must not mask the test result
+                    pass
+        _an._INSTANCE = inherited
+
+
+@pytest.fixture(autouse=True)
 def _reset_reasoning_effort_globals():
     """Snapshot + restore the process-global reasoning-effort allowlist around
     each test. The allowlist is union-only/monotonic by design (persistence
@@ -525,12 +644,29 @@ def _ensure_event_loop():
         ``run_until_complete`` blows up with ``RuntimeError: Event loop is closed``. We
         detect a closed/absent loop and install a fresh open one so each test starts clean.
     """
+    created_loop = None
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
-            asyncio.set_event_loop(asyncio.new_event_loop())
+            created_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(created_loop)
     except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        created_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(created_loop)
+
+    yield
+
+    # ``asyncio.run`` clears the policy's current loop, so the next test needs a
+    # replacement.  On Windows each ProactorEventLoop owns a socketpair; leaving
+    # every replacement open eventually exhausts the ephemeral-port range and
+    # makes ``new_event_loop()`` hang until pytest kills every xdist worker.
+    if created_loop is not None and not created_loop.is_closed():
+        created_loop.close()
+    try:
+        if asyncio.get_event_loop() is created_loop:
+            asyncio.set_event_loop(None)
+    except RuntimeError:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -1007,3 +1143,61 @@ def named_cron_caller(monkeypatch):
     key = "dashboard:conftest-slot"
     monkeypatch.setenv("KIROCREW_SESSION_KEY", key)
     return key
+
+
+#: Comfortably clear of both memory guards ``SubagentManager.spawn`` runs: the
+#: absolute floor (``agent.spawn_min_memory_gb``, 4 GB) and the posture tier
+#: (``agent.resource_critical_gb``, 2 GB).
+_HEALTHY_AVAILABLE_GB = 8.0
+
+
+@pytest.fixture
+def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the host-memory readings ``SubagentManager.spawn`` consults.
+
+    ``spawn`` refuses -- returning before it registers anything in ``_tasks`` --
+    whenever the machine looks short of memory, and it does so twice: an
+    absolute floor (``check_memory_available`` against
+    ``agent.spawn_min_memory_gb``) and the posture tier
+    (``cached_admission_check``, which refuses while the cgroup-clamped reading
+    is CRITICAL). Both read the host the suite happens to be running on, so
+    without this the verdict is the operator's machine rather than the test's
+    own input.
+
+    The failure it produces is misleading, which is why it is worth a shared
+    fixture: a refusal IS a ``SubagentInfo`` -- a done one carrying ``error`` --
+    so ``assert info is not None`` still passes and the test dies one line later
+    on ``mgr._tasks[info.id]`` with a bare ``KeyError``. Measured on a CI runner
+    with ~0.5 GB free.
+
+    Only the HOST reading is pinned: a caller that names its own ``path`` is
+    feeding the ``/proc/meminfo`` parser a fixture file rather than asking about
+    this machine, so it still runs the real function and a parser regression
+    still goes red. A test that is actually ABOUT either guard patches it in its
+    own body, which lands on top of this and reverts to it.
+    """
+    import kiro_crew.resource_status as resource_status
+    import kiro_crew.subagent as subagent
+
+    real_check = subagent.check_memory_available
+
+    def _pinned_check(
+        min_gb: float | None = None, path: str | None = None
+    ) -> tuple[bool, float]:
+        if path is None:
+            return (True, _HEALTHY_AVAILABLE_GB)
+        if min_gb is None:
+            return real_check(path=path)
+        return real_check(min_gb=min_gb, path=path)
+
+    def _admit() -> resource_status.AdmissionDecision:
+        return resource_status.AdmissionDecision(
+            admitted=True,
+            posture=resource_status.POSTURE_AMPLE,
+            available_gb=_HEALTHY_AVAILABLE_GB,
+        )
+
+    monkeypatch.setattr(subagent, "check_memory_available", _pinned_check)
+    # Also keeps the 5s-TTL refresh thread behind the cached verdict from
+    # starting, so no test leaves one probing the host after it ends.
+    monkeypatch.setattr(subagent, "cached_admission_check", _admit)

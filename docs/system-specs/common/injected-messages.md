@@ -93,17 +93,30 @@ time-to-first-token distribution.
 
 ## Sub-agent delivery failure
 
-The sub-agent completed but injecting its result into the parent session timed out.
-`subagent.py` builds:
+A sub-agent reached a terminal state but injecting its report into the parent
+session failed (most commonly a delivery timeout). `subagent.py` builds:
 
 ```
 [Subagent completion event]
 Agent `<id>` ❌ <reason>
 Task: <first 100 chars of the task>
-The agent finished but result delivery timed out.
+<outcome line>
 Result saved at: <path> (<n> bytes)
 Use the read tool to retrieve it if needed.
 ```
+
+The outcome line reflects the run's actual terminal state instead of asserting
+completion — this path fires for every terminal state, including runs that
+never executed (the never-ran reading comes from the record's execution marker,
+never from its error wording):
+
+- completed: `The agent finished but result delivery timed out.`
+- failed after execution began: `The agent failed before a result could be delivered.`
+- failed before execution (approval or queued rejection, no output exists):
+  `The run failed before it started, so there is no result to deliver.`
+- stopped before execution began (no output exists):
+  `The run was stopped before it started, so there is no result to deliver.`
+- stopped mid-run: `The run was stopped before it completed.`
 
 The result-path lines are present only when a result file exists. **The result is
 on disk**, so use the `read` tool to retrieve it rather than re-running the work.
@@ -151,12 +164,32 @@ none is mirrored to a linked Slack or Telegram thread as though the user typed i
 
 | Prefix | Fired when |
 |---|---|
-| `[Tool refusal — automatic recovery]` | A tool call was refused for a recoverable system reason (a host-gate policy deny, or the read-only bash gate) and the turn ended early. Carries the reason back so the model can adapt instead of stalling for the user. |
+| `[Tool refusal — automatic recovery]` | A tool call was refused for a recoverable system reason (a host-gate policy deny, the read-only bash gate, or a PreToolUse hook block) and the in-band notice below could not carry the reason. **Fallback only** — see the in-band note under the table. |
 | `[Stalled turn — automatic recovery]` | A genuinely wedged turn was detected and reset. Tells the model the interruption was a system stall, NOT the user, and to resume from its last committed step rather than restart. |
 | `[Tool stall — automatic recovery]` | The per-session watchdog judged an in-flight tool dead and cancelled the session. Hands over the stall context so the model can check partial results and continue. |
 | `[Interrupted turn — automatic recovery]` | A transient backend 5xx cut a turn short after tokens or tool calls had already streamed. |
 | `[Empty response — automatic recovery]` | The model returned no output twice. Continue the pending request; do not restart from scratch or re-run steps that already succeeded. |
 | `[Unfinished action — automatic recovery]` | The turn ended right after announcing an immediate action ("I'll do that now") without making the tool call, so nothing actually happened yet a billed turn was recorded. Instructs the model to carry out the announced action now — unless it was actually deferred pending the user's approval or an unmet condition, in which case it is told to hold and say what it is waiting for (a semantic consent backstop, since the terminal-promise detector's approval-gate deny-list cannot enumerate every conditional phrasing). Bounded to one attempt per turn; a second consecutive promise-only ending falls through and lands normally with a give-up notice. |
+
+**A tool deny is explained IN-BAND first, and the injection above is the
+fallback.** ACP's permission response carries only `outcome`/`optionId`, so the
+host cannot attach a reason to a rejection — kiro-cli hands the model the fixed
+tool result `"User denied tool execution"`, which reads as the person having
+clicked No. `chat_runner._steer_policy_notice` therefore steers
+`state.build_refusal_steer_notice`'s body into the turn **before** answering the
+permission request. Holding the unanswered request is what makes that race-free:
+the turn is provably in flight, so the notice is queued and folded in at the next
+model-inference boundary — the one right after the rejected tool resolves — and
+the model adapts inside the SAME turn. It is opt-in by positive capability
+(`supports_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
+steer is unchanged.
+
+`should_queue_refusal_recovery` then suppresses the extra turn only when every
+refusal got a notice AND a `steering_consumed` echo accounted for all of them. An
+unconfirmed notice counts as undelivered: skipping wrongly leaves the model with
+kiro-cli's wrong attribution and no correction, while queueing wrongly costs one
+turn the model is told twice — which is what this path cost before in-band
+delivery existed.
 
 The recovery classification for the last two is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert

@@ -1757,6 +1757,7 @@ async def _launch_loop(request: web.Request, cid: str, *, prepared: bool = False
         idle_secs=int(row["idle_secs"] or DEFAULT_IDLE_SECS),
         max_cycles=int(row["max_cycles"] or 0),
         stop_sentinel_path=str(_campaign_dir(cid) / "STOP"),
+        admission_check=lambda: state.get_slot(slot.key) is slot,
     )
 
 
@@ -2177,7 +2178,7 @@ def _read_workflow_cycle_offset(campaign_id: str) -> int:
         return 0
     try:
         return int(json.loads(p.read_text()).get("cycle_offset", 0) or 0)
-    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError):
         return 0
 
 
@@ -2320,7 +2321,7 @@ async def _poll_workflow_campaign(
                             ),
                             error_message="Workflow run snapshot lost after 1h — run likely evicted or crashed.",
                         )
-                except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                except (OSError, ValueError, TypeError):
                     pass
             return
         # ALL snapshot processing runs under the campaign's transition lock:

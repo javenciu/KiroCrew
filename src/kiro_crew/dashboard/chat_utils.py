@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMEvent
     from kiro_crew.slack.outbound import PostedOptions
 
+from kiro_crew.context_blocks import attributable_user_chars
 from kiro_crew.dashboard.state import (
     BUSY_RECOVERY_PREFIX,
     CONN_RECOVERY_PREFIX,
@@ -39,6 +40,7 @@ from kiro_crew.dashboard.state import (
 from kiro_crew.history import transcript_sort_key
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
+from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.security import (
     oauth_url_contains_credential,
     redact_credentials,
@@ -70,9 +72,11 @@ async def run_config_write(fn, /, *args, **kwargs):
     takes (covering CLI / boot-refresh / other-process writers), and the
     loop-side :func:`_get_config_lock` asyncio lock that the dashboard's legacy
     handlers still rely on *alone* (bare ``read_config_for_update`` +
-    ``write_config_atomically`` — e.g. the memory-settings PUT). A writer that
-    holds only one of the two can interleave with the other family and silently
-    revert its settings from a stale snapshot.
+    ``write_config_atomically``). A writer that holds only one of the two can
+    interleave with the other family and silently revert its settings from a
+    stale snapshot. The memory-settings PUT was such a writer and is not one
+    any more: ``handlers/memory.py`` routes every config mutation through this
+    helper.
 
     This helper is the one async entry point that holds both: the asyncio lock
     is acquired on the event loop, then ``fn`` (a sync callable that itself
@@ -83,7 +87,39 @@ async def run_config_write(fn, /, *args, **kwargs):
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # lazy: import cycle
 
     async with _get_config_lock():
-        return await asyncio.to_thread(fn, *args, **kwargs)
+        # The worker is SHIELDED and drained before the lock is released. A
+        # thread cannot be cancelled, so cancelling this coroutine -- a gateway
+        # shutdown cancelling the boot migration, a client disconnecting mid-PUT
+        # -- would otherwise unwind the `async with` while ``fn`` is still inside
+        # its read-modify-write. The next writer would then enter the critical
+        # section against a file the previous one is still rewriting, and land a
+        # config derived from a snapshot taken before it: the earlier caller's
+        # settings silently revert.
+        #
+        # The invariant is NOT "drain once after a cancellation": it is that once
+        # a cancellation has been observed, the lock cannot leave this block until
+        # the worker is done. A single drain does not give that -- awaiting the
+        # drain is itself a suspension point, so a SECOND cancel (a graceful
+        # shutdown escalating after its timeout, which is exactly when a config
+        # write is most likely to be in flight) unwinds the `async with` with the
+        # thread still writing. Hence the loop: every cancellation is absorbed,
+        # and only a finished future ends it.
+        #
+        # Draining cannot change WHETHER the write happens -- the thread runs to
+        # completion either way -- so this only decides whether the lock outlives
+        # it. The cancellation is re-raised once, never swallowed.
+        fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+            break
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
 
 # Per-turn compaction-failure backoff. See
@@ -273,6 +309,54 @@ SLASH_COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/usage": "Show billing and usage information",
     "/workflows": "List and manage dynamic workflow runs",
 }
+
+
+def user_text_span(
+    offset: int,
+    typed_len: int,
+    *,
+    quick_prompt: bool,
+    prompt_expanded: bool,
+) -> tuple[int, int]:
+    """WHERE the user's typed text sits in the message handed to ``build_message``.
+
+    Deliberately NOT the same question as how much of the turn is ATTRIBUTABLE to
+    the user, which is :func:`attributable_user_chars`. Conflating the two is a live
+    trap: a quick-prompt turn credits the user zero characters, so deriving the
+    span from the attributable count hands ``build_message`` an EMPTY slice — and
+    since that slice is what the quick-prompt matcher reads, the token silently
+    stops expanding altogether.
+
+    So a quick prompt reports its REAL typed span (the matcher has to see the
+    token; ``build_message`` zeroes the attribution itself once it has expanded),
+    while an ``@prompt`` turn — already replaced before this point, so its typed
+    text is gone from the message — reports the empty span the attribution rule
+    asks for.
+    """
+    length = (
+        typed_len
+        if quick_prompt
+        else attributable_user_chars(typed_len, prompt_expanded=prompt_expanded)
+    )
+    return offset, offset + length
+
+
+def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
+    """Whether *first_word* should be forwarded to the harness as a command.
+
+    Two rules, and the second exists because of a trap. A member of
+    :data:`_SLASH_COMMANDS` is a command on every provider. Under ``claude_code``
+    the harness owns its own command set, so ANY leading slash is forwarded —
+    except a quick-prompt token, which is not a command at all but a macro
+    :meth:`ContextBuilder.build_message` expands into an instruction. Forwarding one
+    would hand the harness a command it has no definition for, and the token would
+    silently do nothing on that provider while working everywhere else.
+    """
+    if first_word in _SLASH_COMMANDS:
+        return True
+    if not (cc_provider and first_word.startswith("/")):
+        return False
+    return first_word.lower() not in QUICK_PROMPTS
 
 
 def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEvent") -> str:

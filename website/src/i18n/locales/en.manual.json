@@ -5,6 +5,8 @@
       "rate_limited_by_the_tunnel_edge_http_429_too_man": "Rate limited by the tunnel edge (HTTP 429) — too many requests in a burst. The dashboard retries automatically; if this persists, wait a few seconds and reload.",
       "session_expired": "Session expired.",
       "session_expired_sign_in_again": "Session expired. Run kirocrew token in a terminal, then paste the URL into the banner at the top of this page to sign back in.",
+      "stale_owner_session": "This session predates the configured owner. Sign in again.",
+      "stale_owner_session_sign_in_again": "This session predates the configured owner (it was signed in before KIROCREW_OWNER_ID was set). Run kirocrew token in a terminal, then paste the URL into the banner at the top of this page to sign back in.",
       "stream_ended_without_completion": "Stream ended without completion",
       "unexpected_server_response": "Unexpected server response"
     }
@@ -22,9 +24,14 @@
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
     "iam_identity_center": "IAM Identity Center",
+    "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
     "kiro_credit_usage_unavailable": "Kiro credit usage — unavailable",
     "memory_unavailable": "Memory: unavailable",
     "metrics_are_stale_latest_fetch_failed": "Metrics are stale, latest fetch failed",
+    "n_more_one": "{{count}} more",
+    "n_more_other": "{{count}} more",
+    "notification_count_one": "{{count}} notification",
+    "notification_count_other": "{{count}} notifications",
     "resource_critical": "Critical",
     "resource_posture_tooltip_critical": "Host memory is critically low ({{gb}} GB free). Avoid heavy parallel work.",
     "resource_posture_tooltip_tight": "Host memory is tight ({{gb}} GB free). Heavy work may be slower.",
@@ -32,6 +39,8 @@
     "subagent_cap": "cap: {{cap}}",
     "show_fewer_apps": "Show fewer apps",
     "show_less": "Show less",
+    "show_more_apps_one": "Show {{count}} more app",
+    "show_more_apps_other": "Show {{count}} more apps",
     "social_login": "Social login",
     "stale_fetch_failing": "(stale: fetch failing)",
     "starting_update": "Starting update…",
@@ -282,6 +291,7 @@
         "show_in_file_manager": "Show in file manager"
       },
       "searchPanel": {
+        "capped": "(capped)",
         "search_failed": "search failed",
         "search_in": "Search in {{name}}",
         "search_in_2": "Search in {{name}}...",
@@ -292,7 +302,8 @@
       "workspace": {
         "selected_issue_hidden_by_filters": "The selected issue is hidden by the active filters.",
         "selected_change_hidden_by_filters": "The selected {{subject}} is hidden by the active filters.",
-        "clear_filters": "Clear filters"
+        "clear_filters": "Clear filters",
+        "select_a_work_item_to_see_its_details": "Select a work item to see its details."
       },
       "components": {
         "agentSessionButton": {
@@ -330,7 +341,14 @@
         },
         "issueList": {
           "closed_issues_are_capped_at_the_100_most_recentl": "Closed issues are capped at the 100 most recently updated",
-          "loading_the_rest": "Loading the rest…"
+          "loading_the_rest": "Loading the rest…",
+          "re_fetch_issues_and_labels_from": "Re-fetch issues + labels from {{provider}}",
+          "time_since_issue_list_last_fetched_from": "Time since the issue list was last fetched from {{provider}}",
+          "search": "Search {{label}}…",
+          "search_2": "Search {{label}}",
+          "tracked_items_are_project_scoped": "Work items belong to the whole {{project}} project, so every repository in it shows this same list.",
+          "work_item_one": "{{count}} work item",
+          "work_item_other": "{{count}} work items"
         },
         "labelPalette": {
           "no_labels_match_query": "No labels match “{{query}}”."
@@ -367,13 +385,16 @@
         },
         "prList": {
           "closed_merged_prs_are_capped_at_the_100_most_rec": "Closed/merged PRs are capped at the 100 most recently updated — turn on a \"me\" filter for a complete, repo-wide search",
+          "file_changed_one": "{{count}} file changed",
+          "file_changed_other": "{{count}} files changed",
           "loading_the_rest": "Loading the rest…",
           "re_fetch_from": "Re-fetch {{label}} from {{provider}}",
           "refresh": "Refresh {{label}}",
           "resolved_by_github_search_across_the_whole_repo": "Resolved by GitHub search across the whole repo — not limited to the 100 most recent",
           "resolved_by_github_search_capped": "Resolved by GitHub search across the whole repo, capped at the {{n}} most recently updated matches",
           "search": "Search {{label}}…",
-          "search_2": "Search {{label}}"
+          "search_2": "Search {{label}}",
+          "time_since_list_last_fetched_from": "Time since the {{label}} list was last fetched from {{provider}}"
         },
         "providerBadge": {
           "self_managed_instance": "Self-managed instance: {{host}}"
@@ -418,6 +439,9 @@
         "reviewButton": {
           "open_ai_code_review_session_for_this": "Open an AI code-review chat session for this {{label}}",
           "resume_ai_code_review_session_for_this": "Resume the AI code-review chat session for this {{label}}"
+        },
+        "readOnlyTag": {
+          "read_only_repo_needs_triage_or_push_access": "Read-only repo — needs triage or push access"
         }
       },
       "connectPanel": {
@@ -425,7 +449,10 @@
         "last_contribution": "Your last contribution: {{when}}",
         "most_recent_activity": "most recent activity",
         "no_contributions_in_the_last_month_paste_a_url_b": "No contributions in the last month — paste a URL below instead.",
-        "select": "Select {{name}}"
+        "select": "Select {{name}}",
+        "repositories_in_your_organization": "Repositories in your organization",
+        "no_repositories_in_your_organization_paste_a_url": "No repositories in your organization. Paste a URL below to connect one.",
+        "azure_also_needs_the_devops_extension": "Azure DevOps also needs its own CLI extension, installed once with the command below."
       },
       "connectRepoModal": {
         "connecting": "Connecting {{done}} of {{total}}…"
@@ -450,7 +477,8 @@
           "unanswered": "Unanswered",
           "unassigned": "Unassigned",
           "untriaged": "Untriaged",
-          "untriaged_2": "untriaged"
+          "untriaged_2": "untriaged",
+          "re_fetch_issues_and_labels_from": "Re-fetch issues + labels from {{provider}}"
         },
         "settings": {
           "repoSettings": {
@@ -504,32 +532,43 @@
             "couldn_t_read_this_repo_s_labels_retry_with_the": "Couldn't read this repo's labels — retry with the refresh button.",
             "create": "Create",
             "create_the_label_on_github": "Create the {{name}} label on GitHub",
-            "create_this_label_on_github": "Create this label on GitHub",
             "creating": "Creating…",
+            "open_issue_one": "{{count}} open issue",
+            "open_issue_other": "{{count}} open issues",
+            "open_with_description_one": "{{description}} — {{count}} open",
+            "open_with_description_other": "{{description}} — {{count}} open",
             "read_only_repo_needs_triage_push_access": "Read-only repo — needs triage/push access",
             "suggest_again": "Suggest again",
-            "suggest_new_labels": "Suggest new labels"
+            "suggest_new_labels": "Suggest new labels",
+            "re_fetch_this_repo_s_labels_from": "Re-fetch this repo's labels from {{provider}}",
+            "create_this_label_on": "Create this label on {{provider}}"
           },
           "untaggedIssueCard": {
             "add_labels_to": "Add labels to #{{number}}",
-            "add_these_labels_on_github": "Add these labels on GitHub",
             "click_to_remove": "Click to remove",
             "click_to_remove_2": "{{reason}} — click to remove",
             "read_only_repo_needs_triage_or_push_access": "Read-only repo — needs triage or push access",
-            "select_issue": "Select issue #{{number}}"
+            "select_issue": "Select issue #{{number}}",
+            "add_these_labels_on": "Add these labels on {{provider}}"
           }
         },
         "taggingView": {
           "analyzing": "Analyzing…",
+          "apply_suggestion_one": "Apply {{count}} suggestion",
+          "apply_suggestion_other": "Apply {{count}} suggestions",
           "applying": "Applying…",
           "available_to_assign": "available to assign",
           "clear_selection": "Clear selection",
           "created_but_settings_not_updated": "\"{{name}}\" was created on GitHub, but this repo's local triage settings could not be updated: {{error}}",
+          "labelled_issue_one": "Labelled {{count}} issue.",
+          "labelled_issue_other": "Labelled {{count}} issues.",
+          "labelled_issue_with_failures_one": "Labelled {{count}} issue; {{failed}} could not be updated (see the rows below).",
+          "labelled_issue_with_failures_other": "Labelled {{count}} issues; {{failed}} could not be updated (see the rows below).",
           "read_only_repo_needs_triage_or_push_access": "Read-only repo — needs triage or push access",
           "select_all": "Select all",
           "suggest_again": "Suggest again ({{n}})",
           "suggest_labels_next": "Suggest labels (next {{n}})",
-          "write_every_staged_label_to_github": "Write every staged label to GitHub"
+          "write_every_staged_label_to": "Write every staged label to {{provider}}"
         },
         "registry": {
           "overview": "Overview",
@@ -700,6 +739,11 @@
           "crew_sort_status": "Status",
           "crew_sort_name": "Name",
           "crew_sort_created": "Created"
+        },
+        "links": {
+          "read_only_here_apply_in_provider": "Read-only here — {{provider}} repositories can't be changed from {{productName}}; apply the change in {{provider}}",
+          "tracked_items_work_items": "Work Items",
+          "tracked_items_issues": "Issues"
         }
       },
       "welcomeCarousel": {
@@ -862,7 +906,7 @@
         "close": "Close (Esc)",
         "custom": "Custom",
         "delete": "Delete",
-        "deleteConfirm": "Delete appearance pack \"{{name}}\"? This cannot be undone.",
+        "deleteConfirm": "Delete appearance pack “{{name}}”? This cannot be undone.",
         "deleteFailed": "Delete failed",
         "dressUp": "Dress up",
         "edit": "️ Edit",
@@ -1144,7 +1188,6 @@
       "group_apps": "Apps",
       "group_commands": "Commands",
       "group_settings": "Settings",
-      "keep_typing": "Type at least {{min}} characters",
       "leave_scope": "Back to all commands",
       "no_matches": "No matches",
       "no_sessions": "No sessions match",
@@ -1158,11 +1201,28 @@
       "cmd_toggle_theme": "Toggle Theme",
       "search_failed": "Search failed",
       "retry": "Retry",
+      "action_enter": "Open View",
+      "action_ask": "Ask",
+      "group_attention": "Needs You",
+      "ask_agent": "Ask the agent: “{{query}}”",
+      "action_open": "Open",
+      "action_open_app": "Open App Page",
+      "action_open_session": "Open Session",
+      "action_run": "Run",
+      "action_search_sessions": "Search Sessions",
+      "action_show_recent": "Show Recent",
+      "no_match_show_recent": "No sessions match “{{query}}” — show recent instead",
       "kind": {
         "app": "App",
         "command": "Command",
         "setting": "Setting",
         "view": "View"
+      }
+    },
+    "papyrus": {
+      "workspace": {
+        "co_author_conflict_discard_button": "Discard changes",
+        "co_author_conflict_discard_title": "Discard unsaved changes?"
       }
     }
   },
@@ -1175,6 +1235,12 @@
       "run_named_now": "Run {{name}} now",
       "running": "running"
     },
+    "tailnetMobile": {
+      "automatic_https": "After HTTPS is enabled for this tailnet, Tailscale creates and renews the private certificate automatically.",
+      "setting_up": "Setting up phone access…",
+      "setup_action": "Set up & show QR",
+      "setup_timeout": "Phone access did not reach a ready state. Re-check the setup, then try again."
+    },
     "filePickerMenu": {
       "no_matches_ctrl_enter_sends": "No matching files — Ctrl+Enter sends the message",
       "no_matches_enter_sends": "No matching files — Enter sends the message"
@@ -1183,6 +1249,7 @@
       "account_details_unavailable": "Account details unavailable",
       "checking_account": "Checking account…",
       "checking_credit_usage": "Checking credit usage",
+      "credit_usage_api_key_auth": "Credit usage isn’t available for API key authentication",
       "credit_usage_unavailable": "Credit usage unavailable",
       "days_until_expiration": "Days until expiration: {{count}}",
       "estimated_overage_cost": "Estimated overage cost",
@@ -1211,6 +1278,11 @@
     },
     "appHost": {
       "not_installed": "\"{{name}}\" is not installed"
+    },
+    "approvalCard": {
+      "approval_no_longer_pending": "This approval has expired or was already decided — the agent is no longer waiting on it.",
+      "decision_failed": "This decision may not have been recorded — the request failed.",
+      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}"
     },
     "approvalModePicker": {
       "approval_mode_aria": "Approval mode: {{mode}}",
@@ -1255,7 +1327,7 @@
       },
       "categories": {
         "agents_automation": "Agents & Automation",
-        "designer_tools": "Designer Tools",
+        "designer_tools": "Design Tools",
         "developer_tools": "Developer Tools",
         "oncall_ops": "On-call & Ops",
         "other": "Other",
@@ -1313,6 +1385,14 @@
       "terminal": "Terminal"
     },
     "chatInput": {
+      "send_a_message_or_tap_the_mic_for_voice": "Send a message, or tap the mic for voice",
+      "release_to_transcribe": "Release to transcribe",
+      "hold_to_talk": "Hold to talk",
+      "release_to_cancel": "Release to cancel",
+      "slide_up_to_cancel": "Slide up to cancel",
+      "switch_to_keyboard": "Switch to keyboard",
+      "switch_to_voice": "Switch to voice",
+      "drop_to_attach": "Drop to attach",
       "agent": "Agent: {{name}}",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
       "branch": "Branch: {{branch}}",
@@ -1343,6 +1423,7 @@
       "stop_the_current_response_to_switch_agents": "Stop the current response to switch agents",
       "stop_the_current_response_to_switch_model": "Stop the current response to switch model",
       "stop_the_current_response_to_switch_project": "Stop the current response to switch project",
+      "switch_not_confirmed": "Switch not confirmed yet — it will apply if the connection recovers.",
       "that_approval_expired_the_turn_it_belonged_to_is": "This approval request expired because the associated turn is no longer awaiting approval.",
       "that_request_already_timed_out_and_was_denied": "That {{source}} request already timed out and was denied — the job is no longer waiting. Check the approvals feed for the record.",
       "transcribing": "Transcribing…",
@@ -1350,7 +1431,9 @@
       "voice_input": "Voice input",
       "queue": "Queue",
       "queue_run_after_the_current_work_finishes_desc": "Run after the current work finishes",
-      "steer_act_on_this_right_away_desc": "Act on this right away"
+      "steer_act_on_this_right_away_desc": "Act on this right away",
+      "finishing": "Finishing…",
+      "keep_holding_to_record": "Keep holding to record"
     },
     "chatPane": {
       "earlier_messages_load_failed": "Couldn't load earlier messages. Scroll to the top of the session to try again.",
@@ -1606,7 +1689,8 @@
       "stopped": "stopped",
       "pin_crew": "Pin {{name}} to the header",
       "unpin_crew": "Unpin {{name}} from the header",
-      "pinned_no_room": "pinned, no room in the header"
+      "pinned_no_room": "pinned, no room in the header",
+      "keep_tab_order_fixed": "Keep tab order fixed"
     },
     "issuePanel": {
       "add_to_chat": "Add to chat",
@@ -1705,8 +1789,10 @@
       "required": "Required",
       "run_kirocrew_doctor_on_the_gateway_host_for_a_ful": "Run this on the gateway host for a full prerequisite report, including which sandbox step failed.",
       "sandbox_unavailable": "Sandbox unavailable",
+      "sign_in_again_to_continue": "Sign in again to continue.",
       "sign_in_method_note": "Both open a browser to finish signing in. Pick the one that matches your plan — the sign-in page offers a personal Builder ID alongside organization SSO, and a Builder ID carries a smaller set of models.",
       "sign_in_personal_label": "Personal account — Builder ID, Google, or GitHub",
+      "sign_in_required": "Sign in required",
       "sign_in_sso_hint": "Prompts for your organization's start URL and region.",
       "sign_in_sso_label": "Organization SSO — IAM Identity Center",
       "sign_in_with_kiro_cli_on_the_gateway_host": "Sign in with Kiro CLI on the gateway host, then check again. Kiro CLI manages the sign-in and keeps the credentials.",
@@ -1742,6 +1828,7 @@
       "adding_2": "Adding...",
       "already_in_library": "Already in Library",
       "cannot_read_file": "Cannot read file",
+      "discard_changes_button": "Discard changes",
       "download_failed": "Download failed",
       "edit": "Edit",
       "failed_to_add_source": "Failed to add source",
@@ -1767,9 +1854,7 @@
       "snapshotting": "Snapshotting…",
       "split_view": "Split view",
       "toggle_file_browser": "Toggle file browser",
-      "tracking_description": "Tracking {{path}}",
-      "view_preview": "View Preview",
-      "view_source": "View Source"
+      "tracking_description": "Tracking {{path}}"
     },
     "markdownRenderer": {
       "click_to_browse_shift_click_to_open_in_file_explorer": "Click to browse / Shift+click to open in File Explorer",
@@ -2240,6 +2325,7 @@
       "desc_model": "Show or switch the current model",
       "desc_onboarding": "Replay setup import and the welcome tour",
       "desc_paste": "Paste an image from the clipboard",
+      "desc_plain": "Where things stand - or add a topic",
       "desc_prompts": "List or invoke saved prompts & agent SOPs",
       "desc_quit": "Quit the chat session",
       "desc_reply": "Reply to the last assistant message",
@@ -2297,6 +2383,7 @@
     },
     "trustDropdown": {
       "trust_all_base": "Trust all <mono>{{base}}</mono> commands",
+      "trust_all_tools_channel": "Trust all tools in this channel — persists across restarts",
       "trust_this_command": "Trust “<mono>{{cmd}}</mono>”"
     },
     "searchableSelect": {
@@ -2333,9 +2420,30 @@
       "stat_unknown": "Unknown",
       "tag_shared": "Shared",
       "unsaved_changes": "Unsaved changes",
-      "webhook_unbound_reason": "Webhook tokens carry no crew binding yet, so any token can wake any crew.",
-      "webhook_unbound_short": "Not bound to a crew",
+      "webhook_unbound_short": "No tokens bound",
       "wire_what_it_works_with": "What it works with"
+    },
+    "confirmDialog": {
+      "cancel": "Cancel"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Could not load webhooks, so what wakes this crew is unknown right now.",
+      "inbound_webhooks_are_switched_off": "Inbound webhooks are switched off, so nothing can call in — bound tokens included.",
+      "last_used_ago": "used {{time}}",
+      "no_tokens_are_bound_to_this_crew": "No webhook tokens are bound to this crew.",
+      "off": "Off",
+      "open_webhooks": "Open Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "Outside systems holding one of these tokens can start a turn as this crew. Create and revoke them on the Webhooks page.",
+      "retry": "Retry",
+      "signed": "Signed",
+      "unbound_tokens_can_wake_any_crew_one": "{{count}} token without a crew binding also exists; it can wake any crew, this one included.",
+      "unbound_tokens_can_wake_any_crew_other": "{{count}} tokens without a crew binding also exist; they can wake any crew, this one included.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhooks that wake this crew"
+    },
+    "shortcutsModal": {
+      "panel_toggles": "Panel toggles",
+      "unset": "Not set"
     }
   },
   "hooks": {
@@ -2383,7 +2491,10 @@
       "walk_back_mru_history": "Walk back MRU history",
       "stop_speaking": "Stop speaking",
       "toggle_focus_mode": "Toggle focus mode",
-      "jump_to_chat_letters": "Jump to chat 10 and beyond (letters follow the badge shown on each row)"
+      "jump_to_chat_letters": "Jump to chat 10 and beyond (letters follow the badge shown on each row)",
+      "toggle_left_sidebar": "Toggle left sidebar",
+      "toggle_session_panel": "Toggle session panel",
+      "toggle_side_panel": "Toggle side panel"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "All slots are occupied",
@@ -2495,6 +2606,8 @@
       "failed_to": "Failed to {{action}}",
       "failed_to_load_app": "Failed to load app",
       "failed_to_uninstall": "Failed to uninstall",
+      "use_cases": "Use cases",
+      "configuration": "Configuration",
       "open_screenshot": "Open screenshot {{n}}",
       "screenshot": "Screenshot {{n}}",
       "install_complete": "Install complete",
@@ -2528,6 +2641,8 @@
       "this_section_could_not_be_displayed": "This section could not be displayed.",
       "uninstall_removes_metadata_and_source": "Installed from Apps — {{productName}} metadata and the downloaded source code will be removed.",
       "uninstall_removes_metadata_secret_and_source": "Installed from Apps — {{productName}} metadata, the app secret, and the downloaded source code will be removed.",
+      "updated_app_one": "Updated {{count}} app.",
+      "updated_app_other": "Updated {{count}} apps.",
       "updating_progress": "Updating {{done}}/{{total}}…"
     },
     "artifactDeployPage": {
@@ -2536,7 +2651,7 @@
       "created_and_registered_profile": "Created + registered profile '{{name}}'.",
       "deploy_artifact": "Deploy {{name}}",
       "deployments_count": "Deployments ({{count}})",
-      "destroy_confirm": "DESTROY '{{name}}'? Permanently deletes bucket {{bucket}} and distribution {{distribution}}. Cannot be undone.",
+      "destroy_confirm": "DESTROY “{{name}}”? Permanently deletes bucket {{bucket}} and distribution {{distribution}}. Cannot be undone.",
       "destroying": "Destroying '{{name}}' (CloudFront disable can take 5–15 min).",
       "error": "Error: {{error}}",
       "is_the_default_profile": "{{name}} is the default profile",
@@ -2554,19 +2669,25 @@
       "fullstack_also_requires_the_permissions_boundary": "Fullstack also requires the permissions-boundary policy below — create it BEFORE the first deploy (role creation is conditioned on it).",
       "make_default": "Make default",
       "not_reachable": "not reachable",
-      "recall_confirm": "Recall '{{name}}'? Empties bucket {{bucket}} (URL → 404, reversible). Edge caches may serve briefly; already-downloaded content can't be recalled.",
+      "recall_confirm": "Recall “{{name}}”? Empties bucket {{bucket}} (URL → 404, reversible). Edge caches may serve briefly; already-downloaded content can't be recalled.",
       "recalled": "Recalled '{{name}}'.",
       "register": "Register",
       "registered_profile": "Registered profile '{{name}}'.",
       "remove_failed": "remove failed",
       "remove_from_registry": "Remove {{name}} from registry",
-      "remove_profile_confirm": "Remove '{{name}}' from the registry? Your ~/.aws/config is NOT touched.",
+      "remove_profile_confirm": "Remove “{{name}}” from the registry? Your ~/.aws/config is NOT touched.",
       "removed_from_registry_your_aws_config_is_untouche": "Removed from registry (your ~/.aws/config is untouched).",
       "unknown": "unknown",
       "unknown_2": "(unknown)",
       "update_failed": "update failed",
       "public_by_link_warning": "Published URLs are public-by-link: anyone with the link can view the content — it is served on the public internet with no authentication.",
-      "random_domain_note": "Content is served at a random *.cloudfront.net domain — don't publish anything you wouldn't put on the open internet."
+      "random_domain_note": "Content is served at a random *.cloudfront.net domain — don't publish anything you wouldn't put on the open internet.",
+      "recall_title": "Recall site?",
+      "recall_button": "Recall site",
+      "destroy_title": "Destroy site?",
+      "destroy_button": "Destroy site",
+      "remove_profile_title": "Remove profile?",
+      "remove_profile_button": "Remove profile"
     },
     "artifactDetailPage": {
       "agent_chat": "Agent chat",
@@ -2581,6 +2702,7 @@
       "comment_resolved": "Comment resolved",
       "copy_failed": "Copy failed",
       "could_not_overwrite": "Could not overwrite.",
+      "discard_changes_button": "Discard changes",
       "document_type": "Document type",
       "edit": "Edit",
       "edited": "Edited",
@@ -2636,6 +2758,8 @@
       "deploying": "Deploying…",
       "expired": "Expired",
       "filter_artifacts": "Filter {{provider}} artifacts…",
+      "folder_one": "{{count}} folder",
+      "folder_other": "{{count}} folders",
       "gallery": "Gallery",
       "import_from_a_file": "Import from a file…",
       "live": "Live",
@@ -2653,7 +2777,7 @@
       "preview": "Preview: {{slug}}",
       "published": "Published ({{visibility}})",
       "published_sync_issue": "Published (sync issue)",
-      "remove_artifact_confirm": "Remove artifact \"{{slug}}\" from your library?\n\nThis deletes the artifact entry and its version history. If this artifact came from a file on disk or a chat widget, the original is NOT touched — you can re-add it later.",
+      "remove_artifact_confirm": "Remove artifact “{{slug}}” from your library?\n\nThis deletes the artifact entry and its version history. If this artifact came from a file on disk or a chat widget, the original is NOT touched — you can re-add it later.",
       "remove_star_from_artifact": "Remove star from artifact",
       "star_artifact": "Star artifact",
       "starred_click_to_unstar": "Starred — click to unstar",
@@ -2680,6 +2804,8 @@
       "prompts_description": "Reusable prompt templates from {{registry}}"
     },
     "channelPage": {
+      "agent_joining_one": "{{count}} agent joining",
+      "agent_joining_other": "{{count}} agents joining",
       "failed_to_add_agent": "Failed to add agent",
       "failed_to_clear_context_error": "Failed to clear context: {{error}}",
       "failed_to_create_channel": "Failed to create channel",
@@ -2739,6 +2865,8 @@
         "stopped": "Stopped",
         "subagent": "Subagent {{label}}",
         "subagents": "Subagents",
+        "model_label": "Model: {{model}}",
+        "model_downgraded": "Requested {{requested}}, served {{resolved}}",
         "workflows": "Workflows",
         "workspace_empty": "No files in this workspace yet",
         "workspace_truncated": "Large workspace — showing the first 10,000 files"
@@ -2857,6 +2985,7 @@
         "expand_agent_list": "Expand subagent list",
         "open_in_subagents_sidebar": "Open {{label}} in subagents sidebar",
         "retry_failed_count": "Retry failed ({{count}})",
+        "stop_all": "Stop all",
         "stop_all_running_subagents": "Stop all running subagents",
         "stop_running_subagent": "Stop running subagent",
         "stop_subagent": "Stop subagent {{name}}"
@@ -2948,6 +3077,7 @@
         "all_files": "All files",
         "changed": "Changed",
         "close_search": "Close search",
+        "ctx_add_to_chat": "Add to chat",
         "filter_placeholder": "Filter files…",
         "refresh": "Refresh",
         "resize": "Resize file browser",
@@ -2960,6 +3090,23 @@
         "select_file_hint": "Select a file from the tree to open it in a new tab",
         "title": "Files",
         "tree_error": "Couldn't load the file tree"
+      },
+      "subagentRunCard": {
+        "agent_finished_one": "{{count}} agent finished",
+        "agent_finished_other": "{{count}} agents finished",
+        "agent_launched_one": "{{count}} agent launched",
+        "agent_launched_other": "{{count}} agents launched",
+        "agent_one": "{{count}} agent",
+        "agent_other": "{{count}} agents",
+        "agent_queued_one": "{{count}} agent queued",
+        "agent_queued_other": "{{count}} agents queued",
+        "agent_running_one": "{{count}} agent running",
+        "agent_running_other": "{{count}} agents running"
+      },
+      "turnBlock": {
+        "hide_tool_calls": "Hide tool calls",
+        "worked_through_step_one": "Worked through {{count}} step",
+        "worked_through_step_other": "Worked through {{count}} steps"
       }
     },
     "chatPage": {
@@ -3008,8 +3155,10 @@
       "send_failed_with_error": "Send failed: {{error}}"
     },
     "chatSidebar": {
+      "archive_session_one": "Archive {{count}} session",
+      "archive_session_other": "Archive {{count}} sessions",
       "default_agent": "Default agent: {{name}}",
-      "delete_folder_confirm": "Delete \"{{name}}\"? Sessions will be ungrouped.",
+      "delete_folder_confirm": "Delete “{{name}}”? Sessions will be ungrouped.",
       "filter_tags": "Filter tags: {{name}}",
       "folder_2": "Folder {{name}}",
       "folder_options_for": "Folder options for {{name}}",
@@ -3038,6 +3187,8 @@
       "last_7_days": "Last 7 Days",
       "dashboard_source": "Dashboard",
       "connected_to": "Connected to {{label}}",
+      "session_failed_to_switch_one": "{{count}} session failed to switch",
+      "session_failed_to_switch_other": "{{count}} sessions failed to switch",
       "started_in_channel": "This conversation started in {{channel}}.",
       "started_in_direct_message": "This conversation started in a direct message.",
       "session_source": "Session",
@@ -3046,6 +3197,10 @@
       "no_inactive_sessions_to_archive": "No inactive sessions to archive.",
       "older": "Older",
       "show": "Show",
+      "show_hidden_folder_one": "Show {{count}} hidden folder",
+      "show_hidden_folder_other": "Show {{count}} hidden folders",
+      "sub_agent_needs_approval_one": "{{count}} sub-agent needs approval",
+      "sub_agent_needs_approval_other": "{{count}} sub-agents need approval",
       "switch_failed": "Switch failed",
       "switch_to_board_view": "Switch to board view",
       "switch_to_flat_view_all_chats_without_folders": "Switch to flat view (all chats without folders)",
@@ -3092,7 +3247,11 @@
       "add_state_lanes": "Add automatic columns",
       "lane_seed_failed": "Could not add the automatic columns.",
       "lane_seed_retry": "Try again",
-      "lane_legacy_column_hint": "shows every session"
+      "lane_legacy_column_hint": "shows every session",
+      "switch_session_one": "Switch {{count}} session",
+      "switch_session_other": "Switch {{count}} sessions",
+      "workflow_running_one": "{{count}} workflow running",
+      "workflow_running_other": "{{count}} workflows running"
     },
     "connectionsPage": {
       "action_failed": "Action failed: {{error}}",
@@ -3350,7 +3509,8 @@
       "total_runs": "Total Runs",
       "matcher_placeholder_regex": "Matcher (regex, e.g. \\b(auth|login)\\b)",
       "matcher_placeholder_contains": "Matcher (contains, e.g. deploy|release)",
-      "skills_inert_warning": "These skills can't fire on this configuration: {{skills}}. To save, switch to UserPromptSubmit or AgentSpawn without a command — or remove the skills."
+      "skills_inert_warning": "These skills can't fire on this configuration: {{skills}}. To save, switch to UserPromptSubmit or AgentSpawn without a command — or remove the skills.",
+      "test_failed": "Test failed"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "A unique identifier for this workspace. Agents reference workspaces by name.",
@@ -3575,11 +3735,14 @@
       "stub_failed": "Could not apply the change. It may already be saved without being live — the switches below now show the stored state.",
       "stub_not_live": "Saved, but the change is not live yet — the gateway could not start. The switch shows what is stored, not what is running.",
       "stub_restart_required": "Saved. Restart the gateway for this to take effect. Sessions already running keep the servers they started with.",
-      "stubbed_of_total": "{{stubbed}} of {{total}} stubbed",
+      "stubbed_of_total": "{{stubbed}} of {{total}} opted in to stubbing",
       "unsupported_platform": "Backend sharing needs Unix-domain sockets, so it is unavailable on this platform.",
       "view_assessment": "Sharing assessment",
       "view_servers": "Servers",
-      "views_aria": "MCP management views"
+      "views_aria": "MCP management views",
+      "state_direct_env": "direct (env)",
+      "state_direct_env_reason": "Not stubbed, but your opt-in stays saved.",
+      "state_direct_env_legend": "direct (env) — the server declares an environment key a shared backend would withhold, so {{productName}} does not stub it at all: the session launches it directly, with no shared backend and no server-authored UI."
     },
     "migrationPage": {
       "clean_up_old_entry": "Clean up old entry",
@@ -3617,6 +3780,8 @@
         "tool_call_budget_per_subagent_1_200_default_100": "Tool-call budget per subagent (1–200). Default: 100."
       },
       "mcpTab": {
+        "applied_change_one": "Applied {{count}} change",
+        "applied_change_other": "Applied {{count}} changes",
         "edit_json_for": "Edit JSON for {{name}}",
         "mcp_servers_count": "MCP Servers ({{count}})",
         "off_count": "({{count}} off)",
@@ -3631,7 +3796,13 @@
         "pending_enable_click_to_revert": "Pending: enable (click to revert)",
         "pending_uninstall": "{{label}} — pending uninstall",
         "unknown": "Unknown",
-        "servers_scope_tip": "MCP servers across Kiro Crew and your interactive {{provider}}/Kiro globals. The Kiro Crew badge shows if it'll load in Kiro Crew sessions; the Globals badge shows if it's shared to your interactive Kiro global. Click to toggle, then Apply."
+        "servers_scope_tip": "MCP servers across Kiro Crew and your interactive {{provider}}/Kiro globals. The Kiro Crew badge shows if it'll load in Kiro Crew sessions; the Globals badge shows if it's shared to your interactive Kiro global. Click to toggle, then Apply.",
+        "sign_in_required": "Sign-in required",
+        "sign_in_required_help": "This server uses OAuth and nobody has signed in yet. <chatLink>Go to chat</chatLink>, start a new session, and send any message — you'll be asked to approve the sign-in in chat. Then probe to refresh this list.",
+        "oauth_not_a_static_token": "This server signs in with OAuth, so a static Authorization header cannot satisfy it. Remove and re-add this server without the header, enable it, then start a new chat session to sign in.",
+        "sign_in_required_next": "Once you have approved it, use the Probe MCP servers button above this table; this row will then read Signed in.",
+        "signed_in": "Signed in",
+        "signed_in_help": "Kiro CLI holds a sign-in for {{provider}}. The probe runs without that token, so {{productName}} cannot confirm the sign-in is still valid."
       },
       "memoryGraphTab": {
         "all_count": "All ({{count}})",
@@ -3646,6 +3817,9 @@
         "consolidated_sessions_failed": "Consolidated {{succeeded}}/{{total}} sessions ({{failed}} failed)",
         "controls_how_conversation_history_is_consolidate": "Controls how conversation history is consolidated into memory.",
         "learned_user_preferences_coding_style_tools_work": "Learned user preferences (coding style, tools, workflows). Auto-updated by memory consolidation.",
+        "lesson_already_covered": "An existing lesson already covers this ({{reason}}). Reword it to add something new.",
+        "lesson_already_stored": "This lesson is already stored.",
+        "lesson_not_saved": "Lesson not saved ({{reason}}). Edit it and try again.",
         "persistent_lessons_injected_into_every_session_a": "Persistent lessons injected into every session. Auto-extracted from task runner failures. Add manually via 'kirocrew learn add'. When vector memory is active, lessons are managed in the Semantic tab as lesson.* entries.",
         "save": "Save"
       },
@@ -3659,8 +3833,8 @@
       },
       "skillsTab": {
         "adds_new_requirements_to": "Adds new requirements to {{target}} — {{description}}",
-        "delete_confirm": "Delete \"{{name}}\"?",
-        "dismiss_confirm": "Dismiss \"{{name}}\"?",
+        "delete_confirm": "Delete “{{name}}”?",
+        "dismiss_confirm": "Dismiss “{{name}}”?",
         "dismiss_all": "Dismiss All",
         "dismiss_all_confirm": "Dismiss all {{count}} pending skills?",
         "loaded_by_2": "Loaded by: {{agents}}",
@@ -3706,7 +3880,7 @@
         "scripts_always_require_review": "Bundled scripts always require manual review, even when skill approval is turned off."
       },
       "steeringTab": {
-        "delete_confirm": "Delete \"{{path}}\"?",
+        "delete_confirm": "Delete “{{path}}”?",
         "edit_2": "Edit {{path}}",
         "no_files_match_query": "No files match “{{query}}”.",
         "select": "Select {{path}}",
@@ -3888,6 +4062,8 @@
       "failed_to_load_jobs": "Failed to load jobs",
       "h_ago": "{{n}}h ago",
       "hide_message": "Hide message",
+      "job_could_not_be_deleted_one": "{{failed}} of {{count}} job could not be deleted",
+      "job_could_not_be_deleted_other": "{{failed}} of {{count}} jobs could not be deleted",
       "just_now": "just now",
       "last_error": "Last Error",
       "last_output": "Last Output",
@@ -3906,7 +4082,7 @@
         "batch_move_failed_one": "{{count}} of {{total}} job could not be moved",
         "batch_move_failed_other": "{{count}} of {{total}} jobs could not be moved",
         "collapse_folder": "Collapse folder",
-        "confirm_delete_folder": "Delete \"{{name}}\"? Jobs will be ungrouped.",
+        "confirm_delete_folder": "Delete “{{name}}”? Jobs will be ungrouped.",
         "create": "Create",
         "delete_folder": "Delete folder",
         "delete_folder_named": "Delete \"{{name}}\"",
@@ -3930,12 +4106,31 @@
       "script_source_failed": "Could not load the script source.",
       "script_source_truncated": "Truncated — the script is larger than the preview limit."
     },
+    "servicesTab": {
+      "channels": "Channels",
+      "connect_error": "Connection error",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
+      "webex": "Webex",
+      "wecom": "WeCom",
+      "weixin": "WeChat",
+      "whatsapp": "WhatsApp",
+      "feishu": "Feishu"
+    },
     "sessionArchive": {
       "no_matches_for_query": "No matches for \"{{query}}\".",
       "truncated_showing_first_200kb": "… truncated (showing first 200KB) …"
     },
     "settings": {
       "aboutPanel": {
+        "diverged": "Diverged",
+        "checkout_diverged_from_upstream": "This checkout has diverged from its upstream ({{distance}}). Rebase or merge to update — nothing is applied automatically, so your local commits are safe.",
+        "commits_ahead_one": "{{count}} commit ahead",
+        "commits_ahead_other": "{{count}} commits ahead",
+        "commits_behind_one": "{{count}} commit behind",
+        "commits_behind_other": "{{count}} commits behind",
         "updates_managed_by_policy": "Updates for this install are managed by an operator-defined update policy. New versions arrive through the mechanism it defines.",
         "updates_managed_externally": "Updates for this install are managed by an external package manager. Use that package manager to get new versions.",
         "updates_managed_externally_by": "Updates for this install are managed by {{managedBy}}. Use it to get new versions.",
@@ -4055,6 +4250,7 @@
         "saved": "Saved.",
         "saved_restart_the_gateway_to_apply": "Saved. Restart the gateway to apply.",
         "saving": "Saving…",
+        "shared_channels": "Shared channels",
         "soft_context_threshold_must_be_a_number_between": "Soft context threshold must be a number between 1 and 100",
         "start_the_channel_at_gateway_startup": "Start the {{channel}} channel at gateway startup (requires a bot token).",
         "verified_with_channel_and_saved": "Verified with {{channel}} and saved. Restart the gateway to connect.",
@@ -4080,13 +4276,13 @@
         "role_subagents": "Sub-agents",
         "background_effort": "Background Effort",
         "subagent_effort": "Subagent Effort",
-        "role_effort_hint": "Applies only on reasoning-capable models; empty inherits the chat default effort.",
+        "role_effort_hint": "Applies only on reasoning-capable models. 'Model default' applies no override — this work does not inherit your Default Reasoning Effort.",
         "failed_to_save_role_effort": "Failed to save role effort",
         "background_model": "Background Model",
         "subagent_model": "Subagent Model",
         "model_for_background_lite_heartbeat_work": "Model for background work — title generation, history compaction, and heartbeat polling.",
         "model_for_spawned_sub_agents": "Model for spawned sub-agents.",
-        "role_model_auto_hint": "'Default' lets the provider pick — it does not inherit your chat model. Pin a model to run this work on it.",
+        "role_model_auto_hint": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it.",
         "failed_to_save_role_model": "Failed to save role model",
         "disabled_by_instance_config_tips_enabled_false": "Disabled by instance config (tips_enabled: false)",
         "enter_for_newline": "Enter for newline",
@@ -4132,7 +4328,16 @@
         "failed_to_save_knowledge_setting": "Failed to save knowledge setting",
         "session_summaries": "Session summaries",
         "summarize_each_session_by_intent_in_the_right_pa": "Summarize each session by intent. Uses tokens on turns that change the session.",
-        "failed_to_save_session_summaries": "Failed to save session summaries setting"
+        "failed_to_save_session_summaries": "Failed to save session summaries setting",
+        "role_model_auto": "Auto (provider picks)",
+        "effort_needs_reasoning_model": "Applies only on reasoning-capable models, so it has no effect on the model selected above.",
+        "throttle_fallback": "Rate-limit fallback",
+        "fallback_model": "Fallback model",
+        "model_tried_when_your_current_model_stays_rate_li": "Model tried when your current model stays rate-limited past its retry budget.",
+        "fallback_auto_hint": "Auto (default) lets the backend route to an available model. A fallback swap is announced in chat and sticks until your model recovers. Disabled turns fallback off.",
+        "fallback_disabled": "Disabled",
+        "fallback_auto": "Auto (recommended)",
+        "failed_to_save_fallback_model": "Failed to save fallback model"
       },
       "displayPanel": {
         "color": "Color {{n}}",
@@ -4247,6 +4452,8 @@
         "profile_unusable_body": "A profile named below could not be loaded, so its surface is held at the policy fallback ceiling — deny-all unless a looser fallback is declared. Correct the file in the profiles folder of your Kiro Crew data home — it is reloaded automatically.",
         "profile_unusable_detail": "The file was unreadable, failed to parse, or extends a profile that is missing. A restart is only needed if the file is already valid for a newer build than the one running.",
         "profile_unusable_which": "Affected: {{profiles}}.",
+        "unknown_scopes_title": "Profile scopes not in this build",
+        "unknown_scopes_tip": "These profiles name capability scopes this build does not register — typically scopes a companion edition adds, though a misspelled scope key lands here too. They are skipped and have no effect in this build.",
         "disabling_all_built_in_denies_removes_kirocrew_s": "Disabling all built-in denies removes Kiro Crew’s protection against destructive and credential-exfiltration commands. Some commands may stay blocked by independent defense-in-depth controls (sensitive paths, IMDS, git-publish).",
         "enabled": "Enabled",
         "expand_category_rules": "Expand {{category}} rules",
@@ -4386,8 +4593,8 @@
           "revoke_disables": "{{name}} is no longer trusted and has been switched off.",
           "change_failed": "That change did not take effect: {{detail}}",
           "unknown_error": "unknown error",
-          "revoke_confirm_title": "Remove trust from {{name}}?",
-          "revoke_confirm_body": "{{name}} will be switched off and stop working. It stays installed, and you can trust it again later.",
+          "revoke_confirm_title": "Remove trust from “{{name}}”?",
+          "revoke_confirm_body": "“{{name}}” will be switched off and stop working. It stays installed, and you can trust it again later.",
           "revoke_confirm_ok": "Remove trust and switch off",
           "allow_all_confirm_body": "Allowing every third-party app lets any app you install run its own code inside Kiro Crew, with the same access Kiro Crew has — your files, your saved credentials, and the internet. Trusting one app at a time is safer.",
           "allow_all_confirm_ack": "I understand every third-party app I install will be able to run its own code with Kiro Crew's access.",
@@ -4425,8 +4632,13 @@
         "voice_input_remote_instance_note": "Voice input on a remote instance requires microphone permission delegation across the iframe boundary. If the mic doesn't respond here, use the local (parent) dashboard instead."
       },
       "teamsPanel": {
+        "active": "Active",
+        "jwt_required": "<strong>Microsoft Teams needs the PyJWT dependency.</strong> Inbound Bot Framework requests carry a signed token that has to be validated, so the channel refuses to start without it. Run <mono>pip install \"kirocrew[teams]\"</mono> in the environment that runs the gateway, then restart it.",
         "microsoft_app_id": "Microsoft App ID",
+        "needs_setup": "Needs setup",
+        "not_active": "Not active",
         "save_failed_is_the_gateway_running": "Save failed. Is the gateway running?",
+        "save_rejected": "The gateway rejected these settings ({{code}}).",
         "save_teams_settings": "Save Teams settings",
         "saved": "Saved.",
         "saved_restart_the_gateway_to_apply": "Saved. Restart the gateway to apply.",
@@ -4495,7 +4707,24 @@
         "saving": "Saving…",
         "settings_are_saved_but_the_channel_is_not_runnin": "Settings are saved but the channel is not running. Restart the gateway to connect.",
         "verified_with_webex_and_saved_restart_the_gatewa": "Verified with Webex and saved. Restart the gateway to connect.",
-        "where_to_find_the_bot_token": "Where to find the bot token"
+        "where_to_find_the_bot_token": "Where to find the bot token",
+        "empty_allowlist_hint": "No allowed emails: the bot rejects every message. Add your Webex account email below.",
+        "soft_threshold_must_be_1_to_100": "Soft context threshold must be a whole number between 1 and 100.",
+        "hard_threshold_must_be_1_to_100": "Hard context threshold must be a whole number between 1 and 100.",
+        "soft_threshold_must_not_exceed_hard": "Soft context threshold must not be higher than the hard one — the hard threshold is checked first, so a higher soft value would never be reached.",
+        "allow_group_spaces": "Answer in group spaces",
+        "allow_group_spaces_desc": "Off by default. A reply in a space is visible to everyone in it, including people not on the allowed-emails list.",
+        "allowed_room_ids": "Allowed space IDs",
+        "allowed_room_ids_desc": "Empty means no space is answered, so turning the switch on alone grants nothing. The sender must also be on the allowed-emails list. A space ID is an opaque string — list yours with:\ncurl -H \"Authorization: Bearer $WEBEX_BOT_TOKEN\" https://webexapis.com/v1/rooms",
+        "allowed_room_ids_empty_hint": "No space is answered yet. Add the bot to the space, then paste that space's ID here.",
+        "room_id_placeholder": "Y2lzY29zcGFyazovL3VzL1JPT00v…",
+        "behaviour": "Behavior",
+        "reply_in_thread": "Reply in thread",
+        "reply_in_thread_desc": "Reply under the message's own thread when it has one, which keeps a busy space readable.",
+        "soft_context_threshold": "Soft context threshold %",
+        "soft_context_threshold_desc": "When a conversation's context passes this, suggest /compact or /new instead of compacting automatically.",
+        "hard_context_threshold": "Hard context threshold %",
+        "hard_context_threshold_desc": "Compact automatically at this point, even without a decision, so the context window never overflows."
       },
       "weixinPanel": {
         "connect_via_qr": "Connect via QR",
@@ -4506,17 +4735,96 @@
         "sign_in_again": "Sign in again",
         "waiting_for_scan": "Waiting for scan…"
       },
+      "whatsAppPanel": {
+        "status_unavailable": "Status unavailable",
+        "setup_guide": "Setup guide",
+        "whatsapp": "WhatsApp",
+        "connected": "Connected",
+        "not_signed_in": "Not paired",
+        "pair_with_whatsapp": "Pair with WhatsApp",
+        "scan_the_code_from_linked_devices": "Scan the code with WhatsApp on your phone: Settings, Linked devices, Link a device.",
+        "signed_in_restart_the_gateway_to_start_receiving": "Paired. Restart the gateway to start receiving messages.",
+        "talk_to_your_agent_from_your_own_whatsapp": "Talk to your agent from your own WhatsApp account, paired as a linked device. Messages the agent sends come from your number.",
+        "waiting_for_a_code": "Waiting for a code...",
+        "waiting_for_scan": "Waiting for the scan...",
+        "scanned_confirm_on_your_phone": "Scanned. Confirm on your phone.",
+        "the_code_expired_try_again": "The code expired. Try again.",
+        "could_not_start_pairing": "Could not start pairing.",
+        "could_not_start_the_login_flow": "Could not start the pairing flow.",
+        "whatsapp_pairing_qr_code": "WhatsApp pairing QR code",
+        "enable_the_whatsapp_channel": "Enable the WhatsApp channel",
+        "who_can_message_the_bot": "Who can message the agent",
+        "only_me_the_default": "Only me (my own messages)",
+        "me_plus_allowed_numbers": "Me, plus allowed numbers",
+        "nobody_ignore_all_messages": "Nobody (ignore all messages)",
+        "anyone_who_messages_you": "Anyone who messages you",
+        "allowed_wa_ids": "Allowed numbers",
+        "allowed_numbers_empty_adds_nobody": "Phone numbers (digits with country code, no plus sign) that may also chat with the agent. Empty adds nobody beyond you.",
+        "phone_number_placeholder": "447700900000",
+        "created_for_you_when_you_turn_this_on_if_it_does": "Created for you when you turn this on, if it does not already exist.",
+        "group_participation_is_opt_in_per_group": "Group participation is opt-in per group: mention mode replies only when tagged; rules mode can also help unprompted, with a cooldown. Uses the unofficial WhatsApp Web protocol; keep usage personal-scale.",
+        "waiting_to_be_paired": "Waiting to be paired",
+        "the_link_was_revoked": "The link was revoked",
+        "blocked_by_whatsapp": "Blocked by WhatsApp",
+        "paired_but_not_connected": "Paired, but not connected",
+        "whatsapp_did_not_connect": "WhatsApp did not connect: {{error}}",
+        "the_channel_is_enabled_but_not_running": "The channel is enabled but not running. Restart the gateway.",
+        "show_pairing_code": "Show pairing code",
+        "already_paired_unlink_then_restart": "Already paired. To pair a different device, unlink this one below, then restart the gateway.",
+        "the_link_was_revoked_restart_to_pair_again": "The link was revoked. Restart the gateway to pair a device again.",
+        "blocked_number_cannot_pair": "WhatsApp has blocked this number, so pairing cannot start.",
+        "pairing_starts_when_the_channel_starts": "A pairing code exists only while the channel is pairing, and pairing begins when the channel starts. Enable the channel below, then restart the gateway.",
+        "the_channel_is_not_running_enable_and_restart": "The WhatsApp channel is not running. Enable it below, then restart the gateway.",
+        "unlink_this_device": "Unlink this device",
+        "revokes_the_linked_device_on_your_account": "Revokes this linked device on your WhatsApp account and deletes the local session. The agent stops reading and sending until a device is paired again.",
+        "confirm_unlink": "Confirm unlink",
+        "unlinked_restart_to_pair_again": "Unlinked. Restart the gateway to pair a device again.",
+        "unlinked_but_the_session_file_was_kept": "Unlinked from WhatsApp, but the local session file could not be removed. Delete it under the data home before pairing again.",
+        "whatsapp_refused_the_unlink_still_linked": "WhatsApp refused the unlink, so the device is still linked and the local session was kept. Try again, or revoke the device from your phone under Linked devices.",
+        "channel_not_running_so_nothing_was_unlinked": "The channel is not running, so nothing was unlinked. A linked device stays linked: revoke it from your phone under Linked devices.",
+        "could_not_unlink_the_device": "Could not unlink the device.",
+        "groups": "Groups",
+        "the_agent_ignores_every_group_not_listed": "The agent ignores every group that is not listed here.",
+        "add_a_group": "Add a group",
+        "your_groups_load_once_the_channel_is_connected": "Your groups appear here once the channel is connected.",
+        "every_group_you_joined_is_already_listed": "Every group you have joined is already listed.",
+        "how_the_agent_joins_in": "How the agent joins in",
+        "mode_only_when_mentioned": "Only when mentioned or quoted",
+        "mode_also_when_the_rules_apply": "Also when its rules apply",
+        "mode_off_keeping_the_entry": "Off, keeping the entry",
+        "when_the_agent_may_speak": "When the agent may speak",
+        "the_agent_stays_silent_unless_these_apply": "Free text. The agent stays silent unless these rules clearly apply.",
+        "rules_example_placeholder": "Answer questions about 3D printing",
+        "seconds_between_unprompted_replies": "Seconds between unprompted replies",
+        "remove_name_from_the_group_list": "Remove {{name}} from the group list",
+        "unofficial_protocol_ban_risk": "Unofficial protocol: WhatsApp may ban the linked number. Don't link a number you can't afford to lose."
+      },
       "channels": {
         "get_your_bot_credentials": "Get your bot credentials",
+        "hard_below_soft_error": "Hard context threshold must be at or above the soft context threshold",
+        "hard_threshold_description": "Compact automatically at this percentage, even without a reply, so the context window never overflows.",
+        "hard_threshold_label": "Hard context threshold %",
+        "hard_threshold_range_error": "Hard context threshold must be a number between 1 and 100",
         "threshold_description": "Prompt to {{compact}} or {{new}} when the session context passes this percentage."
       },
       "discordPanel": {
+        "allowed_server_channel_ids": "Allowed server channel IDs",
         "allowed_server_thread_ids": "Allowed server thread IDs",
-        "allowlist_description": "Discord user IDs permitted to run the agent in DMs or approved threads. Empty = deny all (fail closed).",
-        "description": "Talk to your agent from Discord DMs or explicitly approved server threads over the Gateway WebSocket. Normal server channels are always ignored.",
+        "allowlist_description": "Discord user IDs permitted to run the agent in DMs, approved threads, or allowed channels. Empty = deny all (fail closed).",
+        "auto_thread_description": "A message in an allowed channel opens a fresh public thread, and the turn runs there instead of in the shared channel.",
+        "auto_thread_label": "Answer in a new thread",
+        "auto_thread_off_hint": "Auto-thread is off, so messages in the channels above are ignored. {{productName}} never answers in a shared channel itself.",
+        "channel_allowlist_description": "Optional. Approved users may also run the agent from these shared server channels. Empty = no shared channels.",
+        "channel_help": "With Developer Mode on, right-click the channel → <mono>Copy Channel ID</mono>. Use the channel's own ID, not the ID of a thread inside it.",
+        "channel_warning": "A shared channel is a wider disclosure boundary than a thread: everyone who can see the channel, and everyone who can open the public thread a turn runs in, can read what the agent writes and what its tools print. Only add a channel whose entire membership may see that.",
+        "description": "Talk to your agent from Discord DMs, approved server threads, or allowed server channels over the Gateway WebSocket. Every other server channel is ignored.",
         "empty_allowlist_hint": "No allowed user IDs: the bot rejects every message (fail closed). Add your Discord user ID below.",
-        "guide_body": "Create an app in the Discord Developer Portal, then copy the token from the <mono>Bot</mono> page. For DMs only, leave privileged intents off. For server threads, enable <mono>Message Content Intent</mono> and install with the <mono>bot</mono> scope plus View Channel, Read Message History, and Send Messages in Threads. Enable Discord Developer Mode, then right-click your name to copy your numeric user ID.",
+        "guide_body": "Create an app in the Discord Developer Portal, then copy the token from the <mono>Bot</mono> page. For DMs only, leave privileged intents off. For server threads, enable <mono>Message Content Intent</mono> and install with the <mono>bot</mono> and <mono>applications.commands</mono> scopes plus View Channel, Read Message History, and Send Messages in Threads. Enable Discord Developer Mode, then right-click your name to copy your numeric user ID.",
         "open_developer_portal": "Open Developer Portal",
+        "reactions_description": "Mark your message with an emoji for the phase the agent is in (queued → thinking → coding → done). Off leaves your message unmarked.",
+        "reactions_label": "Phase reactions",
+        "thinking_description": "Post a preview of the model's reasoning as its own subtext note above the answer. Off keeps the channel to the answer alone.",
+        "thinking_label": "Show thinking",
         "thread_allowlist_description": "Optional. Approved users may run the agent only in these exact Discord threads. Empty = DMs only.",
         "thread_help": "With Developer Mode on, right-click the thread → <mono>Copy Channel ID</mono>. Use the thread's ID, not its parent channel ID.",
         "thread_warning": "Thread mode enables Discord's global Message Content intent. Discord delivers content from every server channel the bot can see; Kiro Crew discards traffic outside approved threads. Everyone who can view an approved thread can read agent replies and tool output.",
@@ -4528,6 +4836,12 @@
         "allowlist_description": "Numeric Telegram user IDs permitted to DM the bot. Empty = deny all (fail closed): a Telegram bot is globally reachable by @username.",
         "description": "Talk to your agent from Telegram over the Bot API (long-polling — no webhook or public address needed). Add allowed user IDs so the bot can respond.",
         "empty_allowlist_hint": "No allowed user IDs: the bot rejects every message (fail closed). Add your numeric Telegram user ID below.",
+        "forum_activation_always": "Every message",
+        "forum_activation_description": "When the bot replies inside an allow-listed topic. A direct message is always answered, whichever option is selected here.",
+        "forum_activation_hint": "Choose Only when addressed to hold a conversation with other people in the same topic — the bot then answers only when its @handle is used, or when one of its own messages is replied to.",
+        "forum_activation_label": "Answer in topics",
+        "forum_activation_mention": "Only when addressed",
+        "forum_activation_off": "Never",
         "forum_allowlist_description": "Numeric supergroup chat_ids permitted to run forum-topic sessions. These are negative (e.g. -1001234567890) — find one by adding a bot like @getidsbot to the group. Empty = deny all groups (fail closed).",
         "forum_allowlist_label": "Allowed supergroup chat IDs",
         "forum_empty_hint": "Forum enabled but no allow-listed chats: all forum traffic is denied. Add your supergroup chat_id (a negative number like -100…).",
@@ -4535,8 +4849,12 @@
         "forum_toggle_label": "Serve forum Topics as per-Topic sessions",
         "guide_body": "Message `@BotFather` on Telegram, send `/newbot`, and follow the prompts. BotFather replies with a bot token — paste it below. To find your numeric user ID, message `@userinfobot`.",
         "guide_link_label": "Open @BotFather",
+        "show_thinking_description": "After each answer, post the reasoning as a collapsed quote you can expand. Off by default: Telegram's rate limit is per chat and shared with the streaming edits the answer already spends, so this costs one extra message per turn.",
+        "show_thinking_label": "Post the model's reasoning",
         "token_description": "From @BotFather after creating your bot (looks like 110201543:AAHdqT…).",
-        "token_placeholder": "Paste Telegram bot token (123456:ABC-…)"
+        "token_placeholder": "Paste Telegram bot token (123456:ABC-…)",
+        "voice_replies_description": "Send each answer as a voice message as well as text, using your voice_reply provider settings. Off by default: it costs a second message per turn against Telegram's per-chat rate budget, and text-to-speech may not be installed. Short answers are never spoken, and the text reply always lands first. Use /voice on or /voice off to change one conversation.",
+        "voice_replies_label": "Speak the answers"
       },
       "weComPanel": {
         "allow_all_bypass_note": "Allow-all is on: the userid list above is bypassed. It is kept for when you switch back.",
@@ -4560,7 +4878,9 @@
         "preset_custom": "Custom",
         "record_prompt": "Press keys…",
         "custom_hint": "Use at least one modifier key.",
-        "turn_keyboard_shortcuts_on_or_off_globally": "Turn keyboard shortcuts on or off globally — {{mod}} + K (this reference) always works"
+        "turn_keyboard_shortcuts_on_or_off_globally": "Turn keyboard shortcuts on or off globally — {{mod}} + K (this reference) always works",
+        "clear_shortcut": "Clear",
+        "panel_toggles": "Panel toggles"
       },
       "reportProblemCard": {
         "support": "Support",
@@ -4655,7 +4975,7 @@
         "label": "Browser"
       },
       "channels": {
-        "description": "Chat platforms the agent can send and receive on — Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, WeChat",
+        "description": "Chat platforms the agent can send and receive on",
         "label": "Channels"
       },
       "chat": {
@@ -4713,6 +5033,9 @@
     }
   },
   "utils": {
+    "agentSwitchFeedback": {
+      "turn_in_flight": "A turn is running — try again when it finishes."
+    },
     "cronUtils": {
       "create": "Create",
       "save": "Save",
@@ -4854,7 +5177,7 @@
     "colChecks": "Checks",
     "colPr": "Pull request",
     "colVerdict": "State",
-    "commitConfirm": "Commit this change to {{branch}} and push it? A published commit cannot be recalled.",
+    "commitConfirm": "Commit this change to “{{branch}}” and push it? A published commit cannot be recalled.",
     "commitFailed": "The commit was refused.",
     "commitFinding": "Commit to the branch",
     "currentRepo": "Working on",

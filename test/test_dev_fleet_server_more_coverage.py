@@ -143,6 +143,9 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(mod, "_LIVE_CHECK_AT", 0.0)
     monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
     monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+    # Shutdown admission state: each test starts with a clean (non-shutdown) process.
+    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
 
 
 # --------------------------------------------------------------------------
@@ -378,8 +381,10 @@ async def test_pr_query_one_none_on_empty_result(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pr_query_one_moves_body_to_internal_key(monkeypatch):
-    """``body`` becomes ``_body`` so _redact_pr drops it from the payload."""
-    payload = json.dumps([{"number": 7, "state": "OPEN", "body": None}])
+    """Body and head identity become internal fields omitted from the payload."""
+    payload = json.dumps([
+        {"number": 7, "state": "OPEN", "body": None, "headRefOid": "a" * 40}
+    ])
     seen = _run_cmd_queue(monkeypatch, [(0, payload, "")])
 
     pr = await mod._pr_query_one("o/r", "feat/x")
@@ -387,7 +392,9 @@ async def test_pr_query_one_moves_body_to_internal_key(monkeypatch):
     assert pr is not None
     assert pr["_repo"] == "o/r"
     assert pr["_body"] == ""
+    assert pr["_head_oid"] == "a" * 40
     assert "body" not in pr
+    assert "headRefOid" not in pr
     assert "--head" in seen[0] and "feat/x" in seen[0]
 
 

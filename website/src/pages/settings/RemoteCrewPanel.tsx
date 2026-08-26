@@ -240,7 +240,6 @@ function CrewRow({
   onEditRebase,
   editing,
   blocked,
-  otherPorts,
 }: {
   inst: InstanceView
   cloudTag: string | null
@@ -270,8 +269,6 @@ function CrewRow({
   editing: boolean
   /** This row's Edit was refused because another row holds unsaved changes. */
   blocked: boolean
-  /** Ports held by the OTHER crews, so the edit form can flag a real conflict. */
-  otherPorts: number[]
 }) {
   const connected = inst.status.state === 'connected'
   const isCloud = cloudTag !== null
@@ -463,7 +460,6 @@ function CrewRow({
       <EditInstanceForm
         key={`edit-${inst.id}-${editDraftSeq}`}
         inst={inst}
-        usedPorts={otherPorts}
         onSaved={onEditSaved}
         onCancel={() => onEdit(null)}
         draft={editDraft}
@@ -1005,7 +1001,7 @@ export function RemoteCrewPanel() {
   if (disabled) {
     return (
       <Card>
-        <div className="flex items-center gap-2 text-text font-medium mb-1">
+        <div className="flex items-center gap-2 text-text font-medium mb-1" data-setting-label={i18nT('pages.settings.instancesPanel.enable_remote_crew_management')}>
           <Server className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.multi_instance_management_is_off')}
         </div>
         <p className="text-[13px] text-muted mb-3">{i18nT('pages.settings.instancesPanel.enable_it_to_let_this_gateway_open_ssh_tunnels_t')}</p>
@@ -1192,7 +1188,6 @@ export function RemoteCrewPanel() {
                       if (updated.status?.state !== 'connected') dispatch(removeWarm(inst.id))
                       reloadInstances()
                     }}
-                    otherPorts={instances.filter(i => i.id !== inst.id).map(i => i.remote_port)}
                   />
                 ))}
                 {inProgress.length === 0 && instances.length === 0 && (
@@ -1204,7 +1199,7 @@ export function RemoteCrewPanel() {
             {confirmRemoveId !== null && <p className="mt-2 text-[12px] text-warn">{i18nT('pages.settings.remoteCrewPanel.remove_warning')}</p>}
           </Card>
 
-          <AddInstanceForm onAdded={reloadInstances} usedPorts={instances.map(i => i.remote_port)} />
+          <AddInstanceForm onAdded={reloadInstances} />
         </div>
       ) : (
         <div className="space-y-4">

@@ -143,6 +143,25 @@ describe('App routing', () => {
       onboarded: false,
       import_onboarded: false,
     } as never)
+    // Keep the import chapter open after its scan. An empty scan deliberately
+    // auto-completes the chapter, so asserting on the transient dialog races
+    // that completion under a loaded test shard.
+    vi.mocked(api.onboardingImportScan).mockResolvedValueOnce({
+      sources: [{
+        id: 'codex',
+        name: 'Codex',
+        detected: true,
+        detail: '~/.codex',
+        categories: [{
+          id: 'instructions',
+          label: 'Instructions',
+          count: 1,
+          description: 'Agent instructions',
+        }],
+      }],
+      skipped: [],
+      merge_only: true,
+    } as never)
 
     renderWithProviders(<App />, { route: '/chat' })
 
@@ -1177,13 +1196,19 @@ describe('mobile nav drawer insets', () => {
   })
 
   it('spans the viewport height so both margins resolve', () => {
-    // `top-0 bottom-0` with a margin on each end resolves the height to
+    // An anchor on BOTH ends plus a margin on each resolves the height to
     // viewport-16px. Dropping either anchor would make the margins inert (auto
     // height) and re-open the flush-top defect from the other direction.
+    //
+    // The safe-area variants satisfy this the same way the plain ones do: they
+    // set top/bottom to env(safe-area-inset-*), a definite length that is 0 on
+    // hardware without a notch. So accept either form per end, but keep
+    // requiring that BOTH ends are anchored -- that is the actual invariant,
+    // and the literal class name is not.
     const classes = mobileDrawerClasses()
     expect(classes).toContain('fixed')
-    expect(classes).toContain('top-0')
-    expect(classes).toContain('bottom-0')
+    expect(classes.some(c => c === 'top-0' || c === 'top-safe'), `expected a top anchor, got: ${classes.join(' ')}`).toBe(true)
+    expect(classes.some(c => c === 'bottom-0' || c === 'bottom-safe'), `expected a bottom anchor, got: ${classes.join(' ')}`).toBe(true)
   })
 })
 
@@ -1300,10 +1325,18 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120), so the API call lands a
+    // microtask after the keydown — flush with an async act.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'reviewer')
+    // The pick must land in the store WITHOUT a slots round trip (#5120):
+    // no websocket exists in this harness, so only the optimistic write can
+    // move the row. The mock resolves {} — the requested-name fallback path.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.agent,
+    ).toBe('reviewer'))
   })
 
   it('does not call api.chatSlotAgent when no active slot', async () => {
@@ -1331,7 +1364,9 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
 
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120): flush the microtask
+    // chain so both the API call and the failure notice land.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key, code, altKey: true, shiftKey: true, bubbles: true }))
     })
 
@@ -1397,6 +1432,51 @@ describe('onCycleAgent edge cases', () => {
     })
     expect(api.chatSlotAgent).not.toHaveBeenCalled()
     useAgentsMock.mockReturnValue({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })
+  })
+})
+
+describe('onCycleReasoningEffort keyboard shortcut (#5120)', () => {
+  it('steps a burst from the in-flight target and writes the adjudicated level', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'max' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    // Two presses in one synchronous batch: the first pick is still in
+    // flight when the second press computes its base. From 'max' the first
+    // press targets '' (clear the override — a REAL target), so the second
+    // press's base MUST come from pendingSlotSwitchTarget: reading the store
+    // (still 'max', nothing settled) would issue '' twice, and the ''-falsy
+    // accessor would misread the in-flight '' the same way.
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(1, 'slot-1', '')
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(2, 'slot-1', 'low')
+    // The adjudicated survivor (the newest pick) lands in the store without
+    // a slots round trip — no websocket exists in this harness.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe('low'))
+  })
+
+  it('cycles backward on Alt+Shift+C and writes the store', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'low' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    // 'low' is index 1; backward reaches '' (provider default).
+    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('slot-1', '')
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe(''))
   })
 })
 
@@ -1503,7 +1583,9 @@ describe('onCycleApprovalMode and onCyclePrevAgent shortcuts', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'reviewer' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // Async act: the switch protocol (#5120) chains the wire call on a
+    // microtask, so the mock is invoked a tick after the keydown.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', code: 'KeyZ', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'kirocrew')

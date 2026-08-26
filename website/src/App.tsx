@@ -1,9 +1,11 @@
-import { useEffect, useState, useCallback, useRef, useMemo, createContext, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useAppSelector, useAppDispatch, useAppStore, store } from './store'
-import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds, changeApprovalMode } from './store/dashboardSlice'
+import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds, changeApprovalMode, updateSlot } from './store/dashboardSlice'
+import { pendingSlotSwitch, pendingSlotSwitchTarget, performSlotSwitch } from './lib/slotSwitch'
+import { performAgentSlotSwitch } from './lib/agentSwitch'
 // Side-effect: registers every built-in surface in the registry. MUST run
 // before `getBuiltinSurfaces()` is invoked below to compute `NAV_ITEMS`.
 import './surfaces/builtins'
@@ -14,9 +16,10 @@ import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/arti
 import { applyNavIntentInMain } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
 import { agentSwitchFailureMessage } from './utils/agentSwitchFeedback'
+import { readSendReceipt } from './utils/sendDelivery'
 import { updateAffordance } from './utils/updateAffordance'
 import { metricColor } from './utils/metricColor'
-import { fetchNotifications, ackNotification } from './store/notificationsSlice'
+import { fetchNotifications, ackNotification, armBootNotificationsFallback } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useDashboardHealthProbe } from './hooks/useDashboardHealthProbe'
 import { useTheme } from './hooks/useTheme'
@@ -39,7 +42,7 @@ import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
-import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, Fullscreen, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
+import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, Fullscreen, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -120,6 +123,16 @@ import { i18nT } from './i18n/t'
 import { appNavTarget } from './appNav'
 import { resolveSlotOverlays, type SlotOwners } from './apps/overlaySlots'
 import { fmtCompact, fmtPercent } from './i18n/format'
+
+// Lazy on purpose: the update-found popup (its policy module, Trans runtime
+// wiring, and mutation plumbing) is dead weight for every session without an
+// update, and the app-core chunk is at its size budget. The `updateAvailable`
+// mount gate at the render site means the chunk is fetched exactly when it
+// can render.
+const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
+// Same boundary, same reason: the pill renders nothing without an update,
+// so its code rides the on-demand chunk instead of the app core.
+const UpdatePill = lazy(() => import('./components/UpdatePill'))
 
 const MAX_KIRO_BONUS_GRANT_NAME_CHARS = 100
 const MAX_KIRO_BONUS_CREDITS = 1_000_000
@@ -615,8 +628,8 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
   // offers to re-collapse rather than reveal "0 more".
   const showsCollapse = expanded || hiddenCount === 0
   const Icon = showsCollapse ? ChevronUp : MoreHorizontal
-  const labelText = showsCollapse ? i18nT('app.show_less') : `${hiddenCount} more`
-  const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : `Show ${hiddenCount} more app${hiddenCount === 1 ? '' : 's'}`
+  const labelText = showsCollapse ? i18nT('app.show_less') : i18nT('app.n_more', { count: hiddenCount })
+  const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : i18nT('app.show_more_apps', { count: hiddenCount })
   return (
     <button ref={rowRef}
       className="group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none w-full"
@@ -631,7 +644,10 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
       // click), so it also clears a label that focus had just re-armed.
       onClick={() => { dismissTip(); onClick() }}
       aria-expanded={expanded}
-      aria-label={titleText}
+      // WCAG 2.5.3 Label in Name: while the text label is visible the accessible
+      // name must contain it, so the name IS the label; collapsed (icon-only)
+      // mode uses the fuller title instead.
+      aria-label={collapsed ? titleText : labelText}
       title={titleText}
       onMouseEnter={showTip}
       onMouseLeave={hideTip}
@@ -791,7 +807,7 @@ function NotificationsBellButton() {
         ref={bellRef}
         className={`flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 relative ${open ? 'text-accent' : 'text-muted hover:text-text'}`}
         onClick={() => { if (open) closePanel(); else openPanel() }}
-        title={unacked.length > 0 ? `${unacked.length} notification${unacked.length === 1 ? '' : 's'}` : i18nT('app.notifications')}
+        title={unacked.length > 0 ? i18nT('app.notification_count', { count: unacked.length }) : i18nT('app.notifications')}
         aria-label={i18nT('app.notifications')}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -806,8 +822,15 @@ function NotificationsBellButton() {
       {(open || closing) && createPortal(
         <div
           ref={popoverRef}
-          className="fixed z-[60] pointer-events-none"
-          style={isMobile ? { top: 48, bottom: 0, left: 0, right: 0 } : { top: 48, bottom: 0, right: 0, left: 12 }}
+          // Anchored 48px below the viewport top, which the shell has pushed
+          // down by the top inset — top-safe-offset-[48px] adds both.
+          //
+          // Both branches inset horizontally too, because a landscape iPhone is
+          // ~852px wide and so takes the NON-mobile branch (isMobile is
+          // max-width:767px) — that is where the sensor housing sits beside the
+          // sheet's right edge. left-safe-or-3 keeps the desktop 12px gutter
+          // and widens to the inset only when there is one.
+          className={`fixed z-[60] pointer-events-none top-safe-offset-[48px] bottom-safe ${isMobile ? 'left-safe right-safe' : 'right-safe left-safe-or-3'}`}
         >
           <ErrorBoundary
             scope="notifications-bell"
@@ -1409,9 +1432,13 @@ export default function App() {
   // shown up while only the Main branch was gated.
   const advertisedNavItems = useMemo(
     () => NAV_ITEMS.filter(surfacePreviewEnabled),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the revision is an
-    // invalidation token: what `surfacePreviewEnabled` reads lives in
-    // localStorage, not in React state, so nothing else here can express the dep.
+    // The revision is an invalidation token: what `surfacePreviewEnabled` reads
+    // lives in localStorage, not in React state, so nothing else here can
+    // express the dep. The directive stays on ONE line directly above the deps
+    // array -- `eslint-disable-next-line` targets the literal next line, so a
+    // rationale wrapped after it aims the directive at its own continuation and
+    // suppresses nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [previewFlagRevision],
   )
   // Apps nav reorder is dnd-kit sortable (mirrors QueueStack): rows reflow to
@@ -1630,10 +1657,18 @@ export default function App() {
     const timer = window.setTimeout(() => dispatch(setAgentSwitchNotice(null)), 6000)
     return () => window.clearTimeout(timer)
   }, [agentSwitchNotice, dispatch])
-  const switchActiveSlotAgent = useCallback((slot: string, agent: string) => {
+  const switchActiveSlotAgent = useCallback(async (slot: string, agent: string) => {
     dispatch(setAgentSwitchNotice(null))
-    void api.chatSlotAgent(slot, agent)
-      .catch(error => dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error))))
+    try {
+      // Same protocol as onCycleModel below (#4523): without the store write
+      // the acting tab depends on the coalesced slots rebroadcast to see its
+      // own pick. performAgentSlotSwitch mirrors exactly what the response
+      // names ({agent, workspace} as one adjudicated pair; project is left
+      // to the rebroadcast).
+      await performAgentSlotSwitch(slot, agent, store.dispatch)
+    } catch (error) {
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error)))
+    }
   }, [dispatch])
   useKeyboardShortcuts({ onToggleShortcutsModal: toggleShortcutsModal, onNewChat: () => newChatMutation.mutate(), disabled: shortcutsOpen,
     onToggleFocusMode: toggleFocusMode,
@@ -1642,40 +1677,75 @@ export default function App() {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot || installedAgents.length === 0) return
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentAgent = currentSlot?.agent || defaultAgent
+      // Step from the newest in-flight target when one exists — see
+      // onCycleModel below. Agent names are never '', so the ''-falsy
+      // accessor is safe here.
+      const currentAgent = pendingSlotSwitch('agent', activeSlot) || currentSlot?.agent || defaultAgent
       const idx = installedAgents.findIndex((a: { name: string }) => a.name === currentAgent)
       const nextIdx = (idx + 1) % installedAgents.length
-      switchActiveSlotAgent(activeSlot, installedAgents[nextIdx].name)
+      void switchActiveSlotAgent(activeSlot, installedAgents[nextIdx].name)
     },
     onCyclePrevAgent: () => {
       const slots = store.getState().dashboard.slots
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot || installedAgents.length === 0) return
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentAgent = currentSlot?.agent || defaultAgent
+      // See onCycleAgent above.
+      const currentAgent = pendingSlotSwitch('agent', activeSlot) || currentSlot?.agent || defaultAgent
       const idx = installedAgents.findIndex((a: { name: string }) => a.name === currentAgent)
       const prevIdx = (idx - 1 + installedAgents.length) % installedAgents.length
-      switchActiveSlotAgent(activeSlot, installedAgents[prevIdx].name)
+      void switchActiveSlotAgent(activeSlot, installedAgents[prevIdx].name)
     },
-    onCycleReasoningEffort: () => {
+    onCycleReasoningEffort: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const current = currentSlot?.reasoning_effort || ''
-      const idx = REASONING_EFFORT_LEVELS.indexOf(current)
+      // Step from the newest in-flight target (see onCycleModel below). ''
+      // is a REAL effort target (provider default), so this base uses the
+      // null-aware accessor — the ''-falsy one would misread an in-flight
+      // "back to default" as "nothing pending" and mis-step the burst.
+      const base = pendingSlotSwitchTarget('reasoning_effort', activeSlot)
+        ?? (currentSlot?.reasoning_effort || '')
+      const idx = REASONING_EFFORT_LEVELS.indexOf(base)
       const nextIdx = (idx + 1) % REASONING_EFFORT_LEVELS.length
-      api.chatSlotReasoningEffort(activeSlot, REASONING_EFFORT_LEVELS[nextIdx])
+      const level = REASONING_EFFORT_LEVELS[nextIdx]
+      try {
+        await performSlotSwitch('reasoning_effort', activeSlot, level,
+          async () => {
+            const r = await api.chatSlotReasoningEffort(activeSlot, level)
+            return r?.reasoning_effort ?? level
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, reasoning_effort: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCycleReasoningEffort failed', e)
+      }
     },
-    onCyclePrevReasoningEffort: () => {
+    onCyclePrevReasoningEffort: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const current = currentSlot?.reasoning_effort || ''
-      const idx = REASONING_EFFORT_LEVELS.indexOf(current)
+      // See onCycleReasoningEffort above.
+      const base = pendingSlotSwitchTarget('reasoning_effort', activeSlot)
+        ?? (currentSlot?.reasoning_effort || '')
+      const idx = REASONING_EFFORT_LEVELS.indexOf(base)
       const prevIdx = (idx - 1 + REASONING_EFFORT_LEVELS.length) % REASONING_EFFORT_LEVELS.length
-      api.chatSlotReasoningEffort(activeSlot, REASONING_EFFORT_LEVELS[prevIdx])
+      const level = REASONING_EFFORT_LEVELS[prevIdx]
+      try {
+        await performSlotSwitch('reasoning_effort', activeSlot, level,
+          async () => {
+            const r = await api.chatSlotReasoningEffort(activeSlot, level)
+            return r?.reasoning_effort ?? level
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, reasoning_effort: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCyclePrevReasoningEffort failed', e)
+      }
     },
     onCycleApprovalMode: () => {
       const state = store.getState()
@@ -1695,30 +1765,69 @@ export default function App() {
       const prev = APPROVAL_MODE_LEVELS[(idx - 1 + APPROVAL_MODE_LEVELS.length) % APPROVAL_MODE_LEVELS.length]
       store.dispatch(changeApprovalMode({ mode: prev, slot: activeSlot }))
     },
-    onCycleModel: () => {
+    onCycleModel: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const models = queryClient.getQueryData<{ name: string }[]>(['available-models', provider.id])
       if (!models || models.length === 0) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentModel = currentSlot?.model || ''
-      const idx = currentModel ? models.findIndex(m => m.name === currentModel) : -1
+      // Step from the newest IN-FLIGHT target when one exists: each press of a
+      // burst must advance one step even though the store base has not
+      // settled yet — recomputing from the store made a rapid triple-press
+      // send the same "next" three times and land one step ahead (#4523).
+      const base = pendingSlotSwitch('model', activeSlot) || currentSlot?.model || ''
+      const idx = base ? models.findIndex(m => m.name === base) : -1
       const nextIdx = (idx + 1) % models.length
-      api.chatSlotModel(activeSlot, models[nextIdx].name)
+      const name = models[nextIdx].name
+      // Same protocol as ChatPage.switchModel (#4523): without the store
+      // write a dead websocket wedges the cycle on one step; the shared
+      // per-slot registry means neither the other cycle direction, the
+      // dropdown, nor another slot's press can interleave stale.
+      try {
+        await performSlotSwitch('model', activeSlot, name,
+          async () => {
+            const r = await api.chatSlotModel(activeSlot, name)
+            return r?.model ?? name
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCycleModel failed', e)
+      }
     },
-    onCyclePrevModel: () => {
+    onCyclePrevModel: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const models = queryClient.getQueryData<{ name: string }[]>(['available-models', provider.id])
       if (!models || models.length === 0) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentModel = currentSlot?.model || ''
-      const idx = currentModel ? models.findIndex(m => m.name === currentModel) : -1
+      // See onCycleModel above.
+      const base = pendingSlotSwitch('model', activeSlot) || currentSlot?.model || ''
+      const idx = base ? models.findIndex(m => m.name === base) : -1
       const prevIdx = idx <= 0 ? models.length - 1 : idx - 1
-      api.chatSlotModel(activeSlot, models[prevIdx].name)
+      const name = models[prevIdx].name
+      try {
+        await performSlotSwitch('model', activeSlot, name,
+          async () => {
+            const r = await api.chatSlotModel(activeSlot, name)
+            return r?.model ?? name
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCyclePrevModel failed', e)
+      }
     },
+    // Panel toggles. The sidebar lives here in App; the session list and the
+    // activity panel live on the chat page and already listen for these window
+    // events (their in-header buttons dispatch the same ones).
+    onToggleLeftSidebar: () => toggleNav(),
+    onToggleSessionPanel: () => window.dispatchEvent(new Event('toggle-pin-chat-sidebar')),
+    onToggleSidePanel: () => window.dispatchEvent(new Event('toggle-activity-panel')),
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,
   // 2=first remote, … — matching the InstanceTabBar left-to-right tab order.
@@ -1738,7 +1847,7 @@ export default function App() {
   // backend cache has not warmed yet" (null) apart from "the request failed"
   // (undefined) — both are falsy. Without it a failing endpoint renders as a
   // spinner that never resolves, since the 30s refetch keeps retrying forever.
-  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | null>({
+  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | 'api-key' | null>({
     queryKey: ['kiro-usage'],
     queryFn: () => api.sessionsUsage().then(d => {
       const u: KiroUsagePayload = d?.usage || {}
@@ -1807,8 +1916,11 @@ export default function App() {
         }
         return normalized
       }
-      // Non-Kiro provider (kiro-cli absent) -> hide. Empty cache (Kiro warming) -> spinner.
-      if (u.available === false) return 'none' as const
+      // Non-Kiro provider (kiro-cli absent) -> hide. API-key auth -> terminal
+      // "not available for this auth type" (the pill and modal explain instead
+      // of hiding, because for this account type the state is permanent, not a
+      // warming cache). Empty cache (Kiro warming) -> spinner.
+      if (u.available === false) return u.reason === 'api_key_auth' ? ('api-key' as const) : ('none' as const)
       return null
     }),
     refetchInterval: 30_000,
@@ -1898,9 +2010,16 @@ export default function App() {
         gcOrphanedStorage(liveIds)
       }
     })
-    dispatch(fetchNotifications())
+    // The boot notifications fetch is owned by the WebSocket first-connect
+    // handler (its snapshot is taken after socket registration, so nothing
+    // can fall between snapshot and push -- see notificationsSlice). This
+    // only arms the fallback for a socket that never connects.
+    // Return the thunk promise: a late first connect serializes its own fetch
+    // behind this one via markBootNotificationsFetched() (see notificationsSlice).
+    const disarmNotificationsFallback = armBootNotificationsFallback(() => dispatch(fetchNotifications()))
     // Fetch status immediately to sync YOLO state (WS status push is periodic)
     api.status().then(s => { dispatch(sseStatus(s)); recordSessionStart(s) }).catch(() => {})
+    return disarmNotificationsFallback
   }, [dispatch])
   const { subscribeLogs, subscribeSubagents, forceReconnect } = useWebSocket()
   useDashboardHealthProbe(forceReconnect)
@@ -2028,10 +2147,14 @@ export default function App() {
     } catch { /* Send the visible request even if hidden context is unavailable. */ }
     try {
       const r = await api.sendChat(visibleMessage, slot, colorTheme)
-      const body = await r.json().catch(() => ({}))
+      const { body, outcome } = await readSendReceipt(r)
       // Resolution is not success: the server accepted neither `ok` nor
-      // `queued`, so no turn started and no WS response is coming.
-      if (!body.ok && !body.queued) reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
+      // `queued`, so no turn started and no WS response is coming. An UNKNOWN
+      // outcome (a 2xx whose body would not parse) is deliberately silent — the
+      // request WAS accepted, so a turn may be running, and this row is the only
+      // signal the pill has: claiming a failure it cannot prove tells the user to
+      // resend a request that already went out.
+      if (outcome === 'refused') reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
     } catch { reportFailedSend() }
   }, [dispatch, navigate, colorTheme, appStore])
 
@@ -2146,7 +2269,7 @@ export default function App() {
       <div className="absolute inset-0" style={{ display: activeInstanceId === null ? 'block' : 'none' }}>
     <div
       data-testid="dashboard-shell"
-      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
+      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg p-safe ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
       // Retire the entrance animation once it has played, so re-showing this
       // pane cannot replay it. Guarded on BOTH the keyframe name and the event
       // target: `animationend` bubbles, and descendants (banners, cards) use
@@ -2270,20 +2393,26 @@ export default function App() {
           {!isMobile && isWinElectron && <WindowsTitlebarMenu />}
 
           {isMobile && (
-            <button className="p-2 rounded-md bg-transparent border-none cursor-pointer text-muted hover:text-text shrink-0" onClick={toggleNav} aria-label={i18nT('app.open_menu')}>
-              {/* `Menu` is the one icon in this app whose artwork does NOT fill its
-                  box: lucide draws its three rules from x=4 in a 24-unit viewBox, and
-                  the round cap adds half a stroke, so 3 units of the box are empty on
-                  the left. At size 20 that is 3 * 20/24 = 2.5px, which put the visible
-                  glyph at 18.5px while the button's box sat correctly on the 16px
-                  gutter -- reading as indented against a card border directly below it.
-                  A transform, not a margin: the box, the hit target and the hover pill
-                  stay on the 8px grid, and no sibling in the cluster shifts. Sized off
-                  the icon's own geometry, which `narrowFirstBaseline.test.ts` re-derives
-                  from lucide so a version bump that recentres `Menu` fails loudly.
-                  Icons that DO fill their box need none of this: the chat session
-                  toggle's `MessageSquare` starts at x=2, i.e. 0.67px at size 16. */}
-              <Menu size={20} className="-translate-x-[2.5px]" />
+            <button className="group p-2 rounded-md bg-transparent border-none cursor-pointer text-muted hover:text-text shrink-0" onClick={toggleNav} aria-label={i18nT('app.open_menu')}>
+              {/* The product logo, not a generic menu glyph. A narrow layout has exactly
+                  one nav affordance, and it opens the same rail whose header carries this
+                  same `avatar` on a wide one -- so it is the same asset, the same
+                  `rounded-md object-contain` treatment and the same hover tilt, which is
+                  live here because this bar is what a NARROW WINDOW gets, not only a
+                  touch device. Reading `avatar` rather than importing a file is what
+                  keeps a theme-supplied or user-configured logo in step: the branding
+                  registry resolves it once for the whole shell.
+
+                  A full-colour raster mark is an <img>, which is exactly what the
+                  `use-lucide-icons` rule's brand-mark exception prescribes -- a CSS mask
+                  over `currentColor` would flatten the art to one colour.
+
+                  Square box, so no optical correction exists: the art is square and
+                  `object-contain` fills the box, putting the ink on the 16px page gutter
+                  (topbar pl-2 + this button's p-2) that the page title and every card's
+                  left edge below it sit on, with the button's own box at 24 + 16 = 40px
+                  for the tap target. `narrowFirstBaseline.test.ts` re-derives that sum. */}
+              <img src={avatar} alt="" aria-hidden="true" className="w-6 h-6 rounded-md shrink-0 object-contain transition-transform duration-300 group-hover:rotate-[-8deg]" />
             </button>
           )}
           <InstanceTabBar variant="inline" />
@@ -2536,6 +2665,13 @@ export default function App() {
                 // spinner are both dropped: without it the failed and warming
                 // states are one coin glyph apart in opacity alone.
                 segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_unavailable')} aria-label={i18nT('app.kiro_credit_usage_unavailable')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+              } else if (kiroUsageState === 'api-key') {
+                // API-key auth: the usage API needs an SSO/OIDC token this
+                // account type never has, so this is a PERMANENT state, not a
+                // failure. Same terminal dash as 'failed' (nothing is in
+                // flight), but the label says why, and clicking through opens
+                // the modal's fuller explanation.
+                segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_api_key')} aria-label={i18nT('app.kiro_credit_usage_api_key')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
               } else if (!kiroUsageState) {
                 segments.push(<button key="usage" className={`${seg} text-muted`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_checking')} aria-label={i18nT('app.kiro_credit_usage_checking_2')}><Coins size={12} /> {!isMobile && <Loader2 size={11} className="animate-spin" />}</button>)
               } else {
@@ -2600,6 +2736,16 @@ export default function App() {
               <w.component />
             </ErrorBoundary>
           ))}
+          {/* Update pill — present only while an update exists; deep-links to
+              Settings › About. NOT gated on viewport: it is the download's
+              only progress home, and hiding it on narrow windows would make
+              "Download" consent produce zero visible feedback until the
+              staged-build modal fires minutes later. */}
+          {updateAvailable && (
+            <Suspense fallback={null}>
+              <UpdatePill />
+            </Suspense>
+          )}
           {/* Feedback — "Request a Feature" plus, on a prerelease build, a
               channel chip that opens the same Report a Problem flow. Its own
               bordered pill (28px tall, 12px radius), separated from the readout
@@ -2621,7 +2767,7 @@ export default function App() {
       </header>
 
       {agentSwitchNotice && (
-        <div role="status" className="fixed z-[70] top-14 left-4 right-4 sm:left-auto sm:w-[440px] bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 shadow-xl animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
+        <div role="status" className="fixed z-[70] top-safe-offset-14 left-safe-offset-4 right-safe-offset-4 sm:left-auto sm:w-[440px] bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 shadow-xl animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
           <span className="text-sm text-text flex-1">{agentSwitchNotice.message}</span>
           <button onClick={() => dispatch(setAgentSwitchNotice(null))} aria-label={i18nT('app.dismiss')} className="text-muted hover:text-text leading-none p-0.5"><X className="lucide-inline w-4 h-4" /></button>
         </div>
@@ -2712,6 +2858,11 @@ export default function App() {
       {/* Updating overlay */}
       {(updating || showUpdateModal) && <UpdateOverlay onCancel={() => { setUpdating(false); setShowUpdateModal(false) }} />}
       <UpdateModal />
+      {updateAvailable && (
+        <Suspense fallback={null}>
+          <UpdateFoundModal />
+        </Suspense>
+      )}
 
       {/* First-run modal chrome mounted ONCE (scrim + accent panel + floating
           mascots) so the import→customize hand-off swaps only the right-column
@@ -3160,7 +3311,7 @@ export default function App() {
                 animate={{ width: 220, x: 0 }}
                 exit={{ x: -240 }}
                 transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
-                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-0 left-0 bottom-0"
+                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-safe left-safe bottom-safe"
                 role="navigation"
                 aria-label={i18nT('app.main_navigation')}
               >

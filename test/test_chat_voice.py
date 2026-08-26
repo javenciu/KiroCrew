@@ -381,8 +381,8 @@ class TestVoiceVoices:
         config_dir().mkdir(parents=True, exist_ok=True)
         _consent_to_polly(profile="", region="")
         # The gate also verifies the LIVE account, which would spawn the AWS CLI
-        # and collide with this class's single-argument `shutil.which` stub.
-        # These cases are about the catalogue, so return a matching identity.
+        # behind this class's `resolve_polly_cli` stub. These cases are about
+        # the catalogue, so return a matching identity.
         from kiro_crew import aws_consent
 
         async def _probe(_profile, _region, *, use_cache=True):
@@ -420,7 +420,9 @@ class TestVoiceVoices:
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
-        monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/aws")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
 
         from kiro_crew.dashboard.chat_voice import api_voice_voices
         app = web.Application()
@@ -479,7 +481,9 @@ class TestVoiceVoices:
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
-        monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/aws")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
 
         from kiro_crew.dashboard.chat_voice import api_voice_voices
         app = web.Application()
@@ -502,19 +506,19 @@ class TestVoiceVoices:
 
         async def mock_exec(*args, **kwargs):
             proc = MagicMock()
-
-            async def comm():
-                raise asyncio.TimeoutError()
-            proc.communicate = comm
+            # First await (under wait_for) times out; the second (the reap
+            # after kill) drains the pipes and returns.
+            proc.communicate = AsyncMock(
+                side_effect=[asyncio.TimeoutError(), (b"", b"")]
+            )
             proc.kill = MagicMock()
-
-            async def _wait():
-                return 0
-            proc.wait = _wait
+            proc.wait = AsyncMock()
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
-        monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/aws")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
 
         from kiro_crew.dashboard.chat_voice import api_voice_voices
         app = web.Application()
@@ -526,6 +530,52 @@ class TestVoiceVoices:
             assert resp.status == 504
 
     @pytest.mark.asyncio
+    async def test_voices_timeout_reaps_child_via_communicate_not_wait(
+        self, tmp_path, monkeypatch
+    ):
+        """After a timeout kills the describe-voices child, the cleanup must
+        call ``communicate()`` -- not ``wait()`` -- so that PIPE buffers are
+        drained. A child blocked writing to a full stderr PIPE would hang the
+        request handler if only ``wait()`` were used (#5975)."""
+        import asyncio
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=[asyncio.TimeoutError(), (b"", b"")])
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+
+        async def mock_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
+
+        from kiro_crew.dashboard.chat_voice import api_voice_voices
+        app = web.Application()
+        app["state"] = _make_state(tmp_path)
+        app.router.add_get("/api/voice/voices", api_voice_voices)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/voice/voices")
+            assert resp.status == 504
+
+        proc.kill.assert_called_once()
+        # The critical pin: reap via communicate(), not wait(). The handler
+        # awaits communicate once under wait_for; the reap must award a
+        # SECOND await, and wait() must never be touched. (A bare
+        # ``communicate.assert_awaited()`` would pass even against a
+        # wait()-based reap, so it must be this count/not_awaited shape.)
+        assert proc.communicate.await_count == 2
+        proc.wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_voices_aws_not_found(self, tmp_path, monkeypatch):
         """aws CLI absent from PATH → 200 with empty list, no subprocess spawn."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -534,7 +584,7 @@ class TestVoiceVoices:
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
 
-        monkeypatch.setattr("shutil.which", lambda cmd: None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: None)
         spawn = AsyncMock()
         monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
 
@@ -565,7 +615,9 @@ class TestVoiceVoices:
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
 
-        monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/aws")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
 
         async def mock_exec(*args, **kwargs):
             raise FileNotFoundError(2, "No such file or directory", "aws")

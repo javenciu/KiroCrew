@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import cli_doctor
 
 
@@ -504,10 +507,6 @@ class TestDoctorKas:
         self._patch_cfg(monkeypatch, "kas")
         from kiro_crew.acp import kas_assets, kas_auth
 
-        # Overrides select the direct-spawn path, whose diagnostics these
-        # assertions describe; without them doctor reports the cli-fronted
-        # branch instead.
-        monkeypatch.setenv(kas_assets.ENV_KAS_SCRIPT, "/nonexistent/acp-server.js")
         monkeypatch.setattr(kas_assets, "find_kas_node", lambda: None)
         monkeypatch.setattr(kas_assets, "find_kas_server_script", lambda: None)
 
@@ -528,7 +527,6 @@ class TestDoctorKas:
         self._patch_cfg(monkeypatch, "kas")
         from kiro_crew.acp import kas_assets, kas_auth
 
-        monkeypatch.setenv(kas_assets.ENV_KAS_SCRIPT, "/x/kas/9.9.9-hash/nm/acp-server.js")
         monkeypatch.setattr(kas_assets, "find_kas_node", lambda: Path("/x/node"))
         monkeypatch.setattr(
             kas_assets,
@@ -545,45 +543,6 @@ class TestDoctorKas:
         out = capsys.readouterr().out
         assert "9.9.9-hash" in out
         assert "2099-01-01T00:00:00Z" in out
-        assert "SECRET-DO-NOT-PRINT" not in out
-        assert issues == []
-
-    def test_cli_fronted_missing_kiro_cli_appends_issue(self, monkeypatch, capsys) -> None:
-        """Default (no override): readiness is kiro-cli itself being present."""
-        self._patch_cfg(monkeypatch, "kas")
-        from kiro_crew.acp import kas_assets, kas_auth
-
-        monkeypatch.delenv(kas_assets.ENV_KAS_NODE, raising=False)
-        monkeypatch.delenv(kas_assets.ENV_KAS_SCRIPT, raising=False)
-        monkeypatch.setattr(cli_doctor.shutil, "which", lambda _name: None)
-
-        async def _raise(*, timeout: float = 8.0):
-            raise kas_auth.KasAuthCallbackError("kiro-cli not found; cannot obtain a KAS token")
-
-        monkeypatch.setattr(kas_auth, "resolve_kas_access_token", _raise)
-        issues: list[str] = []
-        cli_doctor._doctor_kas(issues)
-        out = capsys.readouterr().out
-        assert "kiro-cli acp --agent-engine v3" in out
-        assert "KAS backend selected but kiro-cli not found" in issues
-
-    def test_cli_fronted_ready_reports_engine_flag(self, monkeypatch, capsys) -> None:
-        self._patch_cfg(monkeypatch, "kas")
-        from kiro_crew.acp import kas_assets, kas_auth
-
-        monkeypatch.delenv(kas_assets.ENV_KAS_NODE, raising=False)
-        monkeypatch.delenv(kas_assets.ENV_KAS_SCRIPT, raising=False)
-        monkeypatch.setattr(cli_doctor.shutil, "which", lambda _name: "/usr/bin/kiro-cli")
-        monkeypatch.setattr(cli_doctor, "_kas_engine_flag_supported", lambda _bin: True)
-
-        async def _ok(*, timeout: float = 8.0):
-            return {"accessToken": "SECRET-DO-NOT-PRINT", "expiresAt": "2099-01-01T00:00:00Z"}
-
-        monkeypatch.setattr(kas_auth, "resolve_kas_access_token", _ok)
-        issues: list[str] = []
-        cli_doctor._doctor_kas(issues)
-        out = capsys.readouterr().out
-        assert "engine flag" in out
         assert "SECRET-DO-NOT-PRINT" not in out
         assert issues == []
 
@@ -914,13 +873,17 @@ class TestSourceCheckout:
     def test_git_line_pins_git_and_returns_none_when_untrusted(
         self, monkeypatch, tmp_path
     ) -> None:
-        """git resolves via trusted_system_bin; a miss means no subprocess at all.
+        """git resolves via trusted_git_bin; a miss means no subprocess at all.
 
         Doctor runs with operator privileges, so a ``git`` shim planted in an
         agent-writable PATH directory must never execute: when the trusted
-        resolver declines, _git_line collapses to None without spawning.
-        When it resolves, the pinned absolute path — not the bare name — is
-        what reaches argv[0].
+        resolver declines, _git_line collapses to None without spawning. When it
+        resolves, the pinned absolute path -- not the bare name -- reaches argv[0].
+
+        The resolver itself (system dirs plus the Windows install-root fallback)
+        is tested in `test_platform_compat`; this asserts what the doctor does
+        with each OUTCOME, which is why it patches the resolver rather than the
+        directories behind it.
         """
         import subprocess as _sp
 
@@ -932,82 +895,17 @@ class TestSourceCheckout:
 
         monkeypatch.setattr(cli_doctor.subprocess, "run", fake_run)
 
-        # Miss: no trusted git -> None, and no process spawned. Neutralize
-        # the Windows fallback too so the miss is a miss on every platform
-        # (on a real Windows runner _windows_git_bin finds the actual Git
-        # for Windows install; the fallback has its own dedicated test).
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None
-        )
-        monkeypatch.setattr(cli_doctor, "_windows_git_bin", lambda: None)
+        # Miss: no trusted git -> None, and no process spawned.
+        monkeypatch.setattr(cli_doctor.platform_compat, "trusted_git_bin", lambda: None)
         assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") is None
         assert calls == []
 
         # Hit: the resolved absolute path is argv[0], never the bare "git".
         monkeypatch.setattr(
-            cli_doctor.platform_compat,
-            "trusted_system_bin",
-            lambda _n: "/usr/bin/git",
+            cli_doctor.platform_compat, "trusted_git_bin", lambda: "/usr/bin/git"
         )
         assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") == "main"
         assert calls and calls[0][0] == "/usr/bin/git"
-
-    def test_git_line_windows_falls_back_to_git_for_windows_roots(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        """On Windows a system-dirs miss probes the fixed Git for Windows roots.
-
-        Git for Windows installs under Program Files, never System32, so
-        without the fallback every supported Windows source install reported
-        "could not check". The fallback stays pinned: fixed literal roots, and
-        a miss there still means no subprocess.
-        """
-        import subprocess as _sp
-
-        calls: list[list[str]] = []
-
-        def fake_run(argv, *a, **k):
-            calls.append(list(argv))
-            return _sp.CompletedProcess(argv, 0, stdout="main\n", stderr="")
-
-        monkeypatch.setattr(cli_doctor.subprocess, "run", fake_run)
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None
-        )
-        monkeypatch.setattr(cli_doctor.platform_compat, "IS_WINDOWS", True)
-
-        gfw = r"C:\Program Files\Git\cmd\git.exe"
-        monkeypatch.setattr(cli_doctor, "_windows_git_bin", lambda: gfw)
-        assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") == "main"
-        assert calls and calls[0][0] == gfw
-
-        # Fallback miss: still no spawn at all.
-        calls.clear()
-        monkeypatch.setattr(cli_doctor, "_windows_git_bin", lambda: None)
-        assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") is None
-        assert calls == []
-
-    def test_git_line_non_windows_never_probes_git_for_windows(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        # POSIX resolver miss must not consult the Windows fallback: the
-        # trusted-dirs decision is final there.
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None
-        )
-        monkeypatch.setattr(cli_doctor.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(
-            cli_doctor,
-            "_windows_git_bin",
-            lambda: (_ for _ in ()).throw(AssertionError("probed on POSIX")),
-        )
-        assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") is None
-
-    def test_windows_git_bin_returns_none_when_roots_empty(self, monkeypatch) -> None:
-        # Fixed roots only — a miss returns None without consulting PATH or
-        # the environment.
-        monkeypatch.setattr(cli_doctor, "_WINDOWS_GIT_DIRS", ("Z:\\nonexistent\\Git\\cmd",))
-        assert cli_doctor._windows_git_bin() is None
 
 
 class TestCliInstallerResidue:
@@ -1434,6 +1332,7 @@ class TestEffectiveModelSection:
 
         assert "\x1b" not in capsys.readouterr().out
 
+    @requires_symlinks
     def test_a_symlink_to_a_sensitive_target_is_refused(self, monkeypatch, capsys) -> None:
         """The doctor read goes through agent_discovery's hardened reader, which
         refuses a symlink whose RESOLVED target is sensitive (the documented
@@ -1458,12 +1357,12 @@ class TestEffectiveModelSection:
         assert "unreadable" in out
         assert issues == ["agent spec unreadable"]
         assert "(defers)" in out.split("default spec pin:", 1)[1].splitlines()[0]
-        # ... and explains the gap instead of accusing its own tier list of being
-        # stale. `effective` may still carry the value: the RESOLVER reads the
-        # spec through its own path, which follows the link, and hiding what will
-        # actually run would make the report lie. That resolver-side following is
-        # pre-existing and main-owned; noted as a follow-up, not changed here.
-        assert "refused to follow" in out
+        # ... and nothing else acts on it either: the resolver reads through
+        # the same hardened reader, so it refuses too -- `effective` carries no
+        # value from the refused spec, and there is no resolver-vs-report gap
+        # to explain.
+        assert "leaked-value" not in out
+        assert "refused to follow" not in out
         assert "out of date" not in out
 
     def test_an_absent_spec_is_not_reported_as_a_fault(self, capsys) -> None:
@@ -1558,3 +1457,286 @@ class TestEffectiveModelSection:
         # It degrades to the built-in agent and still produces the report.
         assert "effective:" in out
         assert "tracking:" in out
+
+
+class TestWhatsAppSection:
+    """`kirocrew doctor`'s WhatsApp Integration section.
+
+    WhatsApp is the only channel whose whole runtime hangs off an OPTIONAL wheel
+    plus a locally stored credential, and neither absence produces an error the
+    operator sees: a message simply never arrives. So the section has to answer
+    both, and it has to answer them WITHOUT loading the Go core: a preflight that
+    initializes the subsystem it is inspecting is both slow and a side effect.
+    """
+
+    def _cfg(self, *, enabled: bool = True, groups: list | None = None):
+        from kiro_crew.config import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.whatsapp.enabled = enabled
+        cfg.whatsapp.groups = groups if groups is not None else []
+        return cfg
+
+    @pytest.fixture()
+    def home(self, tmp_path: Path, monkeypatch) -> Path:
+        """Pin the data home the section reports on, so no real store is read."""
+        target = tmp_path / "home"
+        target.mkdir()
+        monkeypatch.setattr(cli_doctor, "data_home", lambda: target)
+        return target
+
+    @staticmethod
+    def _extra(monkeypatch, present: bool) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.whatsapp.client.neonize_available", lambda: present
+        )
+
+    @staticmethod
+    def _pair(home: Path) -> Path:
+        from kiro_crew.whatsapp.client import default_db_path
+
+        store = default_db_path(home)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_bytes(b"sqlite")
+        return store
+
+    def test_a_disabled_channel_names_the_two_ways_to_enable_it(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """The channel must be VISIBLE in the preflight even when off, because that
+        is the
+        surface an operator checks before wondering why nothing arrives."""
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(enabled=False), issues)
+
+        out = capsys.readouterr().out
+        assert "WhatsApp Integration" in out
+        assert "not enabled" in out
+        assert "setup --whatsapp" in out
+        assert issues == []
+
+    def test_a_missing_extra_on_an_enabled_channel_is_a_reported_issue(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """Config says the channel is on and the wheel it needs is absent: the
+        channel cannot start at all, and the fix is one offline pip install."""
+        self._extra(monkeypatch, False)
+        self._pair(home)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        out = capsys.readouterr().out
+        assert "kirocrew[whatsapp]" in out
+        assert "whatsapp extra missing" in issues
+
+    def test_an_installed_extra_and_a_paired_store_report_clean(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        self._extra(monkeypatch, True)
+        store = self._pair(home)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        out = capsys.readouterr().out
+        assert "extra:       ✅" in out
+        assert f"session:     ✅ paired session store at {store}" in out
+        assert issues == []
+
+    def test_an_unpaired_store_warns_but_never_fails_doctor(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """Load-bearing split. Pairing is a QR scan served BY the running gateway,
+        so a freshly enabled channel legitimately has no store yet. Counting that
+        as an issue would exit 1 and break the documented
+        `kirocrew doctor && kirocrew gateway` chain at the one moment the operator
+        has to start the gateway to make progress.
+        """
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        out = capsys.readouterr().out
+        assert "not paired yet" in out
+        assert "Settings → Channels" in out
+        assert issues == [], "an unpaired channel must not fail the preflight"
+
+    def test_the_reported_store_is_the_path_the_gateway_opens(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """Doctor and the channel must resolve ONE path, or the report describes a
+        store the gateway never touches."""
+        from kiro_crew.whatsapp.client import default_db_path
+
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        assert str(default_db_path(home)) in capsys.readouterr().out
+
+    def test_the_check_never_imports_neonize(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """The whole point of the ``find_spec`` probe: importing neonize loads a
+        ~19 MB ctypes CDLL plus protobuf descriptors, and a health check must not
+        pay that (or construct a client as a side effect of asking a question).
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _guard(name, *args, **kwargs):
+            if name.split(".")[0] == "neonize":
+                raise AssertionError(
+                    f"doctor imported {name!r}: the preflight must stay a find_spec check"
+                )
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _guard)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(), issues)
+
+        assert "WhatsApp Integration" in capsys.readouterr().out
+
+    def test_configured_groups_are_counted_and_junk_entries_are_not(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        """A hand-edited config reaches this section intact, so a non-dict or a
+        blank JID must neither be counted nor crash the one command a user runs
+        BECAUSE their config is broken."""
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+        groups = [{"jid": "123@g.us"}, {"jid": "  "}, "not-a-dict", {"jid": "456@g.us"}]
+
+        cli_doctor._doctor_whatsapp(self._cfg(groups=groups), issues)
+
+        assert "groups:      ✅ 2 configured" in capsys.readouterr().out
+
+    def test_no_configured_groups_says_group_messages_are_ignored(
+        self, home: Path, monkeypatch, capsys
+    ) -> None:
+        self._extra(monkeypatch, True)
+        issues: list[str] = []
+
+        cli_doctor._doctor_whatsapp(self._cfg(groups=[]), issues)
+
+        assert "none configured" in capsys.readouterr().out
+
+    def test_the_section_is_wired_into_the_doctor_run(self) -> None:
+        """Guards the call site itself. Every other test here drives the helper
+        directly, so a deleted call would leave them all green and the operator
+        with no WhatsApp line, the exact gap this section was added to close.
+        ``_doctor()`` spawns subprocesses, probes the network and calls
+        ``sys.exit``, so its source is read rather than run.
+        """
+        import inspect
+
+        source = inspect.getsource(cli_doctor._doctor)
+        assert "_doctor_whatsapp(cfg, issues)" in source
+
+
+class TestVenvDepsProbe:
+    """The deps probe answers for the VENV, never the doctor's own process.
+
+    ``python -c`` puts the child's CWD at ``sys.path[0]`` and inherits
+    ``PYTHONPATH``, so an unisolated probe imports whatever decoy package
+    sits on either route -- making the doctor's verdict describe the
+    caller's environment instead of the venv under test (the false-healthy
+    the isolated ``dep_sync._probe_interpreter`` closes). The decoys here
+    raise on import: a probe that can still see them fails against an
+    interpreter that genuinely serves the real modules, so each test proves
+    the route is closed in a way that does not depend on which direction the
+    decoy lies in. The probe children run a fixed read-only import with the
+    cwd the code under test pins (the interpreter's own bin dir) -- nothing
+    is written, so the tmp-cwd rule for file-creating children does not
+    apply, and pointing them at ``tmp_path`` would test nothing.
+    """
+
+    _DEP_NAMES = ("websockets", "slack_sdk", "aiohttp")
+
+    def _plant_raising_decoys(self, root: Path) -> Path:
+        decoy = root / "decoy-path"
+        for name in self._DEP_NAMES:
+            pkg = decoy / name
+            pkg.mkdir(parents=True)
+            (pkg / "__init__.py").write_text(
+                "raise ImportError('decoy package imported')", encoding="utf-8"
+            )
+        return decoy
+
+    def test_decoy_on_pythonpath_is_invisible_to_the_probe(self, tmp_path, monkeypatch) -> None:
+        """PYTHONPATH entries rank ahead of site-packages, so an unisolated
+        probe imports the raising decoys and misreports this healthy
+        interpreter as missing its deps."""
+        decoy = self._plant_raising_decoys(tmp_path)
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+
+        assert cli_doctor._venv_deps_ok(Path(sys.executable)) is True
+
+    def test_decoy_in_the_callers_cwd_is_invisible_to_the_probe(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The second route: the caller's CWD lands at ``sys.path[0]`` for an
+        unisolated ``python -c``, ranking the decoys above site-packages."""
+        decoy = self._plant_raising_decoys(tmp_path)
+        monkeypatch.chdir(decoy)
+
+        assert cli_doctor._venv_deps_ok(Path(sys.executable)) is True
+
+    def test_missing_modules_still_report_missing(self, monkeypatch) -> None:
+        """Isolation must not soften the verdict: a probe exiting nonzero is
+        exactly the missing-deps answer the doctor section exists to show."""
+        monkeypatch.setattr(
+            cli_doctor.dep_sync,
+            "_probe_interpreter",
+            lambda *a, **k: subprocess.CompletedProcess(args=[], returncode=1),
+        )
+
+        assert cli_doctor._venv_deps_ok(Path(sys.executable)) is False
+
+    def test_a_wedged_interpreter_reports_missing(self, monkeypatch) -> None:
+        """A hung venv python must surface as a deps failure, not hang the
+        operator's doctor run or escape as a traceback."""
+
+        def _hang(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="python", timeout=5)
+
+        monkeypatch.setattr(cli_doctor.dep_sync, "_probe_interpreter", _hang)
+
+        assert cli_doctor._venv_deps_ok(Path(sys.executable)) is False
+
+    def test_an_unspawnable_interpreter_reports_missing(self, tmp_path) -> None:
+        assert cli_doctor._venv_deps_ok(tmp_path / "no-such-venv" / "python") is False
+
+    def test_the_probe_asks_the_venv_for_all_three_core_deps(self, monkeypatch) -> None:
+        """Pins the probe's question itself: the decoy tests above pass any
+        probe that ignores PYTHONPATH, including one that stopped importing a
+        module the gateway needs."""
+        seen: dict = {}
+
+        def record(target_py, code, timeout=None):
+            seen.update(target=target_py, code=code, timeout=timeout)
+            return subprocess.CompletedProcess(args=[], returncode=0)
+
+        monkeypatch.setattr(cli_doctor.dep_sync, "_probe_interpreter", record)
+
+        assert cli_doctor._venv_deps_ok(Path("/v/bin/python")) is True
+        assert seen["code"] == "import websockets, slack_sdk, aiohttp"
+        assert seen["target"] == Path("/v/bin/python")
+        assert seen["timeout"] == 5
+
+    def test_the_probe_is_wired_into_the_doctor_run(self) -> None:
+        """Guards the call site: every other test drives the helper directly,
+        so a deleted call would leave them green while the doctor silently
+        skipped the check. ``_doctor()`` spawns subprocesses and calls
+        ``sys.exit``, so its source is read rather than run."""
+        import inspect
+
+        source = inspect.getsource(cli_doctor._doctor)
+        assert "_venv_deps_ok(venv_py)" in source

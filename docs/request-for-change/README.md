@@ -15,12 +15,16 @@ was added later still and verified against `b23ab77af`; the
 `rfc-everything-is-an-app` and `rfc-amend-tenets-everything-is-an-app` rows
 were added
 2026-08-18 and verified against `e6b06685e`; the other rows have
-not been re-audited since 2026-08-03.
+not been re-audited since 2026-08-03. The durable-run-coordinator row was added
+2026-08-22 and the orchestrator-chat-sessions row was re-audited at
+`c4f253891`; the `rfc-token-efficient-monitors` row was added 2026-08-22 and
+verified against `6d3e30bbbd`.
 
 | Document | Status | What is actually on main |
 |---|---|---|
+| [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `draft` | Nothing. Design and seven-PR additive migration stack only; the existing in-memory manager and run folders remain authoritative |
 | [rfc-issue-radar-crews.md](rfc-issue-radar-crews.md) | `draft` | Nothing. Design of record only; `crew_brief.md` and `crew_ledger_spec.md` sit beside the Issue Radar backend as companion specs, also unimplemented |
-| [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `in-progress` | Nothing yet — all of it is in open PR [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) (`feat/crew-mode`) |
+| [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `partial` | Crew Mode shipped in [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) and has since received store and routing fixes. The implementation deliberately diverges from the RFC in at least three places: no snapshot-generation CAS, no `release` decision action, and immediate per-result delivery instead of burst coalescing |
 | [rfc-channel-plugin-architecture.md](rfc-channel-plugin-architecture.md) | `partial` | Shared turn pipeline shipped; **4 of 7** channels adopted. Registry/seam collapse, telegram+discord, Feishu unstarted. Its §9 address rule is separately half-shipped — audit this row alongside [rfc-session-address-model.md](rfc-session-address-model.md) |
 | [rfc-session-address-model.md](rfc-session-address-model.md) | `partial` | The dashboard half of the channel-plugin RFC's §9 rule 1 shipped ([#1366](https://github.com/kirodotdev/KiroCrew/pull/1366) plus four follow-ups): a chat-app conversation opened in a dashboard tab is no longer copied into a second session, and `has_dashboard_surface` (7 callers) replaced the name-prefix capability tests. All four phases it proposes are unstarted — 23 named key converters and 5 copies of the session-type ladder remain, surface capability is still one boolean, and an unbound channel tab still starts a second session against the same transcript file |
 | [rfc-local-notification-bus.md](rfc-local-notification-bus.md) | `partial` | Phases 1/3/4 complete. Phase 2 wired but has no producer; Phase 5 shipped 2 of 3 |
@@ -35,6 +39,7 @@ not been re-audited since 2026-08-03.
 | [rfc-app-sandbox-isolation.md](rfc-app-sandbox-isolation.md) | `draft` | Nothing. Apps still run in-process with full privileges (see `src/kiro_crew/docs/app-platform-trust-model.md`); no isolation code exists |
 | [rfc-issue-radar-dispatch.md](rfc-issue-radar-dispatch.md) | `draft` | Nothing. Issue Radar has Investigate and Review; no verb produces work, and issues carry no link to the change that resolves them |
 | [rfc-perpetual-agent.md](rfc-perpetual-agent.md) | `draft` | Nothing. Verified at `9ac3716a`: no schedule kind self-reschedules, and `binding_key_for` has no `cron:` branch |
+| [rfc-token-efficient-monitors.md](rfc-token-efficient-monitors.md) | `draft` | Nothing. Probe-first replacement for token-heavy babysit loops; implementation begins in a stacked series after this RFC |
 | [rfc-tailnet-dashboard-access.md](rfc-tailnet-dashboard-access.md) | `partial` | Phase 1 landed ([#1761](https://github.com/kirodotdev/KiroCrew/pull/1761), `f8afcff7`) — reports the pin's real scope, does not fix it. Phases 2–4 unstarted; the pin repair is tracked as [#1762](https://github.com/kirodotdev/KiroCrew/issues/1762) |
 | [rfc-pluggable-model-providers.md](rfc-pluggable-model-providers.md) | `draft` | Nothing, by design. `agent.provider` is still fixed to `acp` and `AGENTS.md` lists "Other providers" under *Never re-add*. This document **recommends** supporting provider choice and asks the maintainers to amend that rule; it proposes no design, and an exploratory implementation is shelved pending the answer ([#1693](https://github.com/kirodotdev/KiroCrew/issues/1693)) |
 | [rfc-s3-backup.md](rfc-s3-backup.md) | `draft` | Nothing. Verified at `f4d3327a7`: `VALID_COMPONENTS` carries no session component and no code path writes crew state to a remote store |

@@ -11,6 +11,7 @@ import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pasteTokens'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 // Steer bubbles play a one-shot entrance (slide-in + ring pulse) when they land.
 // The chat transcript is virtualized, so a row can remount when scrolled away and
 // back; without this guard the entrance would replay every time. Module-level set
@@ -35,6 +36,7 @@ interface UserMessageProps {
 }
 
 const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin }: UserMessageProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
   const [draft, setDraft] = useState(content)
@@ -205,7 +207,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             <Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.steered_into_the_running_turn')}
           </div>
           <motion.div
-            className="relative w-fit max-w-full"
+            /* Same width cap as the bubble, not just max-w-full: this wrapper
+               sits between the content column and the bubble, and a percentage
+               cap only bites once EVERY box in that chain carries one (see the
+               root's comment). With only max-w-full, intrinsic sizing treats
+               the bubble's percentage max-width as none, the wrapper inflates
+               to the full column, and the capped bubble inside lands at its
+               LEFT edge while the badge stays right. */
+            className="relative w-fit max-w-[min(550px,100%)]"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
@@ -214,9 +223,13 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             {playSteer && (
               <motion.div
                 aria-hidden="true"
-                className="pointer-events-none absolute -inset-0.5 rounded-xl border-2 border-accent"
-                initial={{ opacity: 0.55, scale: 1 }}
-                animate={{ opacity: 0, scale: 1.04 }}
+                /* The ring is drawn INSIDE the bubble box (inset-0, opacity
+                   fade only). The row wrapper is overflow-hidden and hugs the
+                   bubble's edges, so anything drawn outside (-inset-*) or
+                   scaled outward is clipped flat on the right. */
+                className="pointer-events-none absolute inset-0 rounded-xl border-2 border-accent"
+                initial={{ opacity: 0.55 }}
+                animate={{ opacity: 0 }}
                 transition={{ duration: 0.9, ease: 'easeOut' }}
               />
             )}

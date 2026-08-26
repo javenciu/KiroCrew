@@ -924,6 +924,57 @@ class TestRunTask:
         assert vector.embed_fn_factory is None
         assert "Embedding model changed" in capsys.readouterr().err
 
+    def test_vector_init_is_offloaded_off_the_event_loop(
+        self, taskrunner_env, tmp_path, monkeypatch
+    ) -> None:
+        """``VectorMemoryStore.init()`` must honour its caller contract (#5389):
+        the Windows path shells out to icacls, so an async caller offloads it
+        via ``asyncio.to_thread`` instead of freezing the loop. Ordering is
+        asserted too: init must COMPLETE before ``_run_task`` wires the embed
+        hooks (a fire-and-forget offload would reorder them). The sibling
+        ``MemoryStore.init()`` (cheap mkdir+seed) carries no contract and is
+        deliberately not pinned to either thread here."""
+        import threading
+
+        events: list = []
+        init_threads: dict = {}
+
+        class _ThreadRecordingVector(_FakeVectorStore):
+            def init(self) -> None:
+                init_threads["vector"] = threading.current_thread()
+                events.append("init")
+                super().init()
+
+            @property
+            def embed_fn_factory(self):
+                return self.__dict__.get("_eff")
+
+            @embed_fn_factory.setter
+            def embed_fn_factory(self, value) -> None:
+                # First post-init wiring step in _run_task: recording it turns
+                # "init completed before first use" into an observed ordering.
+                events.append("wired")
+                self.__dict__["_eff"] = value
+
+        def _vector(**kw):
+            store = _ThreadRecordingVector(**kw)
+            taskrunner_env["vector"] = store
+            return store
+
+        monkeypatch.setattr(cli_server, "VectorMemoryStore", _vector)
+        taskrunner_env["install_runner"](_Result("completed"))
+        args = argparse.Namespace(
+            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
+        )
+        asyncio.run(cli_server._run_task(args))
+
+        # Offloaded: init ran in a worker thread, not on the loop thread.
+        assert init_threads["vector"] is not threading.current_thread()
+        assert taskrunner_env["vector"].inited is True
+        # Awaited, not fire-and-forget: init completed BEFORE the embed hooks
+        # were wired (the first use that follows it in _run_task).
+        assert events.index("init") < events.index("wired")
+
 
 # --------------------------------------------------------------------------
 # _update — git checkout path
@@ -937,6 +988,9 @@ class _GitStub:
         self.rc = rc
         self.calls: list[list[str]] = []
         self.status_out = ""
+        # Behind-only by default: these tests model a fast-forwardable
+        # checkout, which the divergence guard waves through.
+        self.rev_list_out = "0\t5\n"
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
@@ -946,6 +1000,10 @@ class _GitStub:
             return subprocess.CompletedProcess(argv, self.rc.get("fetch", 0), "", "no remote")
         if argv[:2] == ["git", "diff"]:
             return subprocess.CompletedProcess(argv, self.rc.get("diff", 1), "", "")
+        if argv[:2] == ["git", "rev-list"]:
+            return subprocess.CompletedProcess(
+                argv, self.rc.get("rev_list", 0), self.rev_list_out, ""
+            )
         if argv[:2] == ["git", "status"]:
             return subprocess.CompletedProcess(argv, 0, self.status_out, "")
         if argv[:2] == ["git", "reset"]:
@@ -1052,6 +1110,59 @@ class TestUpdateGitPath:
         assert "Already up to date" in capsys.readouterr().out
         assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
 
+    def test_ahead_only_checkout_is_never_reset(self, monkeypatch, git_checkout, capsys) -> None:
+        """The CLI is the strictest surface: ahead-only has nothing to pull.
+
+        ``origin/<branch>`` is an ancestor of HEAD here, so a reset could only
+        REMOVE the local commits — refused even though the tree content
+        differs from the upstream.
+        """
+        stub = _GitStub()
+        stub.rev_list_out = "2\t0\n"  # 2 ahead, 0 behind
+        monkeypatch.setattr(subprocess, "run", stub)
+        cli_server._update()
+        out = capsys.readouterr().out
+        assert "Already up to date!" in out
+        assert "2 local commit(s) ahead" in out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_diverged_checkout_refuses_without_force(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        stub = _GitStub()
+        stub.rev_list_out = "3\t2\n"  # 3 ahead, 2 behind — diverged
+        monkeypatch.setattr(subprocess, "run", stub)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "diverged" in out
+        assert "kirocrew update --force" in out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_diverged_checkout_resets_under_force(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        stub = _GitStub()
+        stub.rev_list_out = "3\t2\n"  # 3 ahead, 2 behind — diverged
+        monkeypatch.setattr(subprocess, "run", stub)
+        cli_server._update(force=True)
+        out = capsys.readouterr().out
+        assert "--force: discarding 3 local commit(s)" in out
+        assert any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_unreadable_divergence_refuses_the_reset(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """Fail closed: a guard that cannot count must not wave the reset through."""
+        stub = _GitStub(rev_list=128)
+        monkeypatch.setattr(subprocess, "run", stub)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        assert "Could not compare HEAD against origin/main" in capsys.readouterr().out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
     def test_local_changes_prompt_and_abort_leaves_tree_alone(
         self, monkeypatch, git_checkout, capsys
     ) -> None:
@@ -1119,6 +1230,121 @@ class TestUpdateGitPath:
         out = capsys.readouterr().out
         assert "Kiro Crew updated!" in out
         assert "Agent config refresh failed" in out
+
+
+class TestUpdateSubprocessHardening:
+    """The six ``subprocess.run`` calls in ``_update()`` (issue #5648).
+
+    Two gap classes: (a) every captured-output call must also pass
+    ``stdin=subprocess.DEVNULL`` so a child prompt can never block invisibly on
+    the parent terminal; (b) ``TimeoutExpired`` — which ``subprocess.run``
+    RAISES rather than returns — must land on the same branch that the site's
+    existing failure path already takes, never escape ``_update()``.
+    """
+
+    @staticmethod
+    def _timeout_on(prefix, inner):
+        """A subprocess.run stand-in raising TimeoutExpired for one argv prefix."""
+
+        def _run(argv, **kw):
+            if list(argv[: len(prefix)]) == list(prefix):
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=kw.get("timeout", 0))
+            return inner(argv, **kw)
+
+        return _run
+
+    def test_all_six_calls_pass_stdin_devnull(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """Gap class (a): assert on the kwargs actually passed to subprocess.run."""
+        stub = _GitStub()
+        recorded: list[tuple[list[str], dict]] = []
+
+        def _run(argv, **kw):
+            recorded.append((list(argv), kw))
+            return stub(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        # A findable kiro-cli makes the sixth (best-effort) site reachable.
+        monkeypatch.setattr(cli_server.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+        cli_server._update()
+        assert "Kiro Crew updated!" in capsys.readouterr().out
+
+        six = [
+            ["git", "rev-parse"],
+            ["git", "fetch"],
+            ["git", "diff"],
+            ["git", "status"],
+            ["git", "reset"],
+            ["kiro-cli", "update"],
+        ]
+        for prefix in six:
+            matching = [kw for argv, kw in recorded if argv[: len(prefix)] == prefix]
+            assert matching, f"call {prefix} never ran"
+            for kw in matching:
+                assert (
+                    kw.get("stdin") is subprocess.DEVNULL
+                ), f"{prefix} ran without stdin=DEVNULL"
+
+    def test_fetch_timeout_takes_the_existing_failure_branch(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """Gap class (b), exit-1 sites: a timeout must not traceback out.
+
+        RED-BEFORE: on unmodified main this raises TimeoutExpired straight
+        through ``kirocrew update`` instead of the SystemExit(1) the fetch
+        failure path already defines.
+        """
+        monkeypatch.setattr(
+            subprocess, "run", self._timeout_on(["git", "fetch"], _GitStub())
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        assert "git fetch timed out" in capsys.readouterr().out
+
+    def test_diff_timeout_proceeds_like_a_nonzero_exit(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """A diff timeout takes the branch a non-zero exit already takes —
+        proceed to the divergence guard — rather than tracing back or lying
+        "up to date"."""
+        stub = _GitStub()
+        monkeypatch.setattr(subprocess, "run", self._timeout_on(["git", "diff"], stub))
+        cli_server._update()
+        out = capsys.readouterr().out
+        assert "git diff timed out" in out
+        # The update still completed through the guard + reset path.
+        assert "Kiro Crew updated!" in out
+        assert any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_status_timeout_refuses_the_reset(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """The status call guards the hard reset's data discard: an unreadable
+        answer fails closed, mirroring the unreadable-divergence guard."""
+        stub = _GitStub()
+        monkeypatch.setattr(subprocess, "run", self._timeout_on(["git", "status"], stub))
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        assert "git status timed out" in capsys.readouterr().out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_kiro_cli_update_timeout_degrades_best_effort(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """The backend update's result is not inspected today, so its timeout
+        warns and the update continues — the #5637 handler shape."""
+        stub = _GitStub()
+        monkeypatch.setattr(
+            subprocess, "run", self._timeout_on(["kiro-cli", "update"], stub)
+        )
+        monkeypatch.setattr(cli_server.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+        cli_server._update()
+        out = capsys.readouterr().out
+        assert "kiro-cli update timed out" in out
+        assert "Kiro Crew updated!" in out
 
 
 class TestUpdateWheelDispatch:
