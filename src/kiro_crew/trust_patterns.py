@@ -23,8 +23,8 @@ _GRANT_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|;|\|)\s*")
 _COMMAND_SUBSTITUTION_RE = re.compile(r"\$\(|`|<\(|>\(")
 
 
-def normalize_tool_name(tool_name: str) -> str:
-    """Strip presentation prefixes from a command or tool name."""
+def _strip_presentation_prefix(tool_name: str) -> str:
+    """Strip a provider display prefix from presentation text only."""
     for prefix in _TOOL_TITLE_PREFIXES:
         if tool_name.startswith(prefix):
             return tool_name[len(prefix) :]
@@ -53,7 +53,7 @@ def approval_command(tool_title: str, tool_input: str, *, is_shell: bool) -> str
     if is_shell:
         return extract_bash_command(tool_input) if tool_input else ""
     if not tool_input:
-        return normalize_tool_name(tool_title)
+        return _strip_presentation_prefix(tool_title)
     return ""
 
 
@@ -107,7 +107,11 @@ def split_command_segments(
     mask_escaped: bool = False,
 ) -> tuple[str, list[str]] | None:
     """Split a command into unquoted shell segments, failing closed."""
-    normalized = normalize_tool_name(command)
+    # ``command`` is the canonical value from structured ``tool_input``.  A
+    # shell can legitimately invoke an executable named ``Reading`` or
+    # ``Running:``, so presentation-prefix removal here would alias two distinct
+    # commands at the authorization boundary.
+    normalized = command
     if _COMMAND_SUBSTITUTION_RE.search(normalized) or "\x00" in normalized:
         return None
     quote_masked, separator_restore = _mask_quoted_separators(normalized, mask_escaped=mask_escaped)
@@ -137,10 +141,9 @@ def split_command_segments(
 def matches_trusted_pattern(command: str, patterns: set[str]) -> str | None:
     """Return the trusted fnmatch pattern covering ``command``, if any.
 
-    The input is command-shaped.  Callers must pass the canonical command from
-    ``tool_input`` rather than wrapping it in a synthetic ``"Running: ..."``
-    title.  Presentation-prefix normalization remains for compatibility with
-    existing callers and tests, but it is not an authority source.
+    The input is the canonical command from ``tool_input``.  Presentation
+    prefixes are never stripped here: they are ordinary executable text at this
+    boundary, not UI decoration.
     """
     split = split_command_segments(command)
     if split is None:
@@ -170,16 +173,25 @@ def extract_base_command(command: str) -> str:
     normalized, segments = split
     bases: list[str] = []
     for segment in segments:
-        parts = segment.strip().split(None, 1)
+        stripped = segment.strip()
+        parts = stripped.split(None, 1)
         if not parts or ENV_ASSIGNMENT_RE.match(parts[0]):
             return ""
-        bases.append(parts[0])
+        base = parts[0]
+        # The comma is our multi-command delimiter.  Quotes or escapes mean the
+        # first whitespace-delimited token is not necessarily the executable;
+        # shell expansion characters can likewise select a different binary at
+        # execution time.  A lossy base grant would then authorize a command the
+        # user never saw, so these shapes remain allow-once only.
+        if any(ch in base for ch in "'\"\\,$`*?[]{}()<>!") or base.startswith(("~", "#")):
+            return ""
+        bases.append(base)
     return ",".join(dict.fromkeys(bases)) if bases else normalized
 
 
 def extract_full_command(command: str) -> str:
-    """Return a command/tool name without a presentation prefix."""
-    return normalize_tool_name(command)
+    """Return the canonical command/tool identity unchanged."""
+    return command
 
 
 def base_consent_pattern(base_command: str) -> str:

@@ -5734,6 +5734,7 @@ def _deny_trust_pattern(name: str, request_id: str, action: str, code: str) -> w
         "pattern_required": "pattern required for command-scoped trust",
         "pattern_underivable": "the pending tool has no grantable command scope",
         "approval_superseded": "pattern does not match the pending command",
+        "approval_not_slot_owned": "command-scoped trust requires a live slot approval",
     }
     return web.json_response({"error": errors[code], "code": code}, status=400)
 
@@ -5790,6 +5791,16 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
             request_id, fut = pending[0]
         else:
             fut = None
+    # A state-level approval carries only a boolean decision and has no owning
+    # slot, canonical command card, or scoped-pattern store.  Do not let a
+    # scoped action fall through to ``resolve_state_approval`` as ``True``:
+    # that would approve the tool after skipping every scope check.  Truly
+    # missing IDs retain the 404 from the common fallback below; this explicit
+    # denial covers a live state owner.
+    if original_action in ("trust_command", "trust_base") and (not fut or fut.done()):
+        state_fut = state._approval_futures.get(request_id) if request_id else None
+        if state_fut and not state_fut.done():
+            return _deny_trust_pattern(name, request_id, original_action, "approval_not_slot_owned")
     # Trust: auto-approve remaining tools for this slot. The approval policy MUST
     # be keyed by the OWNER's EFFECTIVE session key — a linked cron/workflow or
     # channel-surfaced slot runs under ``linked_session_key``, not

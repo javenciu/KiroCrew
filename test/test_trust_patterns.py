@@ -16,9 +16,34 @@ from kiro_crew.trust_patterns import (
     approval_command,
     exact_trust_pattern,
 )
-from kiro_crew.trust_patterns import extract_base_command as _extract_base_command
-from kiro_crew.trust_patterns import extract_full_command as _extract_full_command
-from kiro_crew.trust_patterns import matches_trusted_pattern as _matches_trusted_pattern
+from kiro_crew.trust_patterns import extract_base_command as _canonical_extract_base_command
+from kiro_crew.trust_patterns import extract_full_command as _canonical_extract_full_command
+from kiro_crew.trust_patterns import matches_trusted_pattern as _canonical_matches_trusted_pattern
+
+
+def _legacy_title_command(value: str) -> str:
+    """Adapt old title-shaped fixtures into canonical command input.
+
+    Production helpers no longer strip display prefixes.  Most segmentation
+    tests below predate structured ``tool_input`` and still use title-shaped
+    fixtures; explicit boundary regressions exercise the raw helpers directly.
+    """
+    for prefix in ("Running: ", "Reading "):
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
+
+
+def _extract_base_command(value: str) -> str:
+    return _canonical_extract_base_command(_legacy_title_command(value))
+
+
+def _extract_full_command(value: str) -> str:
+    return _canonical_extract_full_command(_legacy_title_command(value))
+
+
+def _matches_trusted_pattern(value: str, patterns: set[str]) -> str | None:
+    return _canonical_matches_trusted_pattern(_legacy_title_command(value), patterns)
 
 
 def _make_state(tmp_path):
@@ -174,6 +199,19 @@ class TestExtractBaseCommand:
     def test_env_assignment_prefix_is_not_a_grantable_base(self):
         assert _extract_base_command("FOO=bar python task.py") == ""
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            '"/tmp/my tool" --safe',
+            r"/tmp/my\ tool --safe",
+            "/tmp/a,b --safe",
+            "$TOOL --safe",
+            "~/bin/tool --safe",
+        ],
+    )
+    def test_ambiguous_or_expanding_executable_is_not_grantable(self, command):
+        assert _canonical_extract_base_command(command) == ""
+
 
 class TestApprovalCommand:
     def test_shell_scope_comes_from_tool_input_not_title(self):
@@ -206,6 +244,13 @@ class TestExtractFullCommand:
 
     def test_reading_prefix(self):
         assert _extract_full_command("Reading /home/user/file.txt") == "/home/user/file.txt"
+
+    def test_canonical_presentation_word_is_not_stripped(self):
+        command = "Reading /usr/bin/id"
+        assert _canonical_extract_full_command(command) == command
+        assert _canonical_extract_base_command(command) == "Reading"
+        assert _canonical_matches_trusted_pattern(command, {command}) == command
+        assert _canonical_matches_trusted_pattern("/usr/bin/id", {command}) is None
 
 
 # ── _ChatSlot trusted_patterns initialization ──
@@ -1062,6 +1107,78 @@ class TestApproveHandlerTrustCommand:
             assert resp.status == 200
         assert state_fut.done()
         assert state_fut.result() is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("scoped_action", "pattern", "plain_action", "plain_result"),
+        (
+            ("trust_command", "ls /tmp", "approved", True),
+            ("trust_base", "ls *", "rejected", False),
+        ),
+    )
+    async def test_state_level_future_refuses_scoped_trust_then_accepts_plain_decision(
+        self, tmp_path, scoped_action, pattern, plain_action, plain_result
+    ):
+        """A state future has no slot-owned command metadata or pattern store.
+
+        A scoped trust action must therefore leave it unresolved instead of
+        silently becoming a boolean approval.  The same future must remain
+        usable through the ordinary state-level approval path afterwards.
+        """
+        state = _make_state(tmp_path)
+        state.sessions.set_approval_policy = MagicMock()
+        slot = _ChatSlot(key="slot-1")
+        state._slots["slot-1"] = slot
+        loop = asyncio.get_running_loop()
+        state_fut: asyncio.Future[bool] = loop.create_future()
+        state._approval_futures["req-state-scope"] = state_fut
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            scoped = await client.post(
+                "/api/chat/slots/slot-1/approve",
+                json={
+                    "action": scoped_action,
+                    "request_id": "req-state-scope",
+                    "pattern": pattern,
+                },
+            )
+            assert scoped.status == 400
+            assert (await scoped.json())["code"] == "approval_not_slot_owned"
+            assert not state_fut.done()
+            assert not slot._trusted_patterns
+
+            plain = await client.post(
+                "/api/chat/slots/slot-1/approve",
+                json={"action": plain_action, "request_id": "req-state-scope"},
+            )
+            assert plain.status == 200
+
+        assert state_fut.result() is plain_result
+
+    @pytest.mark.asyncio
+    async def test_state_level_future_preserves_trust_all_compatibility(self, tmp_path):
+        """The state-only guard is limited to command-scoped trust actions."""
+        state = _make_state(tmp_path)
+        set_policy = MagicMock()
+        state.sessions.set_approval_policy = set_policy
+        slot = _ChatSlot(key="slot-1")
+        state._slots["slot-1"] = slot
+        loop = asyncio.get_running_loop()
+        state_fut: asyncio.Future[bool] = loop.create_future()
+        state._approval_futures["req-state-trust"] = state_fut
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/slots/slot-1/approve",
+                json={"action": "trust", "request_id": "req-state-trust"},
+            )
+            assert resp.status == 200
+
+        assert state_fut.result() is True
+        assert slot._trust is True
+        set_policy.assert_called_once_with("dashboard:slot-1", "auto")
 
 
 class TestMatchesTrustedPatternPiped:

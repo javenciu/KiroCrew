@@ -225,14 +225,17 @@ from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SpeculativeResumeRefused
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
-from kiro_crew.trust_patterns import (
+from kiro_crew.trust_patterns import (  # noqa: F401 -- compatibility re-export
+    _mask_quoted_separators,
     approval_command,
 )
 from kiro_crew.trust_patterns import extract_base_command as _extract_base_command
 from kiro_crew.trust_patterns import extract_bash_command as _extract_bash_command
 from kiro_crew.trust_patterns import extract_full_command as _extract_full_command
 from kiro_crew.trust_patterns import matches_trusted_pattern as _matches_trusted_pattern
-from kiro_crew.trust_patterns import split_command_segments as _split_command_segments
+from kiro_crew.trust_patterns import (  # noqa: F401 -- compatibility re-export
+    split_command_segments as _split_command_segments,
+)
 from kiro_crew.validation import ValidationError, infer_use_case, validate_ask_user_question
 from kiro_crew.widget_artifacts import register_widgets_off_loop
 

@@ -1962,19 +1962,19 @@ class TestCommandParsing:
         assert list(restore.values()) == ["|"]
 
     def test_command_substitution_is_denied_by_default(self):
-        assert chat_runner._matches_trusted_pattern("Running: echo $(whoami)", {"echo*"}) is None
+        assert chat_runner._matches_trusted_pattern("echo $(whoami)", {"echo*"}) is None
 
     def test_every_segment_must_match_for_a_chained_command(self):
-        assert chat_runner._matches_trusted_pattern("Running: ls | rm -rf x", {"ls*"}) is None
+        assert chat_runner._matches_trusted_pattern("ls | rm -rf x", {"ls*"}) is None
 
     def test_all_matching_segments_return_joined_patterns(self):
-        matched = chat_runner._matches_trusted_pattern("Running: ls | wc -l", {"ls*", "wc*"})
+        matched = chat_runner._matches_trusted_pattern("ls | wc -l", {"ls*", "wc*"})
 
         assert matched is not None
         assert matched.count(",") == 1
 
     def test_redirect_forms_are_not_treated_as_separators(self):
-        assert chat_runner._matches_trusted_pattern("Running: ls 2>&1", {"ls*"}) is not None
+        assert chat_runner._matches_trusted_pattern("ls 2>&1", {"ls*"}) is not None
 
     def test_an_escaped_quote_does_not_hide_a_real_separator(self):
         """A closing quote followed by `\\'` leaves quoted context, so the `;`
@@ -1985,7 +1985,7 @@ class TestCommandParsing:
         command inherits whatever the first segment was allowed to do. Verified
         against a real shell: `echo 'foo'\\'; cmd` runs `cmd`.
         """
-        command = "Running: echo 'foo'\\'; whoami"
+        command = "echo 'foo'\\'; whoami"
         _, segments = chat_runner._split_command_segments(command) or ("", [])
 
         assert len(segments) == 2, segments
@@ -1997,7 +1997,7 @@ class TestCommandParsing:
         reading: the line is an unterminated quote, which a shell refuses to run
         at all rather than executing a second command, so there is nothing here
         for segmentation to protect against."""
-        command = 'Running: echo "foo\\"; whoami'
+        command = 'echo "foo\\"; whoami'
         _, segments = chat_runner._split_command_segments(command) or ("", [])
 
         assert len(segments) == 1, segments
@@ -2006,7 +2006,7 @@ class TestCommandParsing:
         """`\\;` is an escaped literal to the shell, not a separator -- but the
         allowlist must not approve the tail either way, so segmentation stays
         fail-closed rather than trying to model every escape."""
-        assert chat_runner._matches_trusted_pattern("Running: ls \\; whoami", {"ls*"}) is None
+        assert chat_runner._matches_trusted_pattern("ls \\; whoami", {"ls*"}) is None
 
     def test_a_backslash_inside_single_quotes_stays_literal(self):
         """The shell does not honor escapes inside single quotes, so a trailing
@@ -2017,10 +2017,10 @@ class TestCommandParsing:
         assert masked.endswith("&& wc -l")
 
     def test_base_command_extraction_dedups_across_segments(self):
-        assert chat_runner._extract_base_command("Running: cat a | wc -l | cat b") == "cat,wc"
+        assert chat_runner._extract_base_command("cat a | wc -l | cat b") == "cat,wc"
 
-    def test_full_command_strips_the_display_prefix(self):
-        assert chat_runner._extract_full_command("Running: ls -la") == "ls -la"
+    def test_full_command_preserves_canonical_text(self):
+        assert chat_runner._extract_full_command("Reading /usr/bin/id") == "Reading /usr/bin/id"
 
 
 # ── model backfill / pin guards ───────────────────────────────────────────
