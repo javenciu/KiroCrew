@@ -154,6 +154,8 @@ describe('UpdateModal', () => {
       expect(
         screen.getByText(i18nT('components.updateModal.installing_update_body')),
       ).toBeInTheDocument()
+      expect(screen.getByRole('alert').textContent).toMatch(/several minutes/i)
+      expect(screen.getByRole('alert').textContent).toMatch(/relaunch automatically/i)
     })
 
     it('offers no dismiss affordance: no buttons, and Escape is inert', async () => {

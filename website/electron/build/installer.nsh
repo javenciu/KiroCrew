@@ -7,7 +7,8 @@
 ; Keep the assisted flow on electron-builder's native MUI pages. Page boundaries
 ; use one short top-level Win32 cross-fade, but extraction stays on the native
 ; progress page: no timer-driven bitmap swaps or Sleep calls can stall its UI
-; thread. The native finish page still owns the transition away from 100%.
+; thread. Fresh installs retain the native finish page. Updates skip every
+; decision page, keep that progress page visible, then relaunch and close.
 ;
 ; SCOPE: exactly one directory -- the electron-updater cache under $LOCALAPPDATA,
 ; which the generated uninstaller cannot reach (it only ever clears $APPDATA).
@@ -51,6 +52,7 @@ Var KiroHasPerMachineInstallation
 Var KiroScope
 Var KiroAnimationsEnabled
 Var KiroWindowVisible
+Var KiroVisibleUpdate
 
 ; The fade operates on the top-level dialog, the only window type for which
 ; AW_BLEND is supported. It runs once per page boundary and leaves the native
@@ -169,10 +171,19 @@ Function KiroEnsureAppInstallDir
   KiroFreshInstallDirReady:
 FunctionEnd
 
+; Updates need progress, not another decision: skip the welcome page while
+; preserving the native assisted flow for a first install.
+Function KiroWelcomePre
+  ${If} $KiroVisibleUpdate == 1
+    Abort
+  ${EndIf}
+FunctionEnd
+
 ; electron-builder exposes the welcome-page macro hook directly. Reinsert the
 ; same native MUI page with show/leave callbacks so startup and the first Next
 ; transition do not blink before the rest of the fade sequence begins.
 !macro customWelcomePage
+  !define MUI_PAGE_CUSTOMFUNCTION_PRE KiroWelcomePre
   !define MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage
   !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage
   !insertmacro MUI_PAGE_WELCOME
@@ -216,6 +227,16 @@ FunctionEnd
 ; or changing the native Install button into a misleading Next button.
 !macro customInstallMode
   !ifndef BUILD_UNINSTALLER
+    ; Preserve the registered install scope without asking the user to choose it
+    ; again. multiUserUi consumes these flags in its page-pre callback, performs
+    ; elevation when needed, and Abort-skips the page.
+    ${If} $KiroVisibleUpdate == 1
+      ${If} $installMode == "all"
+        StrCpy $isForceMachineInstall 1
+      ${Else}
+        StrCpy $isForceCurrentInstall 1
+      ${EndIf}
+    ${EndIf}
     !define MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage
     !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroInstallModeLeave
   !endif
@@ -238,6 +259,18 @@ FunctionEnd
 
     !define MUI_FINISHPAGE_RUN
     !define MUI_FINISHPAGE_RUN_FUNCTION "StartApp"
+
+    ; The extraction page is the entire update UI. Once it reaches 100%, start
+    ; the updated app through electron-builder's locked launch contract and
+    ; close successfully instead of waiting on a redundant Finish click.
+    Function KiroFinishPagePre
+      ${If} $KiroVisibleUpdate == 1
+        Call StartApp
+        !insertmacro quitSuccess
+      ${EndIf}
+    FunctionEnd
+
+    !define MUI_PAGE_CUSTOMFUNCTION_PRE KiroFinishPagePre
   !endif
   !define MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage
   !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage
@@ -248,6 +281,16 @@ FunctionEnd
 ; This runs for silent installs too and does not replace or restyle any page.
 !macro customInit
   StrCpy $KiroWindowVisible 0
+  StrCpy $KiroVisibleUpdate 0
+  ${If} ${isUpdated}
+    StrCpy $KiroVisibleUpdate 1
+    ; Older Kiro Crew clients launch every NSIS update with /S. Convert that
+    ; legacy handoff to the visible, non-interactive update path so users see
+    ; progress on the very first upgrade that contains this fix.
+    ${If} ${Silent}
+      SetSilent normal
+    ${EndIf}
+  ${EndIf}
   Call KiroDetectAnimations
   StrCpy $KiroScope "current"
   ${If} $installMode == "all"

@@ -222,7 +222,7 @@ describe("first-download installer design contract", () => {
     assert.match(installer, /Function \.onGUIEnd[\s\S]*?Call KiroFadeOutPage[\s\S]*?FunctionEnd/);
     assert.match(
       installer,
-      /!macro customWelcomePage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage[\s\S]*?!insertmacro MUI_PAGE_WELCOME/
+      /!macro customWelcomePage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_PRE KiroWelcomePre[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage[\s\S]*?!insertmacro MUI_PAGE_WELCOME/
     );
     assert.match(
       installer,
@@ -249,6 +249,26 @@ describe("first-download installer design contract", () => {
     assert.match(runtimeScript, /native-install-mode\.png/);
   });
 
+  it("shows native progress for updates without adding setup decisions", () => {
+    assert.match(
+      installer,
+      /Function KiroWelcomePre[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?Abort[\s\S]*?FunctionEnd/
+    );
+    assert.match(
+      installer,
+      /!macro customInstallMode[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?StrCpy \$isForceMachineInstall 1[\s\S]*?StrCpy \$isForceCurrentInstall 1/
+    );
+    assert.match(
+      installer,
+      /Function KiroFinishPagePre[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?Call StartApp[\s\S]*?!insertmacro quitSuccess[\s\S]*?FunctionEnd/
+    );
+    assert.match(
+      installer,
+      /!macro customInit[\s\S]*?\$\{If\} \$\{isUpdated\}[\s\S]*?\$\{If\} \$\{Silent\}[\s\S]*?SetSilent normal/
+    );
+    assert.doesNotMatch(installer, /NSD_(?:Create|Kill)Timer|Sleep\s+\d+/);
+  });
+
   it("keeps install-root ownership and legacy startup cleanup without custom pages", () => {
     assert.match(installer, /Function KiroEnsureAppInstallDir[\s\S]*?FunctionEnd/);
     assert.match(installer, /!macro customInit[\s\S]*?Call KiroEnsureAppInstallDir/);
@@ -265,10 +285,11 @@ describe("first-download installer design contract", () => {
       installer,
       /Function KiroValidateInstallDirAfterMode[\s\S]*?Call KiroEnsureAppInstallDir[\s\S]*?StrCpy \$INSTDIR \$KiroInstallDir[\s\S]*?FunctionEnd/
     );
-    assert.doesNotMatch(
+    const validateInstallDir = normalizedNsisBlock(
       installer,
-      /Function KiroValidateInstallDirAfterMode[\s\S]*?Abort[\s\S]*?FunctionEnd/
+      /Function KiroValidateInstallDirAfterMode[\s\S]*?FunctionEnd/
     );
+    assert.doesNotMatch(validateInstallDir, /Abort/);
     assert.match(installer, /GetFileAttributesW/);
     assert.match(installer, /KiroCheckFreshInstallDir/);
     assert.match(
