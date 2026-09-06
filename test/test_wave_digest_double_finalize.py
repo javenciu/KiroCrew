@@ -23,9 +23,26 @@ manager, so the race window is deterministic instead of a timing lottery.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kiro_crew.subagent import SubagentInfo
+from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+
+def _mk_real_manager(**kwargs):  # type: ignore[no-untyped-def]
+    """A REAL ``SubagentManager`` (no scripted seams) for the run-side tests.
+
+    Sessions double carries only the seams ``_run``'s terminal paths touch;
+    every process boundary stays stubbed — nothing here launches a runtime.
+    """
+    sessions = MagicMock()
+    sessions.get_pid = MagicMock(return_value=None)
+    sessions.release = MagicMock()
+    sessions.reset = AsyncMock()
+    sessions.record_success = MagicMock()
+    kwargs.setdefault("sessions", sessions)
+    kwargs.setdefault("ctx_builder", None)
+    return SubagentManager(**kwargs)  # type: ignore[arg-type]
 
 
 def _build_gw():  # type: ignore[no-untyped-def]
@@ -200,19 +217,184 @@ class TestWaveDigestDoubleFinalize:
         gw.subagent_mgr.finalize_batch.assert_called_once_with("w1")
         assert "w1" not in gw._batch_progress
 
-    def test_consumer_marks_the_member_report_consumed_with_the_count(self) -> None:
-        """The flag and the count land in the same synchronous block: after the
-        consumer accounts a member, that member no longer reads as an
+    def test_consumer_releases_the_hold_with_the_count(self) -> None:
+        """The hold release and the count land in the same synchronous block:
+        after the consumer accounts a member, that member no longer reads as an
         in-flight report (this is what lets the real predicate flip exactly
-        when the scripted one did above)."""
+        when the scripted one did above). The release goes to the manager-level
+        registry, so it survives the member having been popped from `_agents`
+        by an operator clear mid-flight."""
         gw = _build_gw()
         done_cb = _init_and_get_done_cb(gw)
         gw.subagent_mgr.batch_members_pending = MagicMock(return_value=True)
         gw.subagent_mgr.batch_reports_in_flight = MagicMock(return_value=False)
 
         member = _member("a")
-        assert member._report_consumed is False
         p1, p2, p3 = _patches()
         with p1, p2, p3:
             asyncio.run(done_cb(member))
-        assert member._report_consumed is True
+        gw.subagent_mgr.consume_report_hold.assert_called_once_with("w1", "a")
+
+
+class TestFailurePathFlipAndArmAreInseparable:
+    """The done-flip and the hold-arm must never be observable apart — on the
+    RUN side, not just inside the report machinery.
+
+    The c2 revision armed the hold at the top of ``_report_terminal`` (the
+    report task's first execution step). But on the failure paths
+    (``_run``'s timeout / cancel / exception except-bodies) ``info.done``
+    flips in the except-body, and the report task spawned by the ``finally``
+    does not run until after the coroutine yields at
+    ``_teardown_run_session``. At that yield a sibling completion reads the
+    member as neither pending (``not a.done`` drops it) nor in flight (never
+    armed) and closes the wave early; the member's report then finalizes it
+    a second time — the exact double-digest the hold exists to prevent.
+
+    These tests drive the REAL ``_run`` coroutine on a REAL manager and probe
+    the registry at the real yield point (a checkpoint patched over
+    ``_teardown_run_session``), so the window is checked deterministically
+    where the adjudicated finding located it, not via a timing lottery.
+    """
+
+    @staticmethod
+    def _mgr_and_member():  # type: ignore[no-untyped-def]
+        mgr = _mk_real_manager()
+        info = SubagentInfo(id="a-fail", task="t", batch_id="w9", batch_total=2)
+        mgr._agents[info.id] = info
+        return mgr, info
+
+    @staticmethod
+    def _checkpoint(mgr, info, seen):  # type: ignore[no-untyped-def]
+        async def _teardown_probe(_info, _session_key):  # type: ignore[no-untyped-def]
+            # The real run.py yield point: record what a sibling scheduled
+            # here would observe about this member.
+            seen.append((_info.done, mgr.batch_reports_in_flight(info.batch_id)))
+
+        return _teardown_probe
+
+    def test_exception_path_arms_in_the_same_synchronous_block(self) -> None:
+        mgr, info = self._mgr_and_member()
+        seen: list = []
+
+        async def _boom(_info, _sk):  # type: ignore[no-untyped-def]
+            raise RuntimeError("boom")
+
+        async def _drive() -> None:
+            with (
+                patch.object(mgr, "_run_inner", _boom),
+                patch.object(mgr, "_teardown_run_session", self._checkpoint(mgr, info, seen)),
+            ):
+                await mgr._run(info)
+
+        asyncio.run(_drive())
+        assert seen, "teardown checkpoint never reached"
+        done_at_yield, in_flight_at_yield = seen[0]
+        assert done_at_yield is True
+        # The window under attack: done observable without the hold.
+        assert in_flight_at_yield is True, (
+            "done-but-unarmed window at the teardown yield: a sibling "
+            "completion here closes the wave early and the report "
+            "re-finalizes it (issue #8554)"
+        )
+
+    def test_timeout_path_arms_in_the_same_synchronous_block(self) -> None:
+        mgr, info = self._mgr_and_member()
+        mgr._default_timeout = 0.001
+        seen: list = []
+
+        async def _slow(_info, _sk):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(30)
+
+        async def _drive() -> None:
+            with (
+                patch.object(mgr, "_run_inner", _slow),
+                patch.object(mgr, "_teardown_run_session", self._checkpoint(mgr, info, seen)),
+            ):
+                await mgr._run(info)
+
+        asyncio.run(_drive())
+        assert seen and seen[0] == (True, True)
+
+    def test_cancel_path_arms_in_the_same_synchronous_block(self) -> None:
+        mgr, info = self._mgr_and_member()
+        info.user_stopped = True  # deterministic terminal (recovery-free) arm
+        seen: list = []
+        started = asyncio.Event()
+
+        async def _hang(_info, _sk):  # type: ignore[no-untyped-def]
+            started.set()
+            await asyncio.sleep(30)
+
+        async def _drive() -> None:
+            with (
+                patch.object(mgr, "_run_inner", _hang),
+                patch.object(mgr, "_teardown_run_session", self._checkpoint(mgr, info, seen)),
+            ):
+                run_task = asyncio.create_task(mgr._run(info))
+                await started.wait()
+                run_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run_task
+
+        asyncio.run(_drive())
+        assert seen and seen[0] == (True, True)
+
+
+class TestStrandGuards:
+    """An early-armed hold must always have a releaser.
+
+    Arming at the flip (instead of inside the report body) creates one new
+    hazard: a report/announce task cancelled BEFORE its first execution step
+    never runs its body's structural ``finally`` release. A hold nothing
+    releases pins ``batch_reports_in_flight`` forever — and the reaper's
+    deadline sweep deliberately SKIPS waves with a report in flight, so even
+    the last-resort exit is fenced off. The task done-callbacks own the
+    rescue: by task-done time a report is not in flight on any path.
+    """
+
+    def test_report_task_cancelled_before_first_run_releases_the_hold(self) -> None:
+        mgr = _mk_real_manager()
+        info = SubagentInfo(id="a-strand", task="t", batch_id="w9", batch_total=2)
+        mgr._agents[info.id] = info
+        info.done = True
+        mgr.arm_report_in_flight(info)  # the flip-site arm
+
+        async def _drive() -> None:
+            task = mgr._spawn_terminal_report(
+                info,
+                source="Subagent",
+                injection_timeout_reason="t/o",
+                mark_delivered_on_success=True,
+            )
+            task.cancel()  # before its first execution step
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            # Let the done-callback run.
+            await asyncio.sleep(0)
+
+        asyncio.run(_drive())
+        assert mgr.batch_reports_in_flight("w9") is False, (
+            "a report task cancelled before first run stranded the hold — "
+            "the wave-close fallback and the reaper sweep are both fenced "
+            "off forever (issue #8554)"
+        )
+
+    def test_rejection_announce_cancelled_before_first_run_releases_the_hold(self) -> None:
+        async def _noop_done(_info):  # type: ignore[no-untyped-def]
+            return None
+
+        mgr = _mk_real_manager(on_done=_noop_done)
+        info = SubagentInfo(id="a-rej", task="t", batch_id="w9", batch_total=2)
+        info.done = True
+        mgr.arm_report_in_flight(info)  # the rejection flip-site arm
+
+        async def _drive() -> None:
+            mgr._announce_rejection(info)
+            task = mgr._tasks[f"reject-{info.id}"]
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+
+        asyncio.run(_drive())
+        assert mgr.batch_reports_in_flight("w9") is False

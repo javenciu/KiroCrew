@@ -524,6 +524,9 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             else:
                 info.done = True
                 info.error = "spawn rejected: no approval mechanism configured"
+                # Registered terminal flip whose announce task arms a loop
+                # cycle later — arm with the flip (issue #8554).
+                self._manager.arm_report_in_flight(info)
                 self._manager._running_count -= 1
                 self._manager._drain_queue()
                 sel().log_tool_invocation(
@@ -547,6 +550,9 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         else:
             info.done = True
             info.error = "spawn rejected: no approval mechanism configured"
+            # Registered terminal flip whose announce task arms a loop cycle
+            # later — arm with the flip (issue #8554).
+            self._manager.arm_report_in_flight(info)
             self._manager._running_count -= 1
             self._manager._drain_queue()
             sel().log_tool_invocation(
@@ -571,16 +577,25 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             info (SubagentInfo): The subagent metadata.
         """
         assert self._manager._on_done is not None
+        # Records routed here never pass through `_report_terminal`, so this
+        # is their done-flip-equivalent moment: arm the done-but-unreported
+        # hold immediately before the announce (registered approval-parked
+        # rejections, batch rejections, lost-submission synthetics — all
+        # created/flipped ``done=True`` before reaching this coroutine).
+        # Flush-only records never arm (guarded inside the arm itself): they
+        # skip the consumer's accounting block entirely (issue #8554).
+        self._manager.arm_report_in_flight(info)
         try:
             await self._manager._on_done(info)
         except Exception:
-            # A failed announce never reaches the consumer's accounting. Most
-            # announces routed here are for UNREGISTERED synthetic records, but
-            # the approval-parked rejection is registered with done=True — clear
-            # its done-but-unreported hold so `batch_reports_in_flight` cannot
-            # strand the wave-close fallback (issue #8554).
-            info._report_consumed = True
             logger.exception("Subagent announce failed for %s", info.id)
+        finally:
+            # Structural release, mirroring `_report_terminal`'s: whether the
+            # consumer landed the contribution (idempotent no-op), the
+            # announce raised, or this task was cancelled — an announce that
+            # has ended is no longer in flight, and `batch_reports_in_flight`
+            # must not strand the wave-close fallback (issue #8554).
+            self._manager.consume_report_hold(info.batch_id, info.id)
 
     def _announce_rejection_impl(self, info: SubagentInfo) -> SubagentInfo:
         """Route a terminal spawn rejection through the done callback.
@@ -603,8 +618,15 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         """
         if info.batch_id and self._manager._on_done:
             try:
-                self._manager._tasks[f"reject-{info.id}"] = asyncio.ensure_future(
-                    self._manager._safe_announce(info)
+                _announce_task = asyncio.ensure_future(self._manager._safe_announce(info))
+                self._manager._tasks[f"reject-{info.id}"] = _announce_task
+                # Strand-guard mirroring `_spawn_terminal_report`'s (issue
+                # #8554): the rejection flip above armed the hold, and an
+                # announce task cancelled before its first run never reaches
+                # `_safe_announce`'s structural release. Idempotent no-op on
+                # every path where the release already happened.
+                _announce_task.add_done_callback(
+                    lambda _t: self._manager.consume_report_hold(info.batch_id, info.id)
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
@@ -829,6 +851,9 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             # separates this from a decline for a machine; the prose is what
             # separates it for the agent that receives the completion event.
             info.error = no_surface_error or "spawn rejected"
+            # Registered terminal flip whose announce task arms a loop cycle
+            # later — arm with the flip (issue #8554).
+            self._manager.arm_report_in_flight(info)
             # Slot accounting through the one-shot token, NOT a bare decrement.
             # A user Stop funnels into `_force_reap` and can land while this
             # approval is still pending (a human prompt has no deadline), and
