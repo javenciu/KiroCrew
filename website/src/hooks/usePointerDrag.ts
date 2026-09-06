@@ -33,10 +33,13 @@ export interface PointerDragOptions {
 interface DragInternal {
   startX: number
   startY: number
-  /** last position from a coordinate-bearing event (down/move/up/cancel).
-   *  got/lostpointercapture coordinates are not defined by the Pointer Events
-   *  spec (browsers commonly deliver 0,0), so the end payload derives from
-   *  this instead of trusting the terminal event. */
+  /** last position from a user-driven coordinate-bearing event (down/move/up).
+   *  Platform-fired ends can carry sentinel coordinates: the Pointer Events
+   *  spec leaves got/lostpointercapture coordinates undefined, and engines
+   *  have shipped pointercancel with 0,0 (the spec needed an explicit
+   *  clarification that cancel coordinates must match the last dispatched
+   *  event) — so the end payload derives from this instead of trusting a
+   *  terminal event. */
   lastX: number
   lastY: number
   active: boolean
@@ -105,15 +108,22 @@ export function usePointerDrag(opts: PointerDragOptions) {
     // gesture crossed the threshold so it can skip drag-only work.
     //
     // The payload derives from the last coordinate-bearing event, not from
-    // this event unconditionally: pointerup/pointercancel carry real
-    // coordinates and refresh the tracker here, but the Pointer Events spec
-    // leaves got/lostpointercapture coordinates undefined and browsers
-    // commonly deliver 0,0. Trusting those would hand consumers dx of
-    // roughly -startX on a mid-drag capture loss: resizers run
+    // this event unconditionally. This is an ALLOW-list: only pointerup — the
+    // user-driven end whose coordinates are spec-defined — refreshes the
+    // tracker. Every platform-fired end is excluded, because their
+    // coordinates are unreliable by spec or by shipped engines: the Pointer
+    // Events spec leaves got/lostpointercapture coordinates undefined, and
+    // engines have delivered pointercancel with 0,0 (Pointer Events L3 added
+    // an explicit clarification that cancel coordinates must match the last
+    // dispatched event precisely because behavior diverged). Trusting a
+    // sentinel would hand consumers dx of roughly -startX: resizers run
     // persist(apply(sign * dx)) in onEnd, which would snap the pane to a
     // clamped extreme or its collapsed state and WRITE it to localStorage,
     // a persisted wrong layout on the exact path this hook exists to heal.
-    if (e.type !== 'lostpointercapture') {
+    // On a conformant engine the excluded cancel carries the last dispatched
+    // coordinates — exactly what the tracker already holds — so committing
+    // the tracked position is lossless there and fail-safe everywhere else.
+    if (e.type === 'pointerup') {
       s.lastX = e.clientX
       s.lastY = e.clientY
     }

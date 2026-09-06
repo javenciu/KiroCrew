@@ -152,3 +152,73 @@ describe('usePointerDrag capture-loss termination', () => {
     })
   })
 })
+
+describe('usePointerDrag pointercancel sentinel coordinates', () => {
+  // pointercancel is platform-fired (touch scroll takeover, pen leaving range,
+  // palm rejection) — the user never chose its position. Pointer Events L3
+  // requires its coordinates to match the last dispatched pointer event, but
+  // engines have shipped pointercancel with 0,0 (the spec carries an explicit
+  // late "clarification about pointercancel coordinates" because behavior
+  // diverged). Trusting the event's coordinates is therefore at best equal to
+  // the hook's own tracker and at worst a dx of ≈ -startX that resizers
+  // persist to storage. The end payload must derive from the tracker.
+
+  it('a pointercancel with sentinel 0,0 coordinates ends from the last tracked position', () => {
+    const onEnd = vi.fn()
+    const { handle } = renderHandle({ onMove: () => {}, onEnd, threshold: 0 })
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100, clientY: 100 })
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 150, clientY: 110 })
+    // Legacy-engine shape: cancel delivered with default-initialized coords.
+    fireEvent.pointerCancel(handle, { pointerId: 1, clientX: 0, clientY: 0 })
+
+    expect(onEnd).toHaveBeenCalledTimes(1)
+    expect(onEnd.mock.calls[0][0]).toMatchObject({
+      dx: 50, dy: 10, x: 150, y: 110, committed: true,
+    })
+  })
+
+  it('a pointercancel before any move ends at the drag origin (dx 0), not at 0,0', () => {
+    const onEnd = vi.fn()
+    const { handle } = renderHandle({ onMove: () => {}, onEnd })
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100, clientY: 100 })
+    fireEvent.pointerCancel(handle, { pointerId: 1, clientX: 0, clientY: 0 })
+
+    expect(onEnd).toHaveBeenCalledTimes(1)
+    expect(onEnd.mock.calls[0][0]).toMatchObject({
+      dx: 0, dy: 0, x: 100, y: 100, committed: false,
+    })
+  })
+
+  it('a spec-conformant pointercancel (coordinates match the last dispatched event) ends identically', () => {
+    // Control: on an engine following Pointer Events L3 §4.2.7 the cancel
+    // carries the last dispatched coordinates — exactly what the tracker
+    // holds — so deriving from the tracker changes nothing.
+    const onEnd = vi.fn()
+    const { handle } = renderHandle({ onMove: () => {}, onEnd, threshold: 0 })
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100, clientY: 100 })
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 150, clientY: 110 })
+    fireEvent.pointerCancel(handle, { pointerId: 1, clientX: 150, clientY: 110 })
+
+    expect(onEnd).toHaveBeenCalledTimes(1)
+    expect(onEnd.mock.calls[0][0]).toMatchObject({
+      dx: 50, dy: 10, x: 150, y: 110, committed: true,
+    })
+  })
+
+  it('does not double-fire onEnd when lostpointercapture follows a pointercancel', () => {
+    // The spec's implicit-release steps fire lostpointercapture immediately
+    // after pointercancel for a captured pointer — the same idempotence
+    // contract as the pointerup twin above.
+    const onEnd = vi.fn()
+    const { handle } = renderHandle({ onMove: () => {}, onEnd })
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerCancel(handle, { pointerId: 1, clientX: 0, clientY: 0 })
+    fireEvent.lostPointerCapture(handle, { pointerId: 1 })
+
+    expect(onEnd).toHaveBeenCalledTimes(1)
+  })
+})
