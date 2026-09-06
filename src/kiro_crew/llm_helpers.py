@@ -19,13 +19,9 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import name_grant
-from kiro_crew.acp.client import (
-    AcpError,
-    AcpPromptBusy,
-    advertised_model_ids,
-    resolve_pin_spelling,
-)
+from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
 from kiro_crew.providers.base import (
