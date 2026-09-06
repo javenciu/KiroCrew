@@ -671,6 +671,174 @@ def test_is_sensitive_source_body_owns_the_pairing():
     assert security.is_sensitive_source_body(broken) is not None
 
 
+def test_doctest_examples_in_docstrings_are_scanned_as_code():
+    """A ``>>> `` example is code doctest will RUN, not documentation (#8824).
+
+    To the literal walk a docstring is one opaque string whose Python-call spelling
+    is not shell grammar, so the command inside
+    ``>>> subprocess.run("grep -r secret ...", shell=True)`` was never a subject.
+    The example's literals must convict exactly like the same literal in body
+    position (which the third case pins as the control).
+    """
+    from kiro_crew.security import is_sensitive_source_body
+
+    call_form = (
+        "def helper():\n"
+        '    """Sync helper.\n'
+        "\n"
+        "    Example:\n"
+        '        >>> subprocess.run("grep -r secret ~/.kiro/crew", shell=True)\n'
+        '    """\n'
+        "    return 1\n"
+    )
+    walk_form = (
+        "def helper():\n"
+        '    """Walk helper.\n'
+        "\n"
+        '    >>> os.system("find ~/.kiro/crew -name .env -exec cat {} +")\n'
+        '    """\n'
+        "    return 2\n"
+    )
+    control = 'cmd = "grep -r secret ~/.kiro/crew"\n'
+    for body in (call_form, walk_form, control):
+        assert is_sensitive_source_body(body) is not None, f"should block: {body!r}"
+
+
+def test_benign_doctest_examples_stay_allowed():
+    """The fix adds subjects, not grammar: ordinary examples must not new-deny."""
+    from kiro_crew.security import is_sensitive_source_body
+
+    benign = (
+        "def add(a, b):\n"
+        '    """Add two numbers.\n'
+        "\n"
+        "    >>> add(1, 2)\n"
+        "    3\n"
+        '    >>> add("x", "y")\n'
+        "    'xy'\n"
+        '    """\n'
+        "    return a + b\n"
+    )
+    assert is_sensitive_source_body(benign) is None
+
+
+def test_doctest_shell_transcript_example_still_denies():
+    """Example code that is not valid Python is raw text, and raw text is a subject.
+
+    A shell line pasted after ``>>> `` never parses, and the deny-direction fallback
+    hands the text itself to the passes rather than exonerating it.
+    """
+    from kiro_crew.security import is_sensitive_source_body
+
+    transcript = (
+        "def demo():\n"
+        '    """Usage:\n'
+        "\n"
+        "    >>> grep -r secret ~/.kiro/crew\n"
+        '    """\n'
+        "    return None\n"
+    )
+    assert is_sensitive_source_body(transcript) is not None
+
+
+def test_malformed_doctest_directive_cannot_exonerate():
+    """A directive the parser refuses (ValueError) must not skip the example.
+
+    Each contiguous ``>>> ``/``... `` block goes through the same literal
+    extraction, so a body cannot buy an exemption by breaking its own doctest
+    syntax.
+    """
+    from kiro_crew.security import is_sensitive_source_body
+
+    malformed = (
+        "def demo():\n"
+        '    """Usage:\n'
+        "\n"
+        '    >>> os.system("find ~/.kiro/crew -name .env -exec cat {} +")  # doctest: +NO_SUCH_OPTION\n'
+        '    """\n'
+        "    return None\n"
+    )
+    assert is_sensitive_source_body(malformed) is not None
+
+
+def test_malformed_doctest_continuation_lines_cannot_exonerate():
+    """A payload on a ``... `` continuation line under a malformed directive still
+    convicts, at deny-parity with the identical valid-syntax example.
+
+    The fallback walks contiguous ``>>> ``/``... `` blocks; skipping continuation
+    lines would make malformed input SAFER than well-formed input — the exact
+    inversion the extraction exists to prevent.
+    """
+    from kiro_crew.security import is_sensitive_source_body
+
+    malformed = (
+        "def demo():\n"
+        '    """Usage:\n'
+        "\n"
+        "    >>> if True:  # doctest: +NO_SUCH_OPTION\n"
+        '    ...     subprocess.run("grep -r secret ~/.kiro/crew", shell=True)\n'
+        '    """\n'
+        "    return None\n"
+    )
+    valid_control = malformed.replace("  # doctest: +NO_SUCH_OPTION", "")
+    assert is_sensitive_source_body(valid_control) is not None, "control must deny"
+    assert is_sensitive_source_body(malformed) is not None, "fallback must match control"
+
+
+def test_escape_spelled_fenced_read_in_example_convicts_via_fence_path():
+    """An example literal's escape spelling hides from the raw-text fence scan.
+
+    The example's OWN parse decodes ``\\x25`` to ``%`` and ``\\x5c`` to a
+    separator, so the code doctest runs reads the real store while the docstring's
+    raw text — the only thing the fence pass saw — matches no fence pattern. The
+    extracted (decoded) literal must take the same fence check as a literal in body
+    position, which the twin pins as the control.
+    """
+    from kiro_crew.security import (
+        _sensitive_run_in_source_literals,
+        is_sensitive_source_body,
+    )
+
+    hidden = (
+        "def helper():\n"
+        '    r"""Utility.\n'
+        "\n"
+        '    >>> fh = open("\\x25LOCALAPPDATA\\x25\\x5c\\x5ckiro-cli\\x5c\\x5cc.json")\n'
+        '    """\n'
+        "    return 1\n"
+    )
+    body_position_twin = (
+        'fh = open("\x25LOCALAPPDATA\x25\x5c\x5ckiro-cli\x5c\x5cc.json")\n'
+    )
+    parsed, reason = _sensitive_run_in_source_literals(hidden)
+    assert parsed is True
+    assert reason is not None, "fence pass must convict the decoded example literal"
+    twin_parsed, twin_reason = _sensitive_run_in_source_literals(body_position_twin)
+    assert twin_parsed is True
+    assert reason == twin_reason, "example literal must convict at body-position parity"
+    assert is_sensitive_source_body(hidden) is not None
+
+
+def test_benign_examples_stay_clear_of_the_fence_path():
+    """The wiring adds a check, not grammar: harmless example literals must not
+    new-deny, including ones that carry escape spellings of innocent paths."""
+    from kiro_crew.security import _sensitive_run_in_source_literals
+
+    benign = (
+        "def loader():\n"
+        '    r"""Read fixture data.\n'
+        "\n"
+        '    >>> fh = open("\\x2ftmp\\x2ffixtures\\x2fdata.json")\n'
+        "    >>> fh.readline()\n"
+        "    'header'\n"
+        '    """\n'
+        "    return None\n"
+    )
+    parsed, reason = _sensitive_run_in_source_literals(benign)
+    assert parsed is True
+    assert reason is None
+
+
 def test_authenticity_follows_the_module_through_an_alias():
     """Mutating the module under a second name is mutating the module.
 

@@ -6,6 +6,7 @@ import ast
 import asyncio
 import base64
 import bisect
+import doctest
 import fnmatch
 import ipaddress
 import json
@@ -11964,6 +11965,95 @@ def _reads_dunder_doc(tree: "ast.Module") -> bool:
     return False
 
 
+def _doctest_example_subjects(value: str, *, _depth: int = 0) -> "list[str]":
+    """Command-string subjects hiding in doctest examples inside *value* (#8824).
+
+    ``doctest`` EXECUTES the ``>>> `` examples in a docstring, but to the literal
+    walk a docstring is one opaque string whose Python-call spelling
+    (``>>> subprocess.run("grep -r secret ...", shell=True)``) is not shell grammar,
+    so the traversal passes never saw the command that actually runs. This re-reads
+    every example with Python's OWN parser (``doctest.DocTestParser`` -- the same
+    PS1/PS2 grammar the runner uses, never a hand-rolled regex) and hands back the
+    string literals inside the example code, so each rides the passes as its own
+    subject exactly like a literal in body position.
+
+    Every fallback errs toward denying, matching the module's direction everywhere
+    else: example code that is not valid Python (a shell transcript pasted after
+    ``>>> ``) comes back as raw text -- a subject that only ADDS a chance to convict;
+    a malformed doctest directive (``ValueError`` from the parser) must not
+    exonerate the text, so each contiguous ``>>> ``/``... `` block goes through
+    the SAME literal extraction, and breaking the doctest syntax cannot buy an
+    exemption for any line of the example. Nested
+    examples (a docstring quoting a docstring) are followed to a small fixed depth --
+    past it the inner text was already appended as a plain subject one level up, so
+    nothing is silently dropped.
+    """
+    if _depth >= 3 or ">>>" not in value:
+        return []
+
+    def _from_example_source(example_source: str) -> "list[str]":
+        """Literals inside one example's code -- or the code itself if unparseable."""
+        example_source = example_source.strip()
+        if not example_source:
+            return []
+        example_tree = _parse_source_body(example_source)
+        if example_tree is None:
+            return [example_source]
+        collected: list[str] = []
+        for inner_node in ast.walk(example_tree):
+            if not isinstance(inner_node, ast.Constant):
+                continue
+            if isinstance(inner_node.value, str):
+                inner = inner_node.value
+            elif isinstance(inner_node.value, bytes):
+                inner = inner_node.value.decode("latin-1")
+            else:
+                continue
+            if not inner.strip():
+                continue
+            collected.append(inner)
+            collected.extend(_doctest_example_subjects(inner, _depth=_depth + 1))
+        return collected
+
+    try:
+        examples = doctest.DocTestParser().get_examples(value)
+    except ValueError:
+        # A directive the parser refuses must not exonerate the example: raw
+        # ``>>> `` lines AND their ``... `` continuation lines go through the SAME
+        # literal extraction, joined into the contiguous block they form, so
+        # breaking the doctest syntax cannot buy an exemption for any line of the
+        # example -- a payload moved onto a continuation line is still a subject.
+        out: list[str] = []
+        block: list[str] = []
+
+        def _after_marker(text: str) -> str:
+            # doctest's own convention: the marker is ``>>>``/``...`` plus ONE
+            # space; anything beyond that space is the example's own indentation
+            # and must survive, or a continuation body arrives dedented and an
+            # ``if True:`` block becomes an IndentationError -- raw text again.
+            rest = text[3:]
+            return rest[1:] if rest.startswith(" ") else rest
+
+        for line in value.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith(">>>"):
+                if block:
+                    out.extend(_from_example_source("\n".join(block)))
+                block = [_after_marker(stripped)]
+            elif stripped.startswith("...") and block:
+                block.append(_after_marker(stripped))
+            elif block:
+                out.extend(_from_example_source("\n".join(block)))
+                block = []
+        if block:
+            out.extend(_from_example_source("\n".join(block)))
+        return out
+    out = []
+    for example in examples:
+        out.extend(_from_example_source(example.source))
+    return out
+
+
 def _source_command_subjects(tree: "ast.Module") -> "tuple[str, ...] | None":
     """The command strings *tree* CARRIES, as subjects for the two traversal passes.
 
@@ -12032,8 +12122,6 @@ def _source_command_subjects(tree: "ast.Module") -> "tuple[str, ...] | None":
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant):
             continue
-        if id(node) in docstrings:
-            continue
         if isinstance(node.value, str):
             value = node.value
         elif isinstance(node.value, bytes):
@@ -12042,9 +12130,23 @@ def _source_command_subjects(tree: "ast.Module") -> "tuple[str, ...] | None":
             continue
         if not value.strip():
             continue
-        if len(found) >= _SOURCE_COMMAND_SUBJECT_CAP:
-            return None
-        found.append((getattr(node, "lineno", 0), getattr(node, "col_offset", 0), value))
+        if id(node) not in docstrings:
+            if len(found) >= _SOURCE_COMMAND_SUBJECT_CAP:
+                return None
+            found.append((getattr(node, "lineno", 0), getattr(node, "col_offset", 0), value))
+        # Doctest examples inside this constant are executable code (#8824): their
+        # literals join the subjects under the SAME cap -- a body over it was never
+        # inspected, so allowing would make the cap the bypass. This runs for
+        # docstring-position constants TOO: the exclusion above withholds the
+        # docstring's PROSE as a whole-subject (it is documentation by position),
+        # while a ``>>> `` example inside it is code ``doctest`` RUNS -- the two
+        # treatments compose, they do not compete.
+        for extra in _doctest_example_subjects(value):
+            if len(found) >= _SOURCE_COMMAND_SUBJECT_CAP:
+                return None
+            found.append(
+                (getattr(node, "lineno", 0), getattr(node, "col_offset", 0), extra)
+            )
     return tuple(value for _, _, value in sorted(found, key=lambda item: item[:2]))
 
 
@@ -12135,6 +12237,20 @@ def _sensitive_run_in_source_literals(
                             or not re_authentic
                         ):
                             return reason
+                    # Doctest examples inside this literal are executable code
+                    # (#8824): the example's OWN parse decodes its escape spellings,
+                    # so a fenced read spelled ``\x25LOCALAPPDATA\x25…`` hides in
+                    # this literal's raw text -- which the check above just scanned
+                    # and cleared -- while executing against the real store. Each
+                    # extracted literal therefore takes the SAME fence check. The
+                    # pattern-slot exoneration is NOT inherited: it is earned by the
+                    # literal that OCCUPIES the slot, and an example literal sits
+                    # inside that literal, not in the slot -- denying matches the
+                    # module's direction everywhere an exoneration is in doubt.
+                    for example_value in _doctest_example_subjects(value):
+                        example_reason = _fence_hit_in_collapsed(example_value)
+                        if example_reason:
+                            return example_reason
             nested = visit(child, parents + [node])
             if nested:
                 return nested
