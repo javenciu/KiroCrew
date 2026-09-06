@@ -105,4 +105,50 @@ describe('usePointerDrag capture-loss termination', () => {
     fireEvent.pointerUp(handle, { pointerId: 2, clientX: 35, clientY: 30 })
     expect(onEnd).toHaveBeenCalledTimes(2)
   })
+
+  it('ends a capture-loss drag from the last moved-to position, not the event coordinates', () => {
+    // The Pointer Events spec does not define pointer coordinates on
+    // lostpointercapture; browsers commonly deliver 0,0. If the end payload
+    // trusted them, dx would resolve to ≈ -startX and consumers that
+    // persist(apply(sign * dx)) in onEnd would commit a clamped/collapsed
+    // layout to storage — a persisted wrong layout on the rare path.
+    const onEnd = vi.fn()
+    const { handle } = renderHandle({ onMove: () => {}, onEnd, threshold: 0 })
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100, clientY: 100 })
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 150, clientY: 110 })
+    fireEvent.lostPointerCapture(handle, { pointerId: 1, clientX: 0, clientY: 0 })
+
+    expect(onEnd).toHaveBeenCalledTimes(1)
+    expect(onEnd.mock.calls[0][0]).toMatchObject({
+      dx: 50, dy: 10, x: 150, y: 110, committed: true,
+    })
+  })
+
+  it('a normal pointerup still ends from its own (real) coordinates', () => {
+    // Control: up/cancel coordinates are spec-defined — they stay
+    // authoritative and refresh the tracked position.
+    const onEnd = vi.fn()
+    const { handle } = renderHandle({ onMove: () => {}, onEnd, threshold: 0 })
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100, clientY: 100 })
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 150, clientY: 100 })
+    fireEvent.pointerUp(handle, { pointerId: 1, clientX: 160, clientY: 105 })
+
+    expect(onEnd).toHaveBeenCalledTimes(1)
+    expect(onEnd.mock.calls[0][0]).toMatchObject({ dx: 60, dy: 5, x: 160, y: 105 })
+  })
+
+  it('a capture loss before any move ends at the drag origin (dx 0), not at 0,0', () => {
+    const onEnd = vi.fn()
+    const { handle } = renderHandle({ onMove: () => {}, onEnd })
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100, clientY: 100 })
+    fireEvent.lostPointerCapture(handle, { pointerId: 1, clientX: 0, clientY: 0 })
+
+    expect(onEnd).toHaveBeenCalledTimes(1)
+    expect(onEnd.mock.calls[0][0]).toMatchObject({
+      dx: 0, dy: 0, x: 100, y: 100, committed: false,
+    })
+  })
 })

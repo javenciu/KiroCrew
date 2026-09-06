@@ -33,6 +33,12 @@ export interface PointerDragOptions {
 interface DragInternal {
   startX: number
   startY: number
+  /** last position from a coordinate-bearing event (down/move/up/cancel).
+   *  got/lostpointercapture coordinates are not defined by the Pointer Events
+   *  spec (browsers commonly deliver 0,0), so the end payload derives from
+   *  this instead of trusting the terminal event. */
+  lastX: number
+  lastY: number
   active: boolean
   committed: boolean
 }
@@ -44,7 +50,7 @@ interface DragInternal {
  */
 export function usePointerDrag(opts: PointerDragOptions) {
   const st = useRef<DragInternal>({
-    startX: 0, startY: 0, active: false, committed: false,
+    startX: 0, startY: 0, lastX: 0, lastY: 0, active: false, committed: false,
   })
   const optsRef = useRef(opts)
   optsRef.current = opts
@@ -57,6 +63,8 @@ export function usePointerDrag(opts: PointerDragOptions) {
     const s = st.current
     s.startX = e.clientX
     s.startY = e.clientY
+    s.lastX = e.clientX
+    s.lastY = e.clientY
     s.active = true
     s.committed = (optsRef.current.threshold ?? 10) <= 0
     optsRef.current.onStart?.(e)
@@ -69,6 +77,10 @@ export function usePointerDrag(opts: PointerDragOptions) {
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const s = st.current
     if (!s.active) return
+    // Track pre-threshold moves too: a capture loss during hysteresis must
+    // still end from the true (small) delta, not a stale origin.
+    s.lastX = e.clientX
+    s.lastY = e.clientY
     const dx = e.clientX - s.startX
     const dy = e.clientY - s.startY
     const threshold = optsRef.current.threshold ?? 10
@@ -91,11 +103,25 @@ export function usePointerDrag(opts: PointerDragOptions) {
     // click on a thin handle would leave that state set forever. dx/dy reflect
     // actual movement (≈0 for a tap); `committed` tells the consumer whether the
     // gesture crossed the threshold so it can skip drag-only work.
+    //
+    // The payload derives from the last coordinate-bearing event, not from
+    // this event unconditionally: pointerup/pointercancel carry real
+    // coordinates and refresh the tracker here, but the Pointer Events spec
+    // leaves got/lostpointercapture coordinates undefined and browsers
+    // commonly deliver 0,0. Trusting those would hand consumers dx of
+    // roughly -startX on a mid-drag capture loss: resizers run
+    // persist(apply(sign * dx)) in onEnd, which would snap the pane to a
+    // clamped extreme or its collapsed state and WRITE it to localStorage,
+    // a persisted wrong layout on the exact path this hook exists to heal.
+    if (e.type !== 'lostpointercapture') {
+      s.lastX = e.clientX
+      s.lastY = e.clientY
+    }
     optsRef.current.onEnd?.({
-      dx: e.clientX - s.startX,
-      dy: e.clientY - s.startY,
-      x: e.clientX,
-      y: e.clientY,
+      dx: s.lastX - s.startX,
+      dy: s.lastY - s.startY,
+      x: s.lastX,
+      y: s.lastY,
       first: false,
       committed: s.committed,
     })
