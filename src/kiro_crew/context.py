@@ -691,45 +691,70 @@ def _member_marker_spans(text: str) -> list[tuple[int, int]]:
     """Merged spans of forgeable member-authority markers, in ORIGINAL coords.
 
     The matching view mirrors :func:`_member_normalized_view` — NFKC first,
-    then ``Cf`` drops and ``Pd`` dashes to ``-`` — but is built PER CHARACTER
-    with an origin map back to original offsets, the same mechanism
-    :func:`_structural_marker_spans` uses for its (narrower, non-NFKC) view.
+    then default-ignorable drops, ``_MULTIBYTE_TABLE`` punctuation folds and
+    ``Pd`` dashes to ``-`` — but is built PER COMBINING
+    SEQUENCE (base character plus its trailing combining marks) with an origin
+    map back to original offsets, the same mechanism
+    :func:`_structural_marker_spans` uses for its view.
 
-    Per-character NFKC differs from whole-string NFKC only in canonical
-    composition ACROSS characters (a base char merging with a following
-    combining mark), and every such composition yields a non-ASCII char — so
-    it can never produce the ASCII bracket/letter/hyphen alphabet the marker
-    patterns match on. The per-character view therefore matches everything
-    the whole-string view does; :func:`_scrub_member_payload` still re-checks
-    its result against the whole-string view and fails CLOSED.
+    Sequences — not lone characters — are the normalization unit because
+    canonical composition happens ACROSS characters within one sequence:
+    ``I`` + U+0307 composes to ``İ`` (U+0130) under whole-string NFKC, and
+    ``İ`` case-folds to ASCII ``i``, so a marker word carrying an embedded
+    combining mark matches the case-insensitive patterns on the whole-string
+    view. A per-character view cannot compose the pair, leaves the mark
+    splitting the word, misses the match, and strands the scrub on the
+    whole-payload fail-closed floor — corrupting legitimate content the
+    span-local rewrite exists to protect.
 
-    A single original char may fold to several view chars (``㎢`` → ``km2``);
-    a match touching any part of the fold maps to the WHOLE original char, so
-    spans only ever over-cover — the deny direction.
+    Residual divergences from the whole-string view (e.g. Hangul jamo, where
+    STARTERS compose with each other) survive this grouping, but every such
+    composition yields a non-ASCII char with no ASCII case fold, so it cannot
+    reach the marker alphabet; :func:`_scrub_member_payload` still re-checks
+    its result against the whole-string view and fails CLOSED regardless.
+
+    A single original char may fold to several view chars (``㎢`` → ``km2``),
+    and a sequence's marks travel with its base; a match touching any part of
+    the fold maps to the WHOLE original sequence, so spans only ever
+    over-cover — the deny direction.
     """
     if text.isascii():  # pure ASCII cannot contain confusables — match directly
         raw = [m.span() for pattern in _MEMBER_MARKER_RES for m in pattern.finditer(text)]
     else:
         norm: list[str] = []
-        origin: list[int] = []
-        for idx, ch in enumerate(text):
-            if ch.isascii():
-                norm.append(ch)
-                origin.append(idx)
+        origin: list[tuple[int, int]] = []  # (start, end] original span per view char
+        i = 0
+        length = len(text)
+        while i < length:
+            if unicodedata.category(text[i]) == "Cf":
+                i += 1  # invisible for matching; still inside any marker's original span
                 continue
-            if unicodedata.category(ch) == "Cf":
-                continue  # invisible for matching; still inside any marker's original span
-            for c in unicodedata.normalize("NFKC", ch):
-                norm.append("-" if unicodedata.category(c) == "Pd" else c)
-                origin.append(idx)
+            # Extend through the base char's combining marks (Mn/Mc/Me). A Cf
+            # char terminates the sequence exactly as it blocks composition in
+            # the whole-string view (NFKC runs before the Cf drop there).
+            end = i + 1
+            while end < length and unicodedata.category(text[end]).startswith("M"):
+                end += 1
+            seq = text[i:end]
+            if seq.isascii():  # single ASCII char, no marks: no fold possible
+                norm.append(seq)
+                origin.append((i, end))
+            else:
+                for c in unicodedata.normalize("NFKC", seq):
+                    if _is_marker_ignorable(c):
+                        continue
+                    for folded in c.translate(_MULTIBYTE_TABLE):
+                        norm.append("-" if unicodedata.category(folded) == "Pd" else folded)
+                        origin.append((i, end))
+            i = end
 
         norm_str = "".join(norm)
         raw = []
         for pattern in _MEMBER_MARKER_RES:
             for m in pattern.finditer(norm_str):
                 s, e = m.span()
-                # Through the last matched char, in original coordinates.
-                raw.append((origin[s], origin[e - 1] + 1))
+                # Through the last matched sequence, in original coordinates.
+                raw.append((origin[s][0], origin[e - 1][1]))
 
     return _merge_overlapping_spans(raw)
 
@@ -737,7 +762,7 @@ def _member_marker_spans(text: str) -> list[tuple[int, int]]:
 def _scrub_member_payload(text: str) -> str:
     """Neutralize member-authority markers in an untrusted payload.
 
-    Detection runs on a normalized view (NFKC + ``Cf`` drop + ``Pd`` fold, see
+    Detection runs on a normalized view (NFKC + ignorable drop + ``Pd`` fold, see
     :func:`_member_marker_spans`) so a confusable forgery
     (``[PERM<zwsp>ANENT RULES‐``) cannot slip past the ASCII patterns — but
     the rewrite is SPAN-LOCAL in the ORIGINAL text: only matched marker spans
