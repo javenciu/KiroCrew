@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shlex
+import sys
 import threading
 import time
 import traceback
@@ -265,6 +266,57 @@ def _safe_folder_tree(folders: object) -> list[dict[str, Any]]:
     if not isinstance(folders, list):
         return []
     return [f for f in folders if isinstance(f, dict) and isinstance(f.get("id"), str)]
+
+
+def _slots_serialization_note(slots_data: object) -> str:
+    """Name the slot and field that broke JSON serialization, for a traceback note.
+
+    A dump failure on the slots projection means EVERY slots read path is broken
+    (GET ``/api/chat/slots``, the WS snapshot, and this broadcast all serialize
+    the same shape), and the stock message — "Object of type X is not JSON
+    serializable" — names neither the slot nor the field, which is how #6522 was
+    first misread as a broadcast bug (#8745). Values are withheld by design: slot
+    state can carry user text, and the type is enough to find the producer.
+
+    Diagnosis must never make the failure worse, so any surprise in the walk
+    degrades to a generic note instead of raising.
+    """
+    try:
+        if not isinstance(slots_data, list):
+            return (
+                "[slots-broadcast] slot projection is "
+                f"{type(slots_data).__name__}, not a list (value withheld)"
+            )
+        for i, entry in enumerate(slots_data):
+            try:
+                json.dumps(entry)
+                continue
+            except (TypeError, ValueError):
+                pass
+            if not isinstance(entry, dict):
+                return (
+                    f"[slots-broadcast] slot entry #{i} is not JSON-serializable: "
+                    f"type {type(entry).__name__} (value withheld)"
+                )
+            key = entry.get("key")
+            slot_name = key if isinstance(key, str) else f"#{i}"
+            for field, value in entry.items():
+                try:
+                    json.dumps(value)
+                except (TypeError, ValueError):
+                    return (
+                        f"[slots-broadcast] slot {slot_name!r} field {field!r} is not "
+                        f"JSON-serializable: type {type(value).__name__} (value withheld)"
+                    )
+            # Every field dumps on its own, yet the entry does not: a non-string
+            # key is the one shape that gets here.
+            return (
+                f"[slots-broadcast] slot {slot_name!r} fails serialization as a whole; "
+                "no single offending field — check for non-string dict keys (value withheld)"
+            )
+        return "[slots-broadcast] slot list fails serialization; no offending entry found"
+    except Exception:  # pragma: no cover - defensive: a diagnostic must not raise
+        return "[slots-broadcast] slot projection is not JSON-serializable (offender walk failed)"
 
 
 def _slots_ws_frame(
@@ -7577,7 +7629,11 @@ class DashboardState:
 
         Depth-counted so nested use is safe (an inner block must not flush early),
         and ``@contextmanager``'s try/finally unwinds the depth even if the body
-        raises. Only flushes if something actually asked to push.
+        raises. Only flushes if something actually asked to push. A flush that
+        itself fails while the body's own exception is unwinding annotates its
+        exception (`PEP 678`) so the buried original stays visible — the flush's
+        exception otherwise replaces the body's in the caller's view, demoting
+        the actual fault to ``__context__`` (how #6522 was first misread).
         """
         self._slots_push_suspend += 1
         try:
@@ -7586,7 +7642,19 @@ class DashboardState:
             self._slots_push_suspend -= 1
             if self._slots_push_suspend == 0 and self._slots_push_pending:
                 self._slots_push_pending = False
-                self.push_slots_update()
+                # Captured BEFORE the flush call: inside the `except` block below,
+                # sys.exc_info() would already name the flush's own exception.
+                unwinding_over = sys.exc_info()[1]
+                try:
+                    self.push_slots_update()
+                except BaseException as flush_exc:
+                    if unwinding_over is not None and unwinding_over is not flush_exc:
+                        flush_exc.add_note(
+                            "[slots-flush] the owed slots flush raised while unwinding "
+                            f"over an in-flight {type(unwinding_over).__name__}; that "
+                            "original exception is chained below as __context__"
+                        )
+                    raise
 
     def push_slots_update(self) -> None:
         """Push slots, keeping provider status confined to owner websockets.
@@ -7729,6 +7797,18 @@ class DashboardState:
         # ``_serialize_for_client`` re-filters app tokens.
         slots_data = self.serialize_slots()
         slots_data_ws = self.serialize_slots(dashboard_user=True)
+        # The evidenced way this broadcast fails is a non-serializable value in
+        # slot state (#6522, #8745): the dump raises, and the bare TypeError
+        # names neither the slot nor the field. Serialize up front and annotate
+        # the failure with the offender so one traceback is enough to find it.
+        # Both coalescing branches (leading edge and trailing timer) funnel
+        # through this method, so both report identically by construction.
+        # Diagnosis only: the exception still propagates unchanged.
+        try:
+            slots_json = json.dumps(slots_data)
+        except (TypeError, ValueError) as exc:
+            exc.add_note(_slots_serialization_note(slots_data))
+            raise
         mgr = getattr(self, "channel_manager", None)
         ch_trusted = bool(mgr and any(ch.trusted for ch in mgr._channels.values()))
         # Piggyback the allowlist generation so clients invalidate the cached
@@ -7757,7 +7837,7 @@ class DashboardState:
                 # unfiltered stream.
                 "_slots_list_ws": slots_data_ws,
                 "_yolo": yolo_active,
-                "slots": json.dumps(slots_data),
+                "slots": slots_json,
                 "channelTrusted": ch_trusted,
                 "gitlabHostsGeneration": gitlab_hosts_generation(),
                 # getattr, not self._folders: this read path runs on EVERY slots
