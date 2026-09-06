@@ -102,5 +102,22 @@ export function usePointerDrag(opts: PointerDragOptions) {
     s.committed = false
   }, [])
 
-  return { onPointerDown, onPointerMove, onPointerUp: end, onPointerCancel: end }
+  // lostpointercapture is the terminal event the Pointer Events spec fires
+  // when capture ends for ANY reason (explicit release, a capture steal by
+  // another element, browser-initiated cancellation). Without it, a drag
+  // whose capture dies mid-gesture never delivers onEnd: pointerup stops
+  // being retargeted to this element, so consumer onStart side effects
+  // (several resizers suppress body-wide text selection; others pin
+  // body.cursor or teardown-critical dragging flags) stay stuck while the
+  // component remains mounted and its unmount guards never run. The normal
+  // end path stays single-fire: `end` flips `s.active` false BEFORE calling
+  // releasePointerCapture, so the lostpointercapture that release triggers
+  // is a no-op re-entry.
+  return {
+    onPointerDown,
+    onPointerMove,
+    onPointerUp: end,
+    onPointerCancel: end,
+    onLostPointerCapture: end,
+  }
 }
