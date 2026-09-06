@@ -702,7 +702,10 @@ class TestEveryHostDenyCallSiteIsWired:
         src = self._src()
         anchor = 'if getattr(slot, "_batch_rejected", False):'
         assert anchor in src, "the cascade site moved -- guard is stale"
-        block = src.split(anchor, 1)[1][:3500]
+        # Window sized for the full cascade block: the audit-first SEL write
+        # (issue #8621) now sits between the anchor and the reject answer, so
+        # the original 3500-char window no longer reached the reject.
+        block = src.split(anchor, 1)[1][:5200]
         steer_at = block.find("_steer_policy_notice")
         reject_at = block.find("reject_tool(")
         assert steer_at != -1, "host-caused cascade no longer steers a notice"

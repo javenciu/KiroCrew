@@ -728,12 +728,11 @@ async def _reject_hook_blocked(
     # ConversationLog, and the sibling reject path (_safe_reject_title) redacts for
     # both that row and the audit.
     title, reason = _redacted_hook_block(event, pre_hook_results)
-    # BEFORE reject_tool: the unanswered permission request is what proves the
-    # turn is still in flight, so the steer is queued rather than dropped.
-    if refusal_notices is not None:
-        await _steer_policy_notice(client, title, reason, refusal_notices, slot)
-    await client.reject_tool(event.request_id)
-    slot.append("tool", f"🚫 {title} (hook blocked)", "msg msg-tool")
+    # Audit FIRST, before any wire I/O for this decision: the steer and the
+    # rejection both await the ACP pipe, and a backend that stops reading stdin
+    # blocks those awaits until the turn deadline cancels this coroutine — an
+    # SEL write sequenced after them never runs. Record the decision, then
+    # attempt delivery.
     sel().log_tool_invocation(
         session_key=session_key,
         agent=slot.agent or "kirocrew",
@@ -744,6 +743,12 @@ async def _reject_hook_blocked(
         request_id=event.request_id,
         metadata=metadata,
     )
+    # BEFORE reject_tool: the unanswered permission request is what proves the
+    # turn is still in flight, so the steer is queued rather than dropped.
+    if refusal_notices is not None:
+        await _steer_policy_notice(client, title, reason, refusal_notices, slot)
+    await client.reject_tool(event.request_id)
+    slot.append("tool", f"🚫 {title} (hook blocked)", "msg msg-tool")
     refusal_reasons.append((title, reason))
 
 
@@ -783,6 +788,20 @@ async def _reject_invalid_tool(
     """
     title = _redact_display_text(event.title)
     _reason = str(error)
+    # Audit FIRST, before any wire I/O for this decision (see
+    # _reject_hook_blocked): a stalled ACP reader cancels this coroutine at the
+    # turn deadline, and an SEL write sequenced after the awaits never runs.
+    sel().log_tool_invocation(
+        session_key=session_key,
+        agent=slot.agent or "kirocrew",
+        source="dashboard",
+        tool_name=title,
+        tool_kind=event.tool_kind,
+        outcome="denied",
+        request_id=event.request_id,
+        error=f"validation_failed: {error}",
+        metadata=metadata,
+    )
     # BEFORE reject_tool: the unanswered permission request is what proves the
     # turn is still in flight, so the steer is queued rather than dropped.
     if refusal_notices is not None:
@@ -797,17 +816,6 @@ async def _reject_invalid_tool(
         )
     await client.reject_tool(event.request_id)
     slot.append("tool", f"🚫 {title} (invalid: {error})", "msg msg-tool")
-    sel().log_tool_invocation(
-        session_key=session_key,
-        agent=slot.agent or "kirocrew",
-        source="dashboard",
-        tool_name=title,
-        tool_kind=event.tool_kind,
-        outcome="denied",
-        request_id=event.request_id,
-        error=f"validation_failed: {error}",
-        metadata=metadata,
-    )
     # The fallback's input. Without this entry a harness with no steer — or a
     # steer that was never folded in — leaves this deny with NO channel to the
     # model at all, while the policy path still gets its continuation. The
@@ -844,6 +852,20 @@ async def _reject_hook_error(
     """
     title = _redact_display_text(event.title)
     _safe_error = _redact_display_text(error)
+    # Audit FIRST, before any wire I/O for this decision (see
+    # _reject_hook_blocked): a stalled ACP reader cancels this coroutine at the
+    # turn deadline, and an SEL write sequenced after the awaits never runs.
+    sel().log_tool_invocation(
+        session_key=session_key,
+        agent=slot.agent or "kirocrew",
+        source="dashboard",
+        tool_name=title,
+        tool_kind=event.tool_kind,
+        outcome="hook_error",
+        request_id=event.request_id,
+        error=_safe_error,
+        metadata=metadata,
+    )
     # BEFORE reject_tool, for the same in-flight-turn reason as the sibling paths.
     if refusal_notices is not None:
         await _steer_policy_notice(
@@ -857,17 +879,6 @@ async def _reject_hook_error(
         )
     await client.reject_tool(event.request_id)
     slot.append("tool", f"🚫 {title} (hook error)", "msg msg-tool")
-    sel().log_tool_invocation(
-        session_key=session_key,
-        agent=slot.agent or "kirocrew",
-        source="dashboard",
-        tool_name=title,
-        tool_kind=event.tool_kind,
-        outcome="hook_error",
-        request_id=event.request_id,
-        error=_safe_error,
-        metadata=metadata,
-    )
     # See _reject_invalid_tool: the fallback needs an entry or this deny reaches
     # the model through no channel at all when the steer could not be delivered.
     refusal_reasons.append((title, _safe_error))
@@ -8362,6 +8373,20 @@ async def _run_chat(
                         _deny_title = _redact_display_text(event.title)
                         _deny_msg, _ = redact_exfiltration_urls(_deny_reason)
                         _deny_msg, _ = redact_credentials(_deny_msg)
+                        # Audit FIRST, before any wire I/O for this decision
+                        # (see _reject_hook_blocked): a stalled ACP reader
+                        # cancels this coroutine at the turn deadline, and an
+                        # SEL write sequenced after the awaits never runs.
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            agent=slot.agent or "kirocrew",
+                            source="dashboard",
+                            tool_name=_deny_title,
+                            tool_kind=event.tool_kind,
+                            outcome="denied",
+                            request_id=event.request_id,
+                            error="hook_deny",
+                        )
                         # In-band first, and BEFORE the rejection goes on the
                         # wire: holding the unanswered permission request is what
                         # guarantees the turn is still in flight, so the notice is
@@ -8388,16 +8413,6 @@ async def _run_chat(
                                 "kind": "permission",
                                 "text": f"Blocked: {_deny_title} — {_deny_msg}",
                             },
-                        )
-                        sel().log_tool_invocation(
-                            session_key=session_key,
-                            agent=slot.agent or "kirocrew",
-                            source="dashboard",
-                            tool_name=_deny_title,
-                            tool_kind=event.tool_kind,
-                            outcome="denied",
-                            request_id=event.request_id,
-                            error="hook_deny",
                         )
                         # Recoverable host-gate refusal: record for auto-recovery.
                         # _deny_title/_deny_msg are ALREADY redacted just above
@@ -8886,6 +8901,27 @@ async def _run_chat(
                 if getattr(slot, "_batch_rejected", False):
                     _title = _redact_display_text(event.title)
                     _cascade_cause = getattr(slot, "_batch_rejected_cause", "")
+                    # Audit FIRST, before any wire I/O for this decision (see
+                    # _reject_hook_blocked): a stalled ACP reader cancels this
+                    # coroutine at the turn deadline, and an SEL write sequenced
+                    # after the awaits never runs.
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        agent=slot.agent or "kirocrew",
+                        source="dashboard",
+                        tool_name=_title,
+                        tool_kind=event.tool_kind,
+                        outcome="rejected",
+                        request_id=event.request_id,
+                        # Additive provenance: an auditor separating "the user
+                        # refused this group" from "a host auto-decline cut it
+                        # short" needs the cause on the cascaded members too.
+                        metadata=(
+                            {"reason": "batch_rejection", "cause": _cascade_cause}
+                            if _cascade_cause
+                            else {"reason": "batch_rejection"}
+                        ),
+                    )
                     if _cascade_cause and not _batch_cascade_steered:
                         # Host-caused cascade: the batch's originating decline
                         # was an auto-decline (approval timeout, no budget,
@@ -8933,23 +8969,6 @@ async def _run_chat(
                         "resolved": "rejected",
                     }
                     slot.append("permission", _title, json.dumps(perm_meta))
-                    sel().log_tool_invocation(
-                        session_key=session_key,
-                        agent=slot.agent or "kirocrew",
-                        source="dashboard",
-                        tool_name=_title,
-                        tool_kind=event.tool_kind,
-                        outcome="rejected",
-                        request_id=event.request_id,
-                        # Additive provenance: an auditor separating "the user
-                        # refused this group" from "a host auto-decline cut it
-                        # short" needs the cause on the cascaded members too.
-                        metadata=(
-                            {"reason": "batch_rejection", "cause": _cascade_cause}
-                            if _cascade_cause
-                            else {"reason": "batch_rejection"}
-                        ),
-                    )
                     logger.warning("AUTO-REJECTED tool=%r (batch rejection)", event.title)
                     continue
                 # Interactive approval — send to frontend, wait for decision
@@ -9362,7 +9381,6 @@ async def _run_chat(
                             metadata={"reason": "interactive"},
                         )
                 else:
-                    await client.reject_tool(event.request_id)
                     # Explain WHY when the command tripped the read-only safety
                     # gate, so the pill reads "Cancelled due to unsafe shell
                     # pattern …" instead of the bare adapter default.
@@ -9375,13 +9393,10 @@ async def _run_chat(
                         _safety_reason, _ = redact_credentials(_safety_reason)
                     _safe_reject_title, _ = redact_exfiltration_urls(event.title)
                     _safe_reject_title, _ = redact_credentials(_safe_reject_title)
-                    if _safety_reason:
-                        _reject_label = f"🚫 {_safe_reject_title} (cancelled — {_safety_reason})"
-                    elif outcome == "rejected_once":
-                        _reject_label = f"🚫 {_safe_reject_title} (rejected — this call only)"
-                    else:
-                        _reject_label = f"🚫 {_safe_reject_title} (rejected)"
-                    slot.append("tool", _reject_label, "msg msg-tool")
+                    # Audit FIRST, before the rejection goes on the wire (see
+                    # _reject_hook_blocked): a stalled ACP reader cancels this
+                    # coroutine at the turn deadline, and an SEL write sequenced
+                    # after the await never runs.
                     sel().log_tool_invocation(
                         session_key=session_key,
                         agent=slot.agent or "kirocrew",
@@ -9392,6 +9407,14 @@ async def _run_chat(
                         request_id=event.request_id,
                         metadata={"reason": _safety_reason or "interactive"},
                     )
+                    await client.reject_tool(event.request_id)
+                    if _safety_reason:
+                        _reject_label = f"🚫 {_safe_reject_title} (cancelled — {_safety_reason})"
+                    elif outcome == "rejected_once":
+                        _reject_label = f"🚫 {_safe_reject_title} (rejected — this call only)"
+                    else:
+                        _reject_label = f"🚫 {_safe_reject_title} (rejected)"
+                    slot.append("tool", _reject_label, "msg msg-tool")
                     # NOTE: Do NOT append to _refusal_reasons here.
                     # This is an interactive user denial — the user chose to reject
                     # the tool. Refusal-recovery is only for system-side blocks —
