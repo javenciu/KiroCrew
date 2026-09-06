@@ -950,6 +950,49 @@ async def _await_cron_fire_time_gate(
     return reason, False
 
 
+async def _pre_create_cron_slot(dashboard_state: "DashboardState", job: CronJob) -> None:
+    """Pre-create the job's first-run dashboard tab (#8336), best-effort.
+
+    :func:`ensure_cron_slot` gives a first run its tab — and with it its
+    session-control caller identity and dashboard-surface routing — before
+    dispatch.  But the tab is an amenity of the run, not a precondition, and
+    the first bind does transcript I/O.  Awaiting it BARE in the pre-dispatch
+    window let any failure there kill the run the tab was meant to serve —
+    and worse than killing it: ``_execute`` clears ``run_never_started``
+    before invoking this callback and its ``except`` arm never re-arms it, so
+    an error propagating from here reached ``cron.py``'s delete site with the
+    retention marker down, and a ``delete_after_run`` one-shot — the DEFAULT
+    shape of an at-scheduled job — was consumed by a run that never
+    dispatched.  A review lane raised exactly that chain.
+
+    Same shape as :func:`_await_cron_fire_time_gate`, for the same reason:
+    the marker is armed for exactly the duration of the await, so the wake
+    deadline cancelling this coroutine AT the await leaves it standing
+    (``CancelledError`` is a ``BaseException`` on every interpreter in this
+    matrix and escapes the ``except Exception`` below) and the one-shot is
+    retained.  An ordinary failure is contained instead of propagated: the
+    run proceeds without the pre-created tab, losing first-run identity for
+    this run only — delivery's own bind still creates the tab afterwards,
+    which is exactly the status quo the pre-create improves on.  The clear on
+    the linear path is not optional either: dispatch begins after this call,
+    and holding the marker past it would retain a HEALTHY one-shot — the
+    same data-integrity failure pointing the other way (the fire-time gate
+    documents the identical contract).  ``record_failure()`` is deliberately
+    not called anywhere here: a tab that could not be minted is not a defect
+    of the job.
+    """
+    job.run_never_started = True
+    try:
+        await ensure_cron_slot(dashboard_state, job)
+    except Exception:
+        logger.warning(
+            "Cron '%s': first-run tab pre-create failed; running without it",
+            job.name,
+            exc_info=True,
+        )
+    job.run_never_started = False
+
+
 class CronClaimTimeDenied(Exception):
     """Governance refused the job when the worker CLAIMED its execution.
 
@@ -4382,8 +4425,12 @@ class GatewayOrchestrator:
             # none appeared. Decided HERE in favor of pre-creating anyway,
             # because gating the tab on the run reaching injection would recreate
             # the very hole this fixes — identity must exist DURING the run.
+            # Guarded wrapper, not a bare await: a tab we FAIL to mint must not
+            # kill — or, via the run_never_started lifecycle, CONSUME — the
+            # one-shot run it was meant to serve (see _pre_create_cron_slot
+            # for the retention-marker contract a review lane convicted here).
             if self.dashboard_state:
-                await ensure_cron_slot(self.dashboard_state, job)
+                await _pre_create_cron_slot(self.dashboard_state, job)
 
             def _cron_extra_env() -> dict[str, str] | None:
                 """job.env plus KIROCREW_APPROVAL_MODE when the job runs auto.

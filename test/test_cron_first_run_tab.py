@@ -232,3 +232,122 @@ def _inject_shaped(job):
     job.timezone = "UTC"
     job.last_result_stamp = CronJob._render_run_stamp(job, 0.0)
     return job
+
+
+class TestPreCreateGuard:
+    """The pre-create must never cost the run — or the job — its life.
+
+    A review lane convicted the bare ``await ensure_cron_slot(...)`` at the
+    gateway callsite: ``_execute`` (cron.py) clears ``run_never_started``
+    BEFORE the callback and its ``except`` arm never re-arms it, so an error
+    propagating out of the pre-dispatch window reached the delete site with
+    the retention marker down and a ``delete_after_run`` one-shot — the
+    default at-scheduled shape — was consumed by a run that never dispatched.
+    These pins hold ``_pre_create_cron_slot`` to the fire-time gate's proven
+    contract: armed for exactly the await, ordinary failure contained,
+    cancellation escaping WITH the marker, linear clear before dispatch.
+
+    The delete-decision assertions mirror cron.py's own expression verbatim
+    (``delete_owed = job.delete_after_run and not (job.fire_time_denied or
+    job.run_never_started)``) so a drift in either side breaks a test, not a
+    user's scheduled job.
+    """
+
+    @staticmethod
+    def _delete_owed(job) -> bool:
+        # Verbatim mirror of cron.py's delete site decision.
+        return bool(job.delete_after_run and not (job.fire_time_denied or job.run_never_started))
+
+    @staticmethod
+    def _arm_lifecycle(job):
+        """Mirror _execute's pre-callback state: marker cleared, one-shot owed."""
+        job.run_never_started = False
+        job.fire_time_denied = False
+        job.delete_after_run = True
+        return job
+
+    @pytest.mark.asyncio
+    async def test_attack_slot_failure_is_contained_and_run_proceeds(self):
+        """A transcript/store error during the pre-create must NOT propagate:
+        at the unguarded callsite it reached cron.py's except arm and the run
+        died for an amenity. Contained, the run proceeds; having actually
+        dispatched, a one-shot is then legitimately consumed."""
+        from kiro_crew.slack.gateway import _pre_create_cron_slot
+
+        state = _make_state()
+        job = self._arm_lifecycle(_make_job())
+        state.conversation_log.read_messages.side_effect = OSError("transcript unreadable")
+
+        await _pre_create_cron_slot(state, job)  # must not raise
+
+        assert job.run_never_started is False, "dispatch begins after the guard: marker must clear"
+        assert self._delete_owed(job) is True, "a run that DID dispatch still consumes its one-shot"
+
+    @pytest.mark.asyncio
+    async def test_attack_cancel_at_await_retains_the_one_shot(self):
+        """The wake deadline cancelling AT the pre-create await is the exact
+        convicted window: CancelledError must escape (cancellation is not
+        ours to swallow) AND leave run_never_started armed, so the delete
+        site retains the unexecuted one-shot."""
+        import asyncio
+
+        from kiro_crew.slack.gateway import _pre_create_cron_slot
+
+        state = _make_state()
+        job = self._arm_lifecycle(_make_job())
+
+        started = asyncio.Event()
+
+        def _hang(*a, **k):
+            # read_messages runs off-loop via prefetch; block it until cancelled.
+            started.set()
+            # A short sync sleep keeps the await pending long enough to cancel.
+            import time as _time
+
+            _time.sleep(0.05)
+            return []
+
+        state.conversation_log.read_messages.side_effect = _hang
+        task = asyncio.ensure_future(_pre_create_cron_slot(state, job))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert (
+            job.run_never_started is True
+        ), "cancelled pre-dispatch: retention marker must survive"
+        assert self._delete_owed(job) is False, "the unexecuted one-shot must be retained"
+
+    @pytest.mark.asyncio
+    async def test_control_normal_first_run_still_binds_through_the_guard(self):
+        """The guard changes failure semantics only: the healthy path still
+        mints the tab, binds identity, and clears the marker for dispatch."""
+        from kiro_crew.slack.gateway import _pre_create_cron_slot
+
+        state = _make_state()
+        job = self._arm_lifecycle(_make_job())
+
+        await _pre_create_cron_slot(state, job)
+
+        slot = state.get_slot("cron-job42")
+        assert slot is not None and slot.linked_session_key == "cron:job42"
+        assert caller_slot_key(state, "cron:job42") == "cron-job42"
+        assert job.run_never_started is False
+        assert self._delete_owed(job) is True, "healthy one-shot must still be consumed post-run"
+
+    @pytest.mark.asyncio
+    async def test_control_ineligible_job_untouched_no_new_deny(self):
+        """Benign no-new-deny: the wrapper adds no refusal path of its own —
+        eligibility still lives in ensure_cron_slot, an ineligible job gets
+        no tab and no marker residue."""
+        from kiro_crew.slack.gateway import _pre_create_cron_slot
+
+        state = _make_state()
+        job = self._arm_lifecycle(_make_job(hidden=True))
+
+        await _pre_create_cron_slot(state, job)
+
+        assert state.get_slot("cron-job42") is None
+        assert job.run_never_started is False
+        assert self._delete_owed(job) is True
