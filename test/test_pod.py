@@ -4252,8 +4252,61 @@ class TestRuntimeHelpers:
                 return b'{"token":"tok-xyz"}'
 
         monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
-        monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
+        monkeypatch.setattr(rt, "unix_socket_urlopen", lambda *a, **k: _Resp())
         assert rt.mint_token(c, "demo", "1h") == "tok-xyz"
+
+    def test_mint_token_sends_the_secret_only_over_the_pod_socket(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The X-Local-Secret request rides the pod's AF_UNIX socket, never TCP.
+
+        The TCP-era transport (#8552) attested ownership and then opened a
+        SEPARATE loopback connection carrying the secret: a pod exiting inside
+        that window frees the port for any local user, and loopback TCP has no
+        peer-credential API to tell the squatter from the gateway. The socket
+        lives inside the pod's owner-only home, so delivery there cannot reach
+        another user -- and `unix_socket_urlopen` has no TCP handler, making
+        "no fallback" structural. This test pins both properties: the TCP
+        opener is never consulted, and the secret-bearing request lands on
+        exactly the pod's own socket path.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        home = c.home_dir("demo")
+        home.mkdir(parents=True)
+        (home / ".local_secret").write_text("s3cret")
+
+        class _Resp:
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b'{"token":"tok-uds"}'
+
+        tcp_calls: list[object] = []
+        uds_calls: list[dict[str, object]] = []
+
+        def _tcp(*a: object, **k: object) -> "_Resp":
+            tcp_calls.append(a)
+            return _Resp()
+
+        def _uds(req: object, timeout: float, *, socket_path: object) -> "_Resp":
+            uds_calls.append({"req": req, "socket_path": socket_path})
+            return _Resp()
+
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "loopback_urlopen", _tcp)
+        monkeypatch.setattr(rt, "unix_socket_urlopen", _uds)
+
+        assert rt.mint_token(c, "demo", "1h") == "tok-uds"
+        assert tcp_calls == []  # the secret-bearing call has no TCP path at all
+        port = rt.derive_port(c, "demo")
+        assert uds_calls[0]["socket_path"] == rt.pod_socket_path(c, "demo", port)
+        req = uds_calls[0]["req"]
+        assert req.get_header("X-local-secret") == "s3cret"  # urllib-normalized key
 
     def test_mint_token_refuses_a_foreign_port_holder(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5095,14 +5148,14 @@ class TestReviewRound1Fixes:
             def read(self) -> bytes:
                 return b'{"token":"t"}'
 
-        def _urlopen(req: object, timeout: int = 5) -> "_Resp":
+        def _urlopen(req: object, timeout: int = 5, *, socket_path: object = None) -> "_Resp":
             captured["url"] = req.full_url  # type: ignore[attr-defined]
             return _Resp()
 
         # Mint now requires positive ownership proof; this test is about the URL
         # it builds, so grant the proof rather than exercising the guard here.
         monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
-        monkeypatch.setattr(rt, "loopback_urlopen", _urlopen)
+        monkeypatch.setattr(rt, "unix_socket_urlopen", _urlopen)
         rt.mint_token(c, "demo", "1 h")
         assert "ttl=1%20h" in captured["url"]
 

@@ -1769,8 +1769,10 @@ def health(cfg: PodConfig, name: str, port: int, timeout: int = 3) -> int:
 
 # --------------------------------------------------------------------------- #
 # Token mint — reads the pod's OWN .local_secret (in its isolated HOME), then
-# calls /api/token/local with X-Local-Secret. Keeps the secret read inside this
-# process (never an agent-issued `cat`).
+# calls /api/token/local with X-Local-Secret over the pod's private unix
+# socket. Keeps the secret read inside this process (never an agent-issued
+# `cat`), and keeps the secret's delivery inside the pod's owner-only home
+# (never a rebindable loopback port — #8552).
 # --------------------------------------------------------------------------- #
 def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
     secret_file = cfg.home_dir(name) / ".local_secret"
@@ -1783,14 +1785,11 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
     port = derive_port(cfg, name)
     owner = port_owner(cfg, name, port)
     if owner != OWNER_POD:
-        # Positive proof REQUIRED here, unlike `health`. This call sends the pod's
-        # own ``.local_secret`` and returns a dashboard credential for whatever
-        # answered, so the two ways of being wrong are not symmetrical: refusing a
-        # live pod costs an error message, while proceeding on an unproven port
-        # hands a different local user -- who can bind 127.0.0.1 but cannot read
-        # this 0600 secret -- a credential for this pod. That is the same reason
-        # ``port_resolution._gateway_owns_port`` fails closed on the path that
-        # sends the secret, including when the listener lookup is simply missing.
+        # Positive proof kept even though the send below rides the pod's own
+        # unix socket: the pre-check costs one process lookup and buys the
+        # refusal messages below, which name WHY the pod cannot answer instead
+        # of surfacing a bare connection error from the socket. The transport
+        # is what makes the secret safe; this is what makes the failure legible.
         if owner == OWNER_FOREIGN:
             raise PodError(
                 f"refusing to mint a credential for pod {name!r}: :{port} is held "
@@ -1805,15 +1804,27 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
             f"process would receive the pod's secret. "
             f"{_unproven_remedy(cfg, name, port)}"
         )
+    socket_path = pod_socket_path(cfg, name, port)
     url = f"http://127.0.0.1:{port}/api/token/local?ttl={urllib.parse.quote(str(ttl))}"
     req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
     try:
-        # Loopback-only call to the pod's own gateway on 127.0.0.1; the URL is
-        # internally derived, so the dynamic-URL SSRF audit rule is a false positive.
-        with loopback_urlopen(req, timeout=5) as resp:  # nosemgrep
+        # Over the pod's own unix socket, never TCP (#8552): this request CARRIES
+        # the pod's `.local_secret`, and the pod's TCP port is ordinary loopback
+        # that any local user can bind the moment the pod releases it — with no
+        # peer-credential API on the wire to tell the squatter from the gateway.
+        # `unix_socket_urlopen` has no TCP handler, so "no fallback" is structural:
+        # a missing, stale, or refusing socket raises instead of handing the
+        # header to whatever answered. The URL keeps the loopback host so the
+        # gateway's Host validation sees exactly what it saw on TCP; the socket
+        # path is derived, never caller-supplied.
+        with unix_socket_urlopen(req, timeout=5, socket_path=socket_path) as resp:  # nosemgrep
             token = json.loads(resp.read()).get("token", "")
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise PodError(f"token mint failed on :{port} ({name}): {exc}") from exc
+        raise PodError(
+            f"token mint for pod {name!r} did not complete over its API socket "
+            f"({socket_path}): {exc}. Not retried on 127.0.0.1:{port} — the pod's "
+            f"secret must not be sent to a process that is not this pod's gateway."
+        ) from exc
     if not token:
         raise PodError(f"gateway returned empty token on :{port} ({name})")
     return token
