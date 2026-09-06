@@ -2361,6 +2361,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         note = {"ts": "2026-09-05T00:00:00Z", "msg": "LIVE-NOTE", "kind": "agent"}
         ran_during_copy = threading.Event()
         submitted: list[object] = []
+        dst = str(home / "notifications.jsonl")
         real_open = os.open
 
         def append_note() -> None:
@@ -2369,7 +2370,16 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
 
         def opening(path, flags, *args, **kwargs):
             fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT and not submitted:
+            # Scoped to the copy's own destination open, not to "the first O_CREAT
+            # seen anywhere": this hook patches `os.open` PROCESS-WIDE, and on a
+            # loaded CI shard the first creating open can belong to another thread
+            # entirely (issue #8893 -- both ordering tests in this class fired on
+            # shard 4 for PRs whose diffs never touch this path). A foreign trigger
+            # submits the append while the worker is still FREE, and the assertion
+            # then reads a real ordering guarantee as broken. The destination is the
+            # one open the copy performs while it occupies the worker, so it is the
+            # only trigger that measures the serialisation.
+            if flags & os.O_CREAT and os.fspath(path) == dst and not submitted:
                 submitted.append(pool.submit(append_note))
                 # A FREE worker runs this in microseconds; a worker the copy is running
                 # on cannot run it at all until the copy returns.
@@ -2460,6 +2470,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         note = {"ts": "2026-09-05T00:00:00Z", "msg": "LIVE-NOTE", "kind": "agent"}
         ran_during_copy = threading.Event()
         fired: list[int] = []
+        dst = str(home / "notifications.jsonl")
         real_open = os.open
 
         def append_note() -> None:
@@ -2468,7 +2479,14 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
 
         def opening(path, flags, *args, **kwargs):
             fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT and not fired:
+            # Same scoping as the READER test above, same reason (issue #8893): the
+            # hook patches `os.open` PROCESS-WIDE, and on a loaded shard the first
+            # O_CREAT can come from a foreign thread while the notification worker is
+            # still FREE -- the append then runs immediately and the assertion reads
+            # the ordering guarantee as broken. Only the copy's own destination open
+            # happens while the copy occupies the worker, so it is the only trigger
+            # that measures the serialisation this test is about.
+            if flags & os.O_CREAT and os.fspath(path) == dst and not fired:
                 fired.append(1)
                 # The delivery sink's own route on a fresh gateway: it ACQUIRES the
                 # executor, creating it if the copy did not.
@@ -2489,6 +2507,99 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         assert any(
             r.get("msg") == "LIVE-NOTE" for r in rows
         ), f"the live notification was dropped by the positional cap ({len(rows)} rows)"
+
+    def test_the_ordering_trigger_ignores_a_foreign_O_CREAT_open(self, tmp_path, monkeypatch):
+        """The loaded-shard condition itself, kept as a test (issue #8893).
+
+        Both ordering tests in this class patch ``os.open`` PROCESS-WIDE, and both
+        fired on a contended CI shard for PRs that never touch this path: some other
+        thread's ``O_CREAT`` open arrived first, the append was submitted while the
+        notification worker was still FREE, and it ran immediately -- the assertion
+        then read a scheduling accident as a broken ordering guarantee. The fix is
+        the destination-path scope on the trigger, and this test is that condition
+        made deterministic: a churn thread is CONFIRMED to have done a creating open
+        before the merge even starts, so under the old first-O_CREAT-anywhere shape
+        the trigger is GUARANTEED foreign and the test fails every run, not one CI
+        run in a thousand. Under the scoped shape the churn is invisible, however
+        the scheduler interleaves it, and the ordering measurement is captured
+        INSIDE the trigger -- the wait's return value, taken while the copy still
+        holds the worker -- where the append's legitimate post-copy run cannot
+        race it: the trigger fired on the destination, the worker stayed held,
+        the note survived.
+        """
+        from kiro_crew.dashboard import state as dashboard_state
+
+        snap, home = self._snap(
+            tmp_path,
+            b"".join(
+                b'{"ts":"2026-01-%02dT00:00:00Z","msg":"archive-%d","kind":"agent"}\n'
+                % ((i % 28) + 1, i)
+                for i in range(dashboard_state._MAX_PERSISTED_NOTIFICATIONS)
+            ),
+        )
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        monkeypatch.setattr(dashboard_state, "_notification_io_pool", None)
+        note = {"ts": "2026-09-05T00:00:00Z", "msg": "LIVE-NOTE", "kind": "agent"}
+        ran_during_copy = threading.Event()
+        ran_while_worker_held: list[bool] = []
+        fired: list[str] = []
+        dst = str(home / "notifications.jsonl")
+        real_open = os.open
+
+        def append_note() -> None:
+            dashboard_state._persist_notification(note)
+            ran_during_copy.set()
+
+        def opening(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT and os.fspath(path) == dst and not fired:
+                fired.append(os.fspath(path))
+                dashboard_state._notification_io_executor().submit(append_note)
+                # The measurement is the WAIT'S RETURN VALUE, captured here. A free
+                # worker runs the queued append in microseconds and the wait returns
+                # True; the worker this copy occupies cannot run it at all, so the
+                # wait times out False. Re-reading the EVENT after the merge returns
+                # would race the append's legitimate post-copy run instead (the
+                # churner join below hands the worker exactly that window).
+                ran_while_worker_held.append(ran_during_copy.wait(timeout=1.0))
+            return fd
+
+        monkeypatch.setattr(os, "open", opening)
+
+        noise_dir = tmp_path / "foreign-o-creat"
+        noise_dir.mkdir()
+        stop = threading.Event()
+        churned_once = threading.Event()
+
+        def churn() -> None:
+            i = 0
+            while not stop.is_set():
+                p = noise_dir / f"scratch-{i}.tmp"
+                fd = os.open(str(p), os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(fd)
+                p.unlink(missing_ok=True)
+                churned_once.set()
+                i += 1
+
+        churner = threading.Thread(target=churn, name="foreign-o-creat", daemon=True)
+        churner.start()
+        try:
+            assert churned_once.wait(timeout=5.0), "the churn thread never opened a file"
+            self._merge(snap, home)
+        finally:
+            stop.set()
+            churner.join(timeout=5.0)
+
+        assert fired == [dst], f"the trigger fired on the wrong open(s): {fired}"
+        assert ran_while_worker_held == [False], (
+            "the append ran while the copy occupied the worker: a foreign trigger "
+            "submitted it while the worker was still free, or the ordering broke"
+        )
+        dashboard_state._notification_io_executor().submit(lambda: None).result()
+        rows = dashboard_state._load_notifications()
+        assert any(
+            r.get("msg") == "LIVE-NOTE" for r in rows
+        ), f"the live notification was dropped ({len(rows)} rows)"
 
     def test_an_import_failure_that_is_not_ImportError_is_not_swallowed(
         self, tmp_path, monkeypatch
