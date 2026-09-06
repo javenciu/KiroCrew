@@ -305,6 +305,66 @@ def strip_control_comments(text: str) -> str:
     return text[: m.start()]
 
 
+#: Prefix closures of the marker grammars, for
+#: :func:`split_trailing_protocol_suffix`'s unfinished-marker probe: a tail is
+#: a STILL-STREAMING marker only when every byte it holds so far could extend
+#: into a complete marker. ``[OPTIONS`` must be followed by ``:`` and then
+#: :data:`OPTIONS_RE_TRAILER`'s body (DOTALL; ``[`` admitted only when not
+#: opening a nested ``[OPTIONS:``). ``[STEERING`` follows the steer-ack
+#: grammar (``messaging/driver.py``): whitespace gap, literal ``steer-``, a
+#: nonempty hex/dash id, then an optional ``:`` summary -- spelled as nested
+#: optionals so every cut point of the literal run is admitted, while a tail
+#: that diverges from the grammar (``[OPTIONSDOC``, ``[STEERING
+#: acknowledgment``, ``steer-:``) is prose and stays visible. Case-sensitive
+#: on purpose: these probe the exact sentinels the detach walk locates.
+_OPTIONS_TAIL_PREFIX_RE = re.compile(
+    r"\[OPTIONS(?::(?:[^[]|\[(?!OPTIONS:))*)?\Z",
+    re.DOTALL,
+)
+_STEERING_TAIL_PREFIX_RE = re.compile(
+    r"\[STEERING(?:\s+(?:s(?:t(?:e(?:e(?:r(?:-(?:[0-9a-f-]+(?:\s*(?::\s*.*)?)?)?)?)?)?)?)?)?)?\Z",
+    re.DOTALL,
+)
+_MARKER_SENTINELS = (
+    ("[STEERING", _STEERING_TAIL_PREFIX_RE),
+    ("[OPTIONS", _OPTIONS_TAIL_PREFIX_RE),
+)
+
+
+def _rightmost_unfinished_marker(text: str) -> int:
+    """Start of the rightmost tail that is a strict prefix of a marker grammar.
+
+    Occurrences are probed RIGHTMOST-FIRST so label bytes that merely contain
+    a sentinel (a bare ``[OPTIONS`` without its colon is legal label content)
+    cannot shadow the genuine fragment start to their left. Each probe is
+    cheap: the ASCII ``]`` gate is one precomputed ``rfind`` comparison, and
+    the prefix regexes are anchored at the occurrence and die on the first
+    diverging byte, so an adversarial buffer repeating failing sentinels
+    walks linearly. Returns ``-1`` when no admissible occurrence exists.
+    """
+    last_close = text.rfind("]")
+    cursors = []
+    for sentinel, prefix_re in _MARKER_SENTINELS:
+        pos = text.rfind(sentinel)
+        if pos != -1:
+            cursors.append((pos, sentinel, prefix_re))
+    while cursors:
+        cursors.sort()
+        pos, sentinel, prefix_re = cursors.pop()  # rightmost overall
+        if pos <= last_close:
+            # ASCII-only unfinished gate (see the closer comment in
+            # ``split_trailing_protocol_suffix``): a ``]`` at/after this
+            # occurrence means the tail is not still-streaming -- and every
+            # remaining occurrence sits further left of that closer too.
+            break
+        if prefix_re.match(text, pos) is not None:
+            return pos
+        nxt = text.rfind(sentinel, 0, pos)
+        if nxt != -1:
+            cursors.append((nxt, sentinel, prefix_re))
+    return -1
+
+
 def split_trailing_protocol_suffix(text: str) -> tuple[str, str]:
     """Detach protocol trailers before a renderer length-splits ``text``.
 
@@ -314,20 +374,26 @@ def split_trailing_protocol_suffix(text: str) -> tuple[str, str]:
     marker leaves the complete block eligible for a mid-token chunk split.
     Return the visible prefix plus the entire protocol suffix so renderers can
     keep both markers together on the surviving tail.
+
+    An occurrence is judged against the marker GRAMMAR, never by bare
+    substring location: a mid-prose mention of ``[OPTIONS`` or ``[STEERING``
+    whose tail cannot extend into a complete marker stays visible, instead of
+    being detached and silently dropped from the rendered cut.
     """
     suffix_start = len(text)
-    idx = max(text.rfind("[STEERING"), text.rfind("[OPTIONS"))
-    # DELIBERATELY ASCII-ONLY -- do not widen this to ``MARKER_CLOSERS``.
-    # This asks "is the tail an UNFINISHED marker?", and mere PRESENCE of a
-    # closer is not completeness: a closer sitting inside a still-streaming
-    # label (``[OPTIONS: Use 】 the bracket``) would read as finished, the
-    # fragment would not be detached, and a length rotation could split the
-    # marker so raw fragments render and the pills are lost. Completeness is
-    # decided by ``OPTIONS_RE_TRAILER`` on the next line, which DOES accept the
-    # lookalikes -- so a complete lookalike-closed block is still pulled into
-    # the suffix. Widening here buys nothing (both paths already yield the same
-    # split for a complete tail) and reintroduces that bug.
-    if idx != -1 and "]" not in text[idx:]:
+    idx = _rightmost_unfinished_marker(text)
+    # DELIBERATELY ASCII-ONLY -- do not widen the helper's gate to
+    # ``MARKER_CLOSERS``. It asks "is the tail an UNFINISHED marker?", and
+    # mere PRESENCE of a closer is not completeness: a closer sitting inside
+    # a still-streaming label (``[OPTIONS: Use 】 the bracket``) would read as
+    # finished, the fragment would not be detached, and a length rotation
+    # could split the marker so raw fragments render and the pills are lost.
+    # Completeness is decided by ``OPTIONS_RE_TRAILER`` on the next line,
+    # which DOES accept the lookalikes -- so a complete lookalike-closed block
+    # is still pulled into the suffix. Widening there buys nothing (both paths
+    # already yield the same split for a complete tail) and reintroduces that
+    # bug.
+    if idx != -1:
         suffix_start = idx
 
     options = OPTIONS_RE_TRAILER.search(text[:suffix_start])
