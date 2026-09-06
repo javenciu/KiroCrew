@@ -2856,7 +2856,12 @@ parameter rather than a baked-in policy:
 - **`True` — a streaming surface** (Discord, Telegram, Teams, WeCom, and Webex's
   status frame). Text is still arriving, so an unfinished `[OPTIONS` fragment may
   be a marker mid-flight; hiding it keeps reserved protocol off the screen, and the
-  next frame re-renders from the full buffer, so nothing is lost.
+  next frame re-renders from the full buffer, so nothing is lost. Only a tail that
+  can still become the trailer is held back — `[OPTIONS` as the final bytes, or
+  `[OPTIONS:` with content still open. Any other byte after `[OPTIONS` is
+  grammar-dead (the trailer opens `[OPTIONS:`), so the fragment is quoted prose
+  and is kept: when no `]` ever arrives, the sealed frame re-trims too, so cutting
+  it would be the permanent loss below wearing a streaming excuse.
 - **`False` — a buffered surface that sends once** (Webex's final answer and the
   zero-widget path). Such a caller cannot tell a live fragment from prose, and
   cutting prose is permanent: a reply ending `see the [OPTIONS section` keeps its
