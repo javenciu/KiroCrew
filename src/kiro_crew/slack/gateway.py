@@ -113,6 +113,7 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.cron_inject import (
     context_meter_reading,
+    ensure_cron_slot,
     inject_cron_result_to_dashboard,
     prefetch_cron_history,
 )
@@ -4363,6 +4364,26 @@ class GatewayOrchestrator:
                     )
                 await _alert_cron_failure(job, gate_reason, denied=True)
                 return None
+
+            # ── First-run tab pre-create (#8336) ──
+            # The result injection at the end of this callback used to be the
+            # ONLY creator site for the job's dashboard tab, so during a NEW
+            # job's first run the tab did not exist: session-control caller
+            # identity (caller_slot_key walks slot links for cron:{id}) refused
+            # every verb with caller_unidentified, and the dashboard-surface
+            # registry had no row for sub-agent/widget/question/approval
+            # routing. Bind the tab up front — eligibility (persistent_session
+            # and not hide_in_chat) lives inside the helper, so script/command
+            # jobs never reach it (they return above) and ineligible message
+            # jobs are untouched. Placed AFTER the fire-time gate: a denied run
+            # dispatches nothing a tab could serve. Visible consequence, which
+            # #8336 flags as needing an explicit decision: a first run that
+            # starts and then fails now leaves an empty tab where previously
+            # none appeared. Decided HERE in favor of pre-creating anyway,
+            # because gating the tab on the run reaching injection would recreate
+            # the very hole this fixes — identity must exist DURING the run.
+            if self.dashboard_state:
+                await ensure_cron_slot(self.dashboard_state, job)
 
             def _cron_extra_env() -> dict[str, str] | None:
                 """job.env plus KIROCREW_APPROVAL_MODE when the job runs auto.
