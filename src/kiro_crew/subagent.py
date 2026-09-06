@@ -1433,6 +1433,17 @@ class SubagentInfo:
     # a report cancelled BEFORE delivery — which must be made recoverable on the
     # next start — from one cancelled AFTER it, which must not be re-delivered.
     _reported_to_parent: bool = False
+    # True once this member's terminal report has been CONSUMED by the batch
+    # completion consumer — its contribution has landed in the wave's
+    # done-count — or its announce terminally failed and nothing further will
+    # arrive. From `done = True` until this flips, the member is
+    # "done-but-unreported": `batch_members_pending()` no longer counts it,
+    # but the wave's done-count does not include it either, so a SIBLING
+    # completion reaching the consumer in that window would finalize the wave
+    # early and the in-flight report would then finalize it a second time.
+    # `batch_reports_in_flight()` reads this to hold the wave-close fallback
+    # open across the window (issue #8554).
+    _report_consumed: bool = False
 
     @property
     def outcome(self) -> str:
@@ -2210,6 +2221,9 @@ class SubagentManager:
 
     def batch_members_pending(self, batch_id: str) -> bool:
         return self._waves.batch_members_pending_impl(batch_id)
+
+    def batch_reports_in_flight(self, batch_id: str) -> bool:
+        return self._waves.batch_reports_in_flight_impl(batch_id)
 
     def finalize_batch(self, batch_id: str) -> None:
         return self._waves.finalize_batch_impl(batch_id)

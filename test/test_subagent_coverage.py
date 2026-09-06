@@ -2124,3 +2124,147 @@ class TestPlatformConstants:
         back to 100 there."""
         assert isinstance(sa._CLK_TCK, int)
         assert sa._CLK_TCK > 0
+
+
+# ── Manager: done-but-unreported wave accounting (issue #8554) ────────────
+
+
+class TestBatchReportsInFlight:
+    """``batch_reports_in_flight`` holds the wave-close fallback open across the
+    done-but-unreported window: ``info.done`` has flipped (so
+    ``batch_members_pending`` no longer counts the member) but its terminal
+    report has not yet been consumed, so the wave's done-count does not include
+    it either. Without the hold, a sibling completion landing in that window
+    finalizes the wave early and the in-flight report finalizes it again."""
+
+    def test_no_batch_id_is_never_in_flight(self) -> None:
+        assert _manager().batch_reports_in_flight("") is False
+
+    def test_done_but_unreported_member_is_in_flight(self) -> None:
+        mgr = _manager()
+        mgr._agents["a"] = _info("a", batch_id="w1", done=True)
+        assert mgr.batch_reports_in_flight("w1") is True
+
+    def test_consumed_report_is_not_in_flight(self) -> None:
+        mgr = _manager()
+        info = _info("a", batch_id="w1", done=True)
+        info._report_consumed = True
+        mgr._agents["a"] = info
+        assert mgr.batch_reports_in_flight("w1") is False
+
+    def test_live_member_is_not_in_flight(self) -> None:
+        """A member still RUNNING is `batch_members_pending`'s job — counting it
+        here too would make the two predicates redundant rather than
+        complementary."""
+        mgr = _manager()
+        mgr._agents["a"] = _info("a", batch_id="w1", done=False)
+        assert mgr.batch_reports_in_flight("w1") is False
+
+    def test_other_waves_members_do_not_count(self) -> None:
+        mgr = _manager()
+        mgr._agents["a"] = _info("a", batch_id="w2", done=True)
+        assert mgr.batch_reports_in_flight("w1") is False
+
+
+class TestReportsInFlightStrandBackstops:
+    """Every terminal arm that can end a member's report WITHOUT reaching the
+    completion consumer must clear the hold, or `batch_reports_in_flight`
+    would strand the wave-close fallback forever. The wave keeps its degraded
+    a-sibling-can-close liveness instead (issue #8554)."""
+
+    @pytest.mark.asyncio
+    async def test_report_injection_timeout_clears_the_hold(self) -> None:
+        """`asyncio.wait_for(self._on_done(info), …)` timing out is terminal for
+        the report: nothing further reaches the consumer for this member."""
+        mgr = _manager(on_done=AsyncMock(side_effect=asyncio.TimeoutError))
+        info = _info("a", batch_id="w1", done=True)
+        mgr._agents["a"] = info
+        assert mgr.batch_reports_in_flight("w1") is True
+
+        await mgr._run_terminal_report(
+            info,
+            source="Test",
+            injection_timeout_reason="delivery timed out (test)",
+            mark_delivered_on_success=False,
+        )
+
+        assert info._report_consumed is True
+        assert mgr.batch_reports_in_flight("w1") is False
+
+    @pytest.mark.asyncio
+    async def test_report_announce_failure_clears_the_hold(self) -> None:
+        mgr = _manager(on_done=AsyncMock(side_effect=RuntimeError("boom")))
+        info = _info("a", batch_id="w1", done=True)
+        mgr._agents["a"] = info
+
+        await mgr._run_terminal_report(
+            info,
+            source="Test",
+            injection_timeout_reason="delivery timed out (test)",
+            mark_delivered_on_success=False,
+        )
+
+        assert info._report_consumed is True
+        assert mgr.batch_reports_in_flight("w1") is False
+
+    @pytest.mark.asyncio
+    async def test_safe_announce_failure_clears_the_hold(self) -> None:
+        """The registered approval-parked rejection announces through
+        `_safe_announce`; a raising consumer must not leave it holding."""
+        mgr = _manager(on_done=AsyncMock(side_effect=RuntimeError("boom")))
+        info = _info("a", batch_id="w1", done=True)
+        mgr._agents["a"] = info
+
+        await mgr._safe_announce(info)
+
+        assert info._report_consumed is True
+        assert mgr.batch_reports_in_flight("w1") is False
+
+    @pytest.mark.asyncio
+    async def test_successful_report_leaves_the_flag_to_the_consumer(self) -> None:
+        """On the happy path the CONSUMER owns the flag (set in the same
+        synchronous block as the done-count increment) — the report machinery
+        itself must not set it early, or the window between `_on_done` starting
+        and the count landing would reopen."""
+        seen: list[bool] = []
+
+        async def _consumer(info: SubagentInfo) -> None:
+            seen.append(info._report_consumed)
+
+        mgr = _manager(on_done=_consumer)
+        info = _info("a", batch_id="w1", done=True)
+        mgr._agents["a"] = info
+
+        await mgr._run_terminal_report(
+            info,
+            source="Test",
+            injection_timeout_reason="delivery timed out (test)",
+            mark_delivered_on_success=False,
+        )
+
+        assert seen == [False]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_recovery_arm_clears_the_hold(self) -> None:
+        """The cancelled-recovery arm is deliberately report-free (limbo
+        avoidance — no finalize claim, no terminal report ever runs), so it is
+        the one terminal RECORD writer that must clear the hold itself."""
+        mgr = _manager()
+        info = _info("a", batch_id="w1")
+        info.started = 1.0
+        mgr._agents["a"] = info
+
+        with patch.object(mgr, "_write_tombstone"):
+            # From the test task, `_resume` awaits the ORIGINAL task — this
+            # test's own — which never finishes first: a deterministic block
+            # point with no timing dependence.
+            mgr._schedule_cancel_recovery(info)
+            recovery = mgr._tasks["a:recovery"]
+            await asyncio.sleep(0)  # let _resume start and park on the wait
+            recovery.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await recovery
+
+        assert info.done is True
+        assert info._report_consumed is True
+        assert mgr.batch_reports_in_flight("w1") is False

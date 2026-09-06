@@ -574,6 +574,12 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         try:
             await self._manager._on_done(info)
         except Exception:
+            # A failed announce never reaches the consumer's accounting. Most
+            # announces routed here are for UNREGISTERED synthetic records, but
+            # the approval-parked rejection is registered with done=True — clear
+            # its done-but-unreported hold so `batch_reports_in_flight` cannot
+            # strand the wave-close fallback (issue #8554).
+            info._report_consumed = True
             logger.exception("Subagent announce failed for %s", info.id)
 
     def _announce_rejection_impl(self, info: SubagentInfo) -> SubagentInfo:

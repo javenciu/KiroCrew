@@ -219,6 +219,14 @@ class TerminalCoordinator(ManagerComponent):
                 except Exception:
                     logger.debug("Failed to clean workspace result for %s", info.id, exc_info=True)
         except asyncio.TimeoutError:
+            # The report is terminally over — nothing further will reach the
+            # completion consumer for this member. Clear the
+            # done-but-unreported hold (usually already cleared: the consumer's
+            # accounting runs before the injection await this timeout
+            # interrupts) so `batch_reports_in_flight` cannot strand the wave;
+            # a sibling completion keeps its degraded ability to close the wave
+            # with this member's line missing (issue #8554).
+            info._report_consumed = True
             logger.error(
                 "%s: completion injection timed out for %s after %.0fs",
                 source,
@@ -238,6 +246,10 @@ class TerminalCoordinator(ManagerComponent):
                 )
             self._manager.notify_injection_failed(info, reason=injection_timeout_reason)
         except Exception:
+            # Same liveness backstop as the timeout arm: a report whose
+            # announce raised will never reach the consumer, so it must not
+            # hold `batch_reports_in_flight` open forever (issue #8554).
+            info._report_consumed = True
             logger.exception("%s: announce failed for %s", source, info.id)
 
     async def _run_terminal_report_impl(

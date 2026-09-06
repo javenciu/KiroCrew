@@ -43,6 +43,28 @@ class WaveDigestCoordinator(ManagerComponent):
             return True
         return any(p.get("batch_id") == batch_id for p in self._manager._queue)
 
+    def batch_reports_in_flight_impl(self, batch_id: str) -> bool:
+        """True while any registered member of *batch_id* is done-but-unreported:
+        ``info.done`` has flipped (so :meth:`batch_members_pending_impl` no
+        longer counts it) but its terminal report has not yet been consumed by
+        the completion consumer, so its contribution to the wave's done-count
+        has not landed. In that window a sibling completion reaching the
+        consumer sees ``done < total`` with no pending members — without this
+        check the last-member fallback finalizes the wave early, and the
+        in-flight report then re-creates the batch-progress record and
+        finalizes the same wave again (issue #8554). The flag is set by the
+        consumer itself the moment the member's contribution lands, and by the
+        report path's failure arms (a report that terminally failed is no
+        longer in flight — the wave keeps its degraded a-sibling-can-close
+        liveness instead of stranding).
+        """
+        if not batch_id:
+            return False
+        return any(
+            a.batch_id == batch_id and a.done and not a._report_consumed
+            for a in self._manager._agents.values()
+        )
+
     def finalize_batch_impl(self, batch_id: str) -> None:
         """Prune per-wave bookkeeping once the wave digest has fired.
 

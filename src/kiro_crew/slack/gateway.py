@@ -7404,6 +7404,12 @@ class GatewayOrchestrator:
                         },
                     )
             if _batch_id and not _flush_only:
+                # This member's report has been consumed: its contribution is
+                # about to land in the wave's done-count, so it no longer holds
+                # the wave-close fallback open (batch_reports_in_flight, issue
+                # #8554). Set in the same synchronous block as the increment so
+                # the flag and the count can never be observed apart.
+                info._report_consumed = True
                 bp["done"] += 1
                 # Fold EVERY member's orchestration escalation into the wave
                 # digest — held members return before the announce is sent, so
@@ -7463,10 +7469,19 @@ class GatewayOrchestrator:
                     # stagger gate) — an unrelated agent under the same
                     # parent must neither hold the digest hostage nor
                     # release it early.
+                    #
+                    # A member whose `done` flag has flipped but whose terminal
+                    # report has not reached this consumer yet is OUTSTANDING
+                    # too: `batch_members_pending` no longer counts it while
+                    # its contribution to bp["done"] is still in flight, so
+                    # without the reports-in-flight check a sibling landing in
+                    # that window finalizes the wave early and the in-flight
+                    # report then finalizes it again (issue #8554).
                     try:
                         _last = bool(
                             self.subagent_mgr
                             and not self.subagent_mgr.batch_members_pending(_batch_id)
+                            and not self.subagent_mgr.batch_reports_in_flight(_batch_id)
                         )
                     except Exception:
                         _last = False

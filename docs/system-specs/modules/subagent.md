@@ -138,6 +138,22 @@ reports are pending, so bulk cancellation cannot rediscover them as running work
 Agents waiting on spawn approval are excluded; their approval card remains the
 authority for approve/reject.
 
+Wave close itself is decided by the completion consumer: a wave finishes when
+its done-count reaches the total, or — for members that failed at spawn and can
+never reach the consumer — when nothing is pending (`batch_members_pending`)
+AND no member's terminal report is still in flight
+(`batch_reports_in_flight`). A member counts as in flight from the moment
+`info.done` flips until the consumer lands its done-count contribution (the
+consumer marks `_report_consumed` in the same synchronous block as the
+increment), because in that done-but-unreported window `batch_members_pending`
+no longer counts the member while the done-count does not include it either —
+without the in-flight hold, a sibling completion landing in the window
+finalizes the wave early and the in-flight report finalizes it a second time.
+Terminal arms that end a report without ever reaching the consumer (injection
+timeout, announce failure, the cancelled-recovery limbo arm) clear the hold
+themselves, so the wave keeps its degraded a-sibling-can-close liveness
+instead of stranding.
+
 The dashboard exposes this through `POST /api/spawn/stop-all` with a validated
 slot name. App tokens are denied before slot lookup because ownership of an app
 slot does not imply ownership of its linked session; a request missing the
@@ -219,7 +235,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - One-shot: gated by `info._cancel_retry_used`; the recovered run's own cancel is terminal.
 - Explicit handshake: `_resume` awaits the ORIGINAL task's full teardown (session release/reset, slot decrement, registry pop) before respawning — never a timed sleep.
 - Slot re-acquisition: waits (bounded, `_RECOVERY_SLOT_WAIT_SECS`) for free capacity; the slot claim and `create_task` are ATOMIC (no await between) so a concurrent `_drain_queue` cannot overshoot `max_concurrent`.
-- Shutdown-reachable: the pending `_resume` task is registered in `_tasks` under `"{id}:recovery"` so `cancel_all()` cancels it; a cancelled recovery finalizes the record terminally and never respawns.
+- Shutdown-reachable: the pending `_resume` task is registered in `_tasks` under `"{id}:recovery"` so `cancel_all()` cancels it; a cancelled recovery finalizes the record terminally and never respawns. This arm is report-free (no finalize claim is taken), so it also clears the member's done-but-unreported hold — a batch member finalized here must not hold `batch_reports_in_flight` open forever.
 - Failed recovery (no slot / teardown timeout) still fully finalizes: `subagent_done` emitted, tombstoned, delivered via `on_done`.
 - Replay-safety at respawn: when the first attempt streamed partial text, the respawned prompt is prefixed with `_CANCEL_RESUME_PREFIX` so the model continues instead of restarting (the prefix also gates on `tool_count` as defense-in-depth, though the side-effect gate above means a tool-activity run never reaches respawn). A bare original prompt is re-sent only for a zero-activity first attempt.
 
