@@ -123,3 +123,87 @@ class TestNothingReadableMeansNothingReattached:
         assert session_directive.is_refusal(kept)
         assert session_directive.peek(kept) is None, "the prose bytes must not read as a directive"
         assert len(kept) <= MAX
+
+
+class TestRepeatedSentinelBytesStayLinear:
+    """The locate walk must pay a BOUNDED cost per occurrence, never a suffix of
+    the frame. ``full`` is an unbounded, model-authored tool-result join (the
+    per-part cut is deliberately gone at the dispatch seam), and the sentinel is
+    a public constant -- one command whose output repeats it puts tens of
+    thousands of occurrences in a multi-megabyte frame. A per-occurrence
+    ``full[probe:]`` slice makes that O(N*L): an event-loop stall and a watchdog
+    restart, reachable without a single valid marker.
+    """
+
+    def test_a_frame_dense_with_sentinel_bytes_parses_in_bounded_time(self):
+        """Attack shape from review: repeated sentinel bytes, no readable marker
+        until the genuine one at the tail. Quadratic locate stalls for minutes;
+        the bounded walk finishes with a wide margin under the ceiling."""
+        import time
+
+        directive = session_directive.encode("autonudge_stop", {"reason": "goal met"}, "stopping")
+        # ~1.3 MB of prose carrying ~32,000 sentinel occurrences on one line --
+        # the review's own attack shape. Each occurrence's "line" is the giant
+        # remainder, so a suffix-slicing walk pays ~40 GB of copies (measured
+        # ~27s here; the ceiling below under-states it 5x on purpose). The
+        # noise sits BEYOND the cut, keeping the kept head sentinel-free prose:
+        # the walk runs over ``full`` either way, and a sentinel-free head is
+        # what lets the round-trip assert stay byte-exact. The fixed walk stays
+        # ~milliseconds (lesson: CI fixture cost must not become the test's own
+        # failure mode).
+        noise = (SENTINEL + "x" * 32) * 32000
+        full = "y" * MAX + "\n" + noise + "\n" + directive
+        cut = _cut_dropping_the_tail(full)
+
+        start = time.monotonic()
+        kept = session_directive.preserve_tail_marker(full, cut)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, f"locate walk took {elapsed:.1f}s -- quadratic cost is back"
+        assert session_directive.decode(kept, "autonudge_stop") == {"reason": "goal met"}
+
+    def test_sentinel_dense_frame_with_no_marker_at_all_is_also_bounded(self):
+        """Same attack without any genuine marker: the walk still visits every
+        occurrence (the ambiguity bar requires it), so the bound must hold on
+        the pure-noise path too, and the cut must stand untouched."""
+        import time
+
+        noise = (SENTINEL + "x" * 32) * 32000
+        full = "y" * MAX + "\n" + noise + "\nplain tail, no marker"
+        cut = _cut_dropping_the_tail(full)
+
+        start = time.monotonic()
+        kept = session_directive.preserve_tail_marker(full, cut)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, f"locate walk took {elapsed:.1f}s -- quadratic cost is back"
+        assert kept == cut
+
+
+class TestAMarkerLineWiderThanAFrameIsBytes:
+    def test_an_over_budget_marker_line_cannot_divert_the_reattach(self):
+        """A sentinel line longer than MAX_TOOL_RESULT_CHARS cannot be a marker
+        three ways at once: ``encode`` refuses anything over MAX_DIRECTIVE_CHARS,
+        the room check could never re-attach it, and the transport cut means no
+        consumer ever reads it whole. The bounded walk treats it as the bytes it
+        is, and the genuine, encodable marker still wins."""
+        directive = session_directive.encode("autonudge_stop", {"reason": "goal met"}, "stopping")
+        huge_args = '{"kind":"monitor_start","args":{"message":"' + "m" * (MAX * 2) + '"}}'
+        full = "y" * MAX + "\n" + SENTINEL + huge_args + "\n" + directive
+        cut = _cut_dropping_the_tail(full)
+
+        kept = session_directive.preserve_tail_marker(full, cut)
+
+        assert session_directive.decode(kept, "autonudge_stop") == {"reason": "goal met"}
+        assert len(kept) <= MAX
+
+    def test_an_over_budget_line_alone_leaves_the_cut_standing(self):
+        """The over-budget line as the ONLY sentinel content: nothing readable
+        within the frame budget, so nothing is re-attached."""
+        huge_args = '{"kind":"monitor_start","args":{"message":"' + "m" * (MAX * 2) + '"}}'
+        full = "y" * MAX + "\n" + SENTINEL + huge_args
+        cut = _cut_dropping_the_tail(full)
+
+        kept = session_directive.preserve_tail_marker(full, cut)
+
+        assert kept == cut
