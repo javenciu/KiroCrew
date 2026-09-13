@@ -311,6 +311,7 @@ class AcpProvider(LLMProvider):
         permission_mode: str | None = None,
         crew_agent: str | None = None,
         private_memory: bool = False,
+        native_text_profile: object | None = None,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -320,6 +321,16 @@ class AcpProvider(LLMProvider):
                 f"Unknown acp_backend {acp_backend!r}; "
                 f"expected one of {sorted(ACP_BACKENDS_KNOWN)}"
             )
+        self.native_text_profile = native_text_profile
+        self.native_text_runtime = None
+        if native_text_profile is not None:
+            from kiro_crew.acp.native_text_profile import NativeTextProfile
+            if type(native_text_profile) is not NativeTextProfile:
+                raise RuntimeError('native text profile type is unsupported')
+            native_text_profile.validate_factory(session_key, work_dir, acp_backend)
+            if (agent != native_text_profile.agent or extra_env
+                    or mcp_gateway_overlay or mcp_gateway_socket):
+                raise RuntimeError('native provider inputs are not isolated')
         kwargs: dict[str, Any] = {
             "work_dir": work_dir,
             "model": model,
@@ -386,7 +397,7 @@ class AcpProvider(LLMProvider):
             if tool_search_min_tokens is None
             else tool_search_min_tokens
         )
-        if self.is_acp_runtime_backend:
+        if self.is_acp_runtime_backend and native_text_profile is None:
             # Recover overlay-persisted levels (server-restart resilience) and
             # write the overlay BEFORE the first spawn so kiro-cli reads it on
             # session/new. Caller-provided overrides win — only fill gaps.
@@ -831,6 +842,8 @@ class AcpProvider(LLMProvider):
 
         # Check for session resume
         resume_sid = getattr(self._client, "_resume_session_id", "")
+        if self.native_text_profile is not None and resume_sid:
+            raise RuntimeError("native text cannot resume a session")
 
         # Preserve the configured model so we can re-apply it once the session
         # is live. AcpClient sends session/set_model in its handshake; the runtime
@@ -848,9 +861,13 @@ class AcpProvider(LLMProvider):
             mcp_gateway_socket=mcp_gateway_socket,
             acp_backend=self._client.backend,
             crew_agent=self._crew_agent,
+            native_text_profile=self.native_text_profile,
+            model=(configured_model or None) if self.native_text_profile is not None else None,
             **private_kwargs,
         )
         _t_spawn = time.monotonic()
+        if self.native_text_profile is not None:
+            self.native_text_runtime = runtime
         try:
             await runtime.spawn()
         except AcpRuntimeError as exc:
@@ -939,6 +956,8 @@ class AcpProvider(LLMProvider):
                 # session/load window (race condition). Calling create_session on
                 # a dead runtime raises AcpRuntimeDead which bubbles to the user.
                 # Instead, detect the dead runtime and transparently respawn.
+                if not runtime.is_alive() and self.native_text_profile is not None:
+                    raise RuntimeError('native text cannot silently respawn')
                 if not runtime.is_alive():
                     logger.warning(
                         "runtime died during resume; respawning for fresh start " "(PID was %s)",
@@ -960,6 +979,8 @@ class AcpProvider(LLMProvider):
                         mcp_gateway_socket=mcp_gateway_socket,
                         acp_backend=self._client.backend,
                         crew_agent=self._crew_agent,
+                        native_text_profile=self.native_text_profile,
+                        model=(configured_model or None) if self.native_text_profile is not None else None,
                         **private_kwargs,
                     )
                     try:
@@ -975,7 +996,8 @@ class AcpProvider(LLMProvider):
                     handle = await runtime.create_session(
                         cwd=work_dir,
                         agent=agent or None,
-                        member_session_key=self._member_session_key(),
+                        mcp_servers=[] if self.native_text_profile is not None else None,
+                        member_session_key="" if self.native_text_profile is not None else self._member_session_key(),
                     )
                 except AcpRuntimeError as exc:
                     if runtime.saw_not_logged_in():
@@ -1016,6 +1038,8 @@ class AcpProvider(LLMProvider):
                     # either spelling still takes the withhold.
                     _send_model = resolve_pin_spelling(configured_model, _advertised)
                 if not _send_model:
+                    if self.native_text_profile is not None:
+                        raise RuntimeError('configured model is not available for native text')
                     logger.warning(
                         "Configured model %s is not available to this account; "
                         "leaving the session on the backend default (advertised: %s)",
@@ -1028,6 +1052,8 @@ class AcpProvider(LLMProvider):
                         await handle.set_model(_send_model)
                         logger.info("Kiro runtime model set: %s", _send_model)
                     except Exception:
+                        if self.native_text_profile is not None:
+                            raise
                         logger.warning(
                             "Failed to set model %s on kiro runtime session",
                             _send_model,
@@ -1126,6 +1152,12 @@ class AcpProvider(LLMProvider):
         membership-gated, so a negation here writes an overlay for a harness the
         clear will never reach — a stale file left in the user's workspace.
         """
+        if self.native_text_profile is not None:
+            model = self._client._model
+            level = self._resolve_effort()
+            if model and level:
+                self.native_text_profile.configure_effort(model, level, effort_settings_key(model))
+            return
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             return
         model = self._client._model
@@ -1146,6 +1178,8 @@ class AcpProvider(LLMProvider):
         toggle value was supplied (``self._tool_search is None``). Called before
         every (re)spawn so resume/restart keeps the same setting.
         """
+        if self.native_text_profile is not None:
+            return
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             return
         if self._tool_search is None:
