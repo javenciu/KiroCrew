@@ -105,6 +105,18 @@ export default [
       // parser, never read as words. Extracted from `PullRequestPanel.tsx` so that
       // panel -- which does carry copy -- stays fully covered.
       'src/components/unifiedPatchHeaders.ts',
+      // Pre-parse nesting-depth clamp: every string is a token of the markdown
+      // or HTML grammar it models (`</pre>`-class raw-block closers, the
+      // `&lt;` a neutralized tag is rewritten to) or a tag name from
+      // micromark's own tables. All of it is handed to a parser, never read as
+      // words. Same named-boundary idiom as `unifiedPatchHeaders.ts` above: the
+      // module may contain ONLY grammar tokens, so the filename IS the boundary
+      // and its consumer (MarkdownRenderer.tsx) stays fully covered.
+      //
+      // Stated as a false-negative class, per this file's convention: copy added
+      // to this module will not be reported. Verified copy-free rather than
+      // assumed — it imports neither `i18nT` nor `useTranslation`.
+      'src/utils/clampNestingDepth.ts',
       // Per-shell env-var export command builders for SettingRef's env popover:
       // every string is CLI syntax handed to a terminal (`export`, `$env:`,
       // `set`, `=1`), never user-visible copy — translating a fragment would
