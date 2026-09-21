@@ -110,6 +110,45 @@ def test_window_limits_to_recent(cost_log):
     assert val == pytest.approx(0.9, abs=0.01)
 
 
+# --- _percentile (pure helper) ---------------------------------------------
+
+
+class TestPercentile:
+    """Pin the linear-interpolation math and edge branches directly.
+
+    The read_learned_cost p90 tests only hit sample values that land on an
+    exact rank, so they cannot tell linear interpolation apart from
+    nearest-rank. These assertions target the pure helper so a regression to
+    nearest-rank, or a broken empty/single-element branch, goes red.
+    ``pct`` is a fraction in [0, 1]: rank = pct * (len - 1).
+    """
+
+    def test_empty_returns_zero(self):
+        assert sc._percentile([], 0.9) == 0.0
+
+    @pytest.mark.parametrize("pct", [0.0, 0.5, 0.9, 1.0])
+    def test_single_element_returns_that_element(self, pct):
+        assert sc._percentile([7.5], pct) == 7.5
+
+    def test_linear_interpolation_at_half_rank(self):
+        # p50 of [10,20,30,40]: rank = 0.5 * 3 = 1.5 -> 20 + (30-20)*0.5 = 25.0.
+        # Nearest-rank would return 20 or 30, never 25.
+        assert sc._percentile([10, 20, 30, 40], 0.5) == pytest.approx(25.0)
+
+    def test_linear_interpolation_at_fractional_rank(self):
+        # p90 of [1..10]: rank = 0.9 * 9 = 8.1 -> 9 + (10-9)*0.1 = 9.1.
+        assert sc._percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9) == pytest.approx(9.1)
+
+    def test_exact_endpoints_return_min_and_max(self):
+        vals = [10, 20, 30, 40]
+        assert sc._percentile(vals, 0.0) == 10  # rank 0 -> min
+        assert sc._percentile(vals, 1.0) == 40  # rank len-1 -> max
+
+    def test_unsorted_input_is_sorted_first(self):
+        # Same fractional-rank case, shuffled, to prove sorting happens.
+        assert sc._percentile([10, 4, 9, 8, 6, 1, 7, 3, 5, 2], 0.9) == pytest.approx(9.1)
+
+
 # --- compaction ------------------------------------------------------------
 
 
