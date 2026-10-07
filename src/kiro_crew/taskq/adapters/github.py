@@ -78,17 +78,16 @@ def parse_gh_stderr(raw: str, *, now: float | None = None) -> GhFailure:
     """Classify ``gh`` CLI stderr.
 
     Rate-limit wording wins over any status (a ``403`` that says "rate limit"
-    is a throttle, not a permission problem). The first ``HTTP <ddd>`` token
-    is then read; a ``429`` behind an earlier status survives to a substring
-    check, exactly as the two monitor copies did. Falls back to wording for
+    is a throttle, not a permission problem). Next, a ``429`` anywhere in the
+    text wins over an earlier non-throttle status, so ``HTTP 403`` followed by
+    ``HTTP 429`` is a throttle. Otherwise the first ``HTTP <ddd>`` token is
+    read and switched on. Falls back to wording for
     authentication, not-found and authorization, and to ``transient`` --
     the retry-safe default -- for anything else.
     """
     lowered = raw.lower()
-    status: int | None = None
-    match = _HTTP_STATUS_RE.search(raw)
-    if match is not None:
-        status = int(match.group(1), 10)
+    statuses = [int(code, 10) for code in _HTTP_STATUS_RE.findall(raw)]
+    status: int | None = statuses[0] if statuses else None
     clock = time.time() if now is None else now
     retry_at = _http.parse_retry_after(_retry_after_in_text(raw), clock)
     if retry_at is None:
@@ -96,6 +95,8 @@ def parse_gh_stderr(raw: str, *, now: float | None = None) -> GhFailure:
     secondary = any(marker in lowered for marker in _SECONDARY_MARKERS)
     if any(marker in lowered for marker in _RATE_LIMIT_MARKERS):
         return GhFailure(CATEGORY_RATE_LIMITED, status, retry_at, secondary)
+    if 429 in statuses:
+        return GhFailure(CATEGORY_RATE_LIMITED, 429, retry_at, secondary)
     if status is not None:
         if status == 429:
             return GhFailure(CATEGORY_RATE_LIMITED, status, retry_at, secondary)
