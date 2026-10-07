@@ -23,7 +23,16 @@ def _github_check(item: dict[str, Any]) -> dict[str, Any]:
         bucket = "passed"
     elif conclusion in {"SKIPPED", "STALE"}:
         bucket = "skipped"
-    elif conclusion in {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "ERROR"}:
+    elif conclusion in {
+        "FAILURE",
+        "CANCELLED",
+        "TIMED_OUT",
+        "ACTION_REQUIRED",
+        "ERROR",
+        "STARTUP_FAILURE",
+    }:
+        bucket = "failed"
+    elif status == "COMPLETED" and conclusion:
         bucket = "failed"
     else:
         bucket = "pending"
