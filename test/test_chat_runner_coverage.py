@@ -49,6 +49,7 @@ from kiro_crew.config import live
 from kiro_crew.config.sections import ResolvedBindings
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.dashboard.turn_dispatch import _bounded_turn
 from kiro_crew.history import ConversationLog
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.metrics import turns as turns_mod
@@ -4808,6 +4809,111 @@ class TestRunChatRecoveryLadders:
 
         assert any("please retry" in err for err in _errors(slot))
         assert slot._queue == []
+
+    @pytest.mark.asyncio
+    async def test_a_turn_cut_by_the_ceiling_resets_the_session(self, tmp_path):
+        """A backend silent from the start of the turn never arms the stale
+        probe, so the dashboard ceiling ends the turn. The slot's runtime still
+        reads alive, so without a reset the next message goes to it and waits
+        out the ceiling again."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+
+        async def _silent(*_args, **_kwargs):
+            await asyncio.Event().wait()
+            yield _complete()  # pragma: no cover - the ceiling fires first
+
+        client.stream = MagicMock(side_effect=_silent)
+        client.stream_command = MagicMock(side_effect=_silent)
+
+        with _quiet_sel(), pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            await _bounded_turn(chat_runner._run_chat(state, slot, "hello"), 0.5)
+        await _settle(slot)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+
+    @pytest.mark.asyncio
+    async def test_a_transport_timeout_resets_the_session_and_says_so(self, tmp_path):
+        """What the ACP handle yields at its own deadline: an EVENT_COMPLETE
+        with stop_reason "timeout". The turn ends, the user is told, and the
+        session is reset so the next message starts a fresh runtime."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(client, [_complete("timeout")])
+
+        await _drive(state, slot)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        assert any("did not finish its answer" in err for err in _errors(slot)), _errors(slot)
+        assert slot._queue == []
+
+    @pytest.mark.asyncio
+    async def test_a_users_stop_does_not_reset_the_session(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        turn_started = asyncio.Event()
+
+        async def _until_stopped(*_args, **_kwargs):
+            turn_started.set()
+            await asyncio.Event().wait()
+            yield _complete()  # pragma: no cover - the Stop lands first
+
+        client.stream = MagicMock(side_effect=_until_stopped)
+        client.stream_command = MagicMock(side_effect=_until_stopped)
+
+        with _quiet_sel():
+            task = asyncio.ensure_future(chat_runner._run_chat(state, slot, "hello"))
+            await asyncio.wait_for(turn_started.wait(), 5)
+            slot._stop_generation += 1  # the Stop button, as stop_turn() records it
+            task.cancel()
+            await asyncio.wait_for(task, 5)
+        await _settle(slot)
+
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_involuntary_cancel_before_the_deadline_keeps_the_session(self, tmp_path):
+        """A closed tab, the idle sweep or shutdown cancel the turn with no Stop
+        recorded and no ceiling reached. The runtime is live, so a reopened chat
+        must not cold-start a fresh process for it."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        turn_started = asyncio.Event()
+
+        async def _until_cancelled(*_args, **_kwargs):
+            turn_started.set()
+            await asyncio.Event().wait()
+            yield _complete()  # pragma: no cover - the cancel lands first
+
+        client.stream = MagicMock(side_effect=_until_cancelled)
+        client.stream_command = MagicMock(side_effect=_until_cancelled)
+
+        with _quiet_sel():
+            task = asyncio.ensure_future(
+                _bounded_turn(chat_runner._run_chat(state, slot, "hello"), 60)
+            )
+            await asyncio.wait_for(turn_started.wait(), 5)
+            task.cancel()  # not the Stop button, and the 60 s ceiling is far off
+            # _run_chat absorbs the cancel and returns normally, so the guarded
+            # task completes rather than raising.
+            try:
+                await asyncio.wait_for(task, 5)
+            except asyncio.CancelledError:
+                pass
+        await _settle(slot)
+
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_normal_end_turn_does_not_reset_the_session(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="done"), _complete()])
+
+        await _drive(state, slot)
+
+        state.sessions.reset.assert_not_awaited()
+        assert _errors(slot) == []
 
 
 # ── _run_chat: auto-approve rungs ─────────────────────────────────────────

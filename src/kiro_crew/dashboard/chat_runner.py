@@ -432,6 +432,7 @@ from kiro_crew.dashboard.turn_dispatch import (
     format_approval_timeout_card,
     spawn_guarded_turn,
     tool_approval_timeout_secs,
+    turn_deadline_passed,
 )
 from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.deny_guidance import (  # noqa: F401
@@ -15948,6 +15949,25 @@ async def _run_chat(
         # than restarts. Bounded so a permanently-broken session surfaces a clean
         # "start a new chat" instead of looping. Complementary to a companion guard,
         # which surfaces the stuck sessions this cannot recover.
+        # The transport's own deadline: the ACP handle ends a turn it never got
+        # a complete for with stop_reason "timeout". The backend did not answer,
+        # and the stale-turn probe never armed (it needs a first text chunk or
+        # tool result), so nothing retired the runtime and it still reads
+        # alive. Reset the session in the finally, keeping the conversation, so
+        # the next message starts a fresh runtime instead of waiting out the
+        # deadline on this one again. Told the way the ceiling card tells it;
+        # the message is kept, not re-queued: a silent backend offers nothing
+        # to continue from, and the user decides what to send next.
+        if _stop_reason == "timeout":
+            needs_session_reset = True  # checked in finally block (reset + resume)
+            slot.append(
+                "error",
+                "⏱️ The agent did not finish its answer before this turn's time limit, "
+                "so the turn was stopped. Work already written to disk is still there — "
+                "nothing was rolled back. Your next message starts the agent again.",
+                "msg msg-err",
+            )
+            return
         if _stop_reason == STOP_REASON_STALE_RECOVER:
             needs_session_reset = True  # checked in finally block (reset + resume)
 
@@ -17767,6 +17787,19 @@ async def _run_chat(
             _cancel_reason = STOP_REASON_CANCELLED
         else:
             _cancel_reason = "error: cancelled"
+            # The turn ceiling is the involuntary cancel that leaves a silent
+            # runtime behind: the backend never answered, so nothing armed the
+            # stale-turn probe and nothing retired its runtime, which still
+            # reads alive. Without a reset the next message is sent to that
+            # same runtime and waits out the ceiling again. The ceiling is told
+            # apart from the other involuntary cancels (a closed tab, the idle
+            # sweep, shutdown) by the deadline _bounded_turn publishes for this
+            # turn: those must not cold-start a reopened chat. The reset keeps
+            # the conversation (the session map entry) and replaces the
+            # runtime, as the stale-recover path does; the user's own Stop
+            # keeps its session, as before.
+            if turn_deadline_passed():
+                needs_session_reset = True
         # A bare CancelledError never reaches the EVENT_COMPLETE latch above, so
         # _stop_reason is still "" here. The first-turn history-debt settle keys
         # ``_turn_emitted and _stop_reason != STOP_REASON_CANCELLED`` off it: once
