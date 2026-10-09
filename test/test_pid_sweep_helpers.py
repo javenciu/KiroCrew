@@ -476,7 +476,9 @@ class TestSweepKillsASandboxedRoot:
 
 
 class TestPeriodicPidSweep:
-    def test_only_sweeps_own_gateway_entries(self, session_pid_file: Path) -> None:
+    def test_sweeps_own_entries_and_skips_a_live_gateways_entries(
+        self, session_pid_file: Path
+    ) -> None:
         from kiro_crew.session_pid import _periodic_pid_sweep
 
         my_gw = os.getpid()
@@ -484,12 +486,13 @@ class TestPeriodicPidSweep:
         session_pid_file.write_text(f"{my_gw}:99999\n{other_gw}:88888\n")
 
         def fake_kill(pid: int, sig: int) -> None:
-            raise ProcessLookupError()  # all dead
+            if pid != other_gw:
+                raise ProcessLookupError()  # every child is dead; the other gateway lives
 
         with patch("os.kill", side_effect=fake_kill):
             killed_or_dead, candidates = _periodic_pid_sweep(my_gw, set())
 
-        # Own gateway's dead entry identified, other gateway's preserved
+        # Own gateway's dead entry identified, a live gateway's preserved
         assert f"{my_gw}:99999" in killed_or_dead
         assert f"{other_gw}:88888" not in killed_or_dead
         assert candidates == []  # dead PIDs are not candidates

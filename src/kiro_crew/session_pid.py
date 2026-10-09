@@ -1295,6 +1295,17 @@ def _sweep_pid_entries(
     return killed, killed_or_dead, candidates
 
 
+def _owning_gateway_may_be_alive(gw_pid: int) -> bool:
+    """Whether the gateway that recorded an entry may still be running.
+
+    The one probe both sweeps use to decide whose entries they may take. It is
+    ``pid_exists``, so a gateway PID that now names some other process, and one
+    this user cannot signal, both read as alive. That is the safe direction: an
+    entry counts as a dead gateway's only when its gateway PID names no process.
+    """
+    return platform_compat.pid_exists(gw_pid)
+
+
 def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str], list[int]]:
     """Phase 1: identify orphan candidates in a thread (no killing).
 
@@ -1340,7 +1351,11 @@ def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str]
 
     _, killed_or_dead, candidates = _sweep_pid_entries(
         lines,
-        should_skip_tagged=lambda gw, _p: gw != my_gw_pid,
+        # This gateway's entries, and those of a gateway that is gone: a backend that
+        # outlived a crashed gateway inside the spawn grace is skipped by the next
+        # boot's sweep, and no later cycle of its own gateway will ever come for it.
+        # A live gateway's entries stay its own.
+        should_skip_tagged=lambda gw, _p: gw != my_gw_pid and _owning_gateway_may_be_alive(gw),
         should_skip_bare=lambda _p: True,
         is_managed=lambda p: p in active_pids,
         dry_run=True,
@@ -1349,7 +1364,11 @@ def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str]
 
 
 def _session_pid_entry_index(my_gw_pid: int) -> dict[int, tuple[str, str | None]]:
-    """``{child_pid: (entry_line, recorded_token)}`` over *my_gw_pid*'s entries.
+    """``{child_pid: (entry_line, recorded_token)}`` over the entries the periodic sweep may take.
+
+    Those are *my_gw_pid*'s entries and the entries of a gateway that is gone
+    (:func:`_owning_gateway_may_be_alive`), the same set the scan phase takes; this
+    gateway's own entry wins when both name one PID.
 
     The periodic sweep runs in two phases with an event-loop hop between them, so
     the kill phase cannot be handed a verdict computed in the scan phase and trust
@@ -1385,8 +1404,10 @@ def _session_pid_entry_index(my_gw_pid: int) -> dict[int, tuple[str, str | None]
             child_pid = int(parts[1])
         except ValueError:
             continue
-        if gw_pid != my_gw_pid or child_pid <= 0:
+        if child_pid <= 0 or (gw_pid != my_gw_pid and _owning_gateway_may_be_alive(gw_pid)):
             continue
+        if gw_pid != my_gw_pid and child_pid in index:
+            continue  # this gateway's own entry for the PID wins
         recorded_token = parts[2] or None if len(parts) == 3 else None
         index[child_pid] = (stripped, recorded_token)
     return index
@@ -2803,7 +2824,7 @@ def cleanup_orphaned_sessions(*, narrow_with_leaders: bool = True) -> None:
         """Skip if owning gateway is still alive."""
         # pid_exists() returns True on a live PID or one we can't signal
         # (can't tell — preserve), and False only when confirmed dead.
-        return platform_compat.pid_exists(gw_pid)
+        return _owning_gateway_may_be_alive(gw_pid)
 
     killed, killed_or_dead, _ = _sweep_pid_entries(
         lines,
