@@ -348,6 +348,13 @@ class BackendGone(RuntimeError):
     emits a clean JSON-RPC error to the originating stub."""
 
 
+#: How many cancelled request ids a backend remembers, so a response the server
+#: had already sent when the client's cancel reached it is dropped quietly
+#: rather than logged as an answer to an unknown id. The oldest id is forgotten
+#: first; a response to a forgotten one costs that warning and nothing else.
+_CANCELLED_FIDS_KEPT = 256
+
+
 #: Requests a departing stub may abandon without the backend being recycled:
 #: a ping and the read-only listings run no tool work, so there is nothing a
 #: best-effort cancel could fail to stop. ``initialize`` is not listed because
@@ -969,6 +976,11 @@ class Backend:
     # original id restored.
     _forward_id_seq: int = 0
     _pending_requests: dict[str, "_PendingRequest"] = field(default_factory=dict)
+    # Forward ids of requests their client cancelled, oldest first, at most
+    # ``_CANCELLED_FIDS_KEPT``. A cancel retires the request from
+    # ``_pending_requests``; this lets a response already in flight be told
+    # apart from one for an id the gateway never issued.
+    _cancelled_fids: dict[str, None] = field(default_factory=dict)
     # Resource-subscription routing table: ``uri -> {stub_uuid}``, the set of
     # stubs whose ``resources/subscribe`` the server ACCEPTED. Grants are
     # recorded on the server's response, never at forward time, so an update
@@ -1608,6 +1620,23 @@ class Backend:
         self._forward_id_seq += 1
         return f"gw-{self.pid}-{self._forward_id_seq}"
 
+    def _retire_cancelled(self, fid: str, pending: "_PendingRequest") -> None:
+        """Forget ``fid``'s request because its client cancelled it.
+
+        A server that honours an MCP cancellation sends no response, so a kept
+        entry would never be settled: it would age into the heartbeat's wedge
+        ceiling and recycle this backend under every session it serves. The
+        entry is removed only while it is still ``pending``, and the id is
+        remembered within ``_CANCELLED_FIDS_KEPT`` so that a response the server
+        had already sent is dropped quietly when it arrives.
+        """
+        if self._pending_requests.get(fid) is not pending:
+            return
+        del self._pending_requests[fid]
+        self._cancelled_fids[fid] = None
+        while len(self._cancelled_fids) > _CANCELLED_FIDS_KEPT:
+            del self._cancelled_fids[next(iter(self._cancelled_fids))]
+
     async def forward_from_stub(
         self,
         stub_uuid: str,
@@ -1737,17 +1766,19 @@ class Backend:
                 _cparams = msg.get("params")
                 if isinstance(_cparams, dict) and "requestId" in _cparams:
                     orig_req = _cparams["requestId"]
-                    cancel_fid = next(
-                        (f for f, pend in self._pending_requests.items()
+                    match = next(
+                        ((f, pend) for f, pend in self._pending_requests.items()
                          if pend.stub_uuid == stub_uuid
                          and pend.original_id == orig_req),
                         None,
                     )
-                    if cancel_fid is not None:
+                    if match is not None:
+                        cancel_fid, cancelled = match
                         msg = dict(msg)
                         new_params = dict(_cparams)
                         new_params["requestId"] = cancel_fid
                         msg["params"] = new_params
+                        self._retire_cancelled(cancel_fid, cancelled)
             # Trust boundary: unconditionally strip any stub-supplied caller
             # identity on EVERY forwarded request regardless of method, then
             # inject the authoritative caller block when known.
@@ -2701,6 +2732,15 @@ class Backend:
             # Response to a previously-forwarded request.
             pending = self._pending_requests.pop(str(msg_id), None)
             if pending is None:
+                if str(msg_id) in self._cancelled_fids:
+                    # The server answered before the client's cancel reached
+                    # it. A cancelled request is owed no response.
+                    del self._cancelled_fids[str(msg_id)]
+                    logger.debug(
+                        "backend pid=%s answered cancelled request id=%r; dropping",
+                        self.pid, msg_id,
+                    )
+                    return
                 logger.warning(
                     "backend pid=%s response to unknown id=%r; dropping",
                     self.pid, msg_id,

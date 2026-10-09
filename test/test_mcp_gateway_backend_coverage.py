@@ -579,6 +579,82 @@ class TestForwardFromStub:
         assert _frames(backend)[0]["params"] == {}
 
     @pytest.mark.asyncio
+    async def test_cancelled_request_leaves_the_pending_table(self) -> None:
+        """A cancel ends its request: a server that honours it sends no
+        response, so nothing may stay pending waiting for one."""
+        backend = _make_backend()
+        await backend.forward_from_stub("s1", {"method": "tools/call", "id": 5})
+        await backend.forward_from_stub("s1", {
+            "method": "notifications/cancelled", "params": {"requestId": 5},
+        })
+        assert backend._pending_requests == {}
+        assert not backend_mod.has_recyclable_in_flight(backend._pending_requests, "s1")
+
+    @pytest.mark.asyncio
+    async def test_cancel_retires_only_the_cancelling_stubs_request(self) -> None:
+        backend = _make_backend()
+        await backend.forward_from_stub("s1", {"method": "tools/call", "id": 5})
+        await backend.forward_from_stub("s2", {"method": "tools/call", "id": 5})
+        await backend.forward_from_stub("s2", {
+            "method": "notifications/cancelled", "params": {"requestId": 5},
+        })
+        assert [p.stub_uuid for p in backend._pending_requests.values()] == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_call_does_not_age_into_the_wedge_ceiling(self) -> None:
+        """A backend that answers pings is not recycled for a call its client
+        cancelled, while a live call past the hard ceiling still recycles it."""
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", {"method": "tools/call", "id": 5})
+        await backend.forward_from_stub("s1", {
+            "method": "notifications/cancelled", "params": {"requestId": 5},
+        })
+        later = time.monotonic() + backend_mod.HARD_WEDGE_CEILING_SECS + 1
+        backend._last_ping_response_mono = later
+        assert await backend._heartbeat_once(later) == "alive"
+
+        await backend.forward_from_stub("s1", {"method": "tools/call", "id": 6})
+        assert await backend._heartbeat_once(later + backend_mod.HARD_WEDGE_CEILING_SECS) == (
+            "wedged"
+        )
+
+    @pytest.mark.asyncio
+    async def test_late_response_to_cancelled_request_is_dropped_quietly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The server may answer before the cancel reaches it. That response goes
+        to no stub and is logged at debug, not as an answer to an unknown id."""
+        backend = _make_backend()
+        inbox = await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", {"method": "tools/call", "id": 5})
+        await backend.forward_from_stub("s1", {
+            "method": "notifications/cancelled", "params": {"requestId": 5},
+        })
+        with caplog.at_level(logging.DEBUG, logger=backend_mod.logger.name):
+            await backend._route_backend_line(
+                _line({"jsonrpc": "2.0", "id": "gw-4242-1", "result": {}})
+            )
+        assert inbox.empty()
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert "answered cancelled request" in caplog.text
+        assert backend._cancelled_fids == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_ids_kept_for_late_responses_are_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(backend_mod, "_CANCELLED_FIDS_KEPT", 2)
+        backend = _make_backend()
+        for req_id in (1, 2, 3):
+            await backend.forward_from_stub("s1", {"method": "tools/call", "id": req_id})
+            await backend.forward_from_stub("s1", {
+                "method": "notifications/cancelled", "params": {"requestId": req_id},
+            })
+        assert list(backend._cancelled_fids) == ["gw-4242-2", "gw-4242-3"]
+        assert backend._pending_requests == {}
+
+    @pytest.mark.asyncio
     async def test_broken_pipe_marks_backend_gone(self) -> None:
         backend = _make_backend()
         cast(Any, backend.stdin).write.side_effect = BrokenPipeError("epipe")
