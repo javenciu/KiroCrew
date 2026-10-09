@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -1925,6 +1926,8 @@ def test_a_malformed_crons_store_is_replaced_not_installed(tmp_path, payload):
     svc._last_mtime_ns = 0
     svc._last_size = 0
     svc._last_digest = b""
+    svc._held_run_records = {}
+    svc._held_run_records_guard = threading.Lock()
     svc._reset_fingerprint = lambda: None
     svc._load()
     assert svc._jobs == []
@@ -2052,6 +2055,8 @@ def test_a_malformed_job_cannot_reach_the_cron_loader(tmp_path):
     svc._last_mtime_ns = 0
     svc._last_size = 0
     svc._last_digest = b""
+    svc._held_run_records = {}
+    svc._held_run_records_guard = threading.Lock()
     svc._reset_fingerprint = lambda: None
     svc._load()
     assert [j.name for j in svc._jobs] == ["survivor"]
