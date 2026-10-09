@@ -2242,6 +2242,16 @@ class TestAnnounceRejection:
         assert announced == [info]
 
     @pytest.mark.asyncio
+    async def test_finished_batch_rejection_announce_leaves_task_registry(self) -> None:
+        mgr = _manager(on_done=AsyncMock())
+        info = _info(done=True, error="rejected", batch_id="w1")
+        mgr._announce_rejection(info)
+        assert list(mgr._tasks) == [f"reject-{info.id}"]  # registered while in flight
+        await asyncio.gather(*mgr._tasks.values())
+        await asyncio.sleep(0)  # done callbacks run on the next loop pass
+        assert mgr._tasks == {}
+
+    @pytest.mark.asyncio
     async def test_safe_announce_swallows_callback_failure(self) -> None:
         mgr = _manager(on_done=AsyncMock(side_effect=RuntimeError("boom")))
         await mgr._safe_announce(_info())  # must not raise
