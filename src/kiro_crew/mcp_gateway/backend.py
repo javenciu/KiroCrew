@@ -348,10 +348,11 @@ class BackendGone(RuntimeError):
     emits a clean JSON-RPC error to the originating stub."""
 
 
-#: How many cancelled request ids a backend remembers, so a response the server
+#: How many cancelled requests a backend remembers, so a response the server
 #: had already sent when the client's cancel reached it is dropped quietly
-#: rather than logged as an answer to an unknown id. The oldest id is forgotten
-#: first; a response to a forgotten one costs that warning and nothing else.
+#: rather than logged as an answer to an unknown id, and a progress
+#: notification or server request tied to the call still finds its owner
+#: instead of recycling a shared backend. The oldest is forgotten first.
 _CANCELLED_FIDS_KEPT = 256
 
 
@@ -976,11 +977,12 @@ class Backend:
     # original id restored.
     _forward_id_seq: int = 0
     _pending_requests: dict[str, "_PendingRequest"] = field(default_factory=dict)
-    # Forward ids of requests their client cancelled, oldest first, at most
+    # Requests their client cancelled, by forward id, oldest first, at most
     # ``_CANCELLED_FIDS_KEPT``. A cancel retires the request from
     # ``_pending_requests``; this lets a response already in flight be told
-    # apart from one for an id the gateway never issued.
-    _cancelled_fids: dict[str, None] = field(default_factory=dict)
+    # apart from one for an id the gateway never issued, and lets a frame the
+    # server ties to the call find the stub that made it.
+    _cancelled_fids: dict[str, "_PendingRequest"] = field(default_factory=dict)
     # Resource-subscription routing table: ``uri -> {stub_uuid}``, the set of
     # stubs whose ``resources/subscribe`` the server ACCEPTED. Grants are
     # recorded on the server's response, never at forward time, so an update
@@ -1512,32 +1514,7 @@ class Backend:
             p = self._pending_requests.get(fid)
             if p is None:
                 continue
-            if p.resource_uri and p.method == _RESOURCES_SUBSCRIBE_METHOD:
-                # BOTH regimes: dropping the pending would drop the server's
-                # verdict — a late identity grant would strand the upstream
-                # lease with nobody to release it. Coalesced: hand it to the
-                # first parked rider; otherwise (including every identity
-                # pending, which never has riders) convert to the sentinel,
-                # whose grant arm releases a granted-but-unwanted lease as
-                # ``pending.caller`` — the right principal.
-                riders = (
-                    []
-                    if self.supports_caller_identity
-                    else self._lease_pending_riders.get(p.resource_uri, [])
-                )
-                if riders:
-                    p.stub_uuid, p.original_id = riders.pop(0)
-                else:
-                    p.origin_stub = stub_uuid
-                    p.stub_uuid = _RELEASE_STUB_SENTINEL
-                    p.original_id = None
-                continue
-            if p.resource_uri and p.method == _RESOURCES_UNSUBSCRIBE_METHOD:
-                # Let the release-in-flight settle silently; the table entry
-                # is pruned below either way.
-                p.origin_stub = stub_uuid
-                p.stub_uuid = _RELEASE_STUB_SENTINEL
-                p.original_id = None
+            if self._hand_off_lease_request(p, stub_uuid):
                 continue
             self._pending_requests.pop(fid, None)
         # Drop the departing stub from the resource-subscription table so a
@@ -1620,20 +1597,54 @@ class Backend:
         self._forward_id_seq += 1
         return f"gw-{self.pid}-{self._forward_id_seq}"
 
+    def _hand_off_lease_request(self, p: "_PendingRequest", stub_uuid: str) -> bool:
+        """Re-own ``p`` when it is a subscribe or unsubscribe whose stub,
+        ``stub_uuid``, detached or cancelled it; True if so.
+
+        Its response still has to settle shared lease state, so the entry is
+        kept. BOTH regimes: dropping it would drop the server's verdict, and a
+        late grant would strand the upstream lease with nobody to release it.
+        A coalesced subscribe with parked riders is handed to the first rider,
+        which then receives the server's verdict under its own id. Any other
+        subscribe (including every identity pending, which never has riders)
+        is converted to the sentinel, whose grant arm releases a
+        granted-but-unwanted lease as ``pending.caller``, the right principal.
+        An unsubscribe is converted too, so the release in flight settles
+        silently.
+        """
+        if not p.resource_uri:
+            return False
+        if p.method == _RESOURCES_SUBSCRIBE_METHOD:
+            riders = (
+                []
+                if self.supports_caller_identity
+                else self._lease_pending_riders.get(p.resource_uri, [])
+            )
+            if riders:
+                p.stub_uuid, p.original_id = riders.pop(0)
+                return True
+        elif p.method != _RESOURCES_UNSUBSCRIBE_METHOD:
+            return False
+        p.origin_stub = stub_uuid
+        p.stub_uuid = _RELEASE_STUB_SENTINEL
+        p.original_id = None
+        return True
+
     def _retire_cancelled(self, fid: str, pending: "_PendingRequest") -> None:
         """Forget ``fid``'s request because its client cancelled it.
 
         A server that honours an MCP cancellation sends no response, so a kept
         entry would never be settled: it would age into the heartbeat's wedge
         ceiling and recycle this backend under every session it serves. The
-        entry is removed only while it is still ``pending``, and the id is
-        remembered within ``_CANCELLED_FIDS_KEPT`` so that a response the server
-        had already sent is dropped quietly when it arrives.
+        entry is removed only while it is still ``pending``, and kept within
+        ``_CANCELLED_FIDS_KEPT`` so that a response the server had already sent
+        is dropped quietly, and a progress notification or a server request
+        tied to the call still reaches the stub that made it.
         """
         if self._pending_requests.get(fid) is not pending:
             return
         del self._pending_requests[fid]
-        self._cancelled_fids[fid] = None
+        self._cancelled_fids[fid] = pending
         while len(self._cancelled_fids) > _CANCELLED_FIDS_KEPT:
             del self._cancelled_fids[next(iter(self._cancelled_fids))]
 
@@ -1774,6 +1785,11 @@ class Backend:
                     )
                     if match is not None:
                         cancel_fid, cancelled = match
+                        if self._hand_off_lease_request(cancelled, stub_uuid):
+                            # Other stubs wait on this lease transition, so the
+                            # server is not asked to drop it: its answer settles
+                            # the lease under the request's new owner.
+                            return
                         msg = dict(msg)
                         new_params = dict(_cparams)
                         new_params["requestId"] = cancel_fid
@@ -2673,8 +2689,17 @@ class Backend:
                 waiters = self._lease_release_waiters.pop(_rel_uri, [])
                 if _is_success_response(msg):
                     self._orphaned_leases.discard(_rel_uri)
+                    # The stub the release was sent for is unsubscribed
+                    # upstream, so it is not routed and holds no grant
+                    # caller either: a cancel hands its own final
+                    # unsubscribe here while it stays attached (a detach
+                    # has already removed both, so this is a no-op then).
+                    if pending.origin_stub:
+                        self._grant_callers.pop(
+                            (_rel_uri, pending.origin_stub), None)
                     subscribers = self._resource_subscriptions.get(_rel_uri)
                     if subscribers is not None:
+                        subscribers.discard(pending.origin_stub)
                         for waiter_uuid, _waiter_id in waiters:
                             subscribers.discard(waiter_uuid)
                         if not subscribers:
@@ -2828,7 +2853,9 @@ class Backend:
                 if isinstance(meta, dict):
                     related_id = meta.get("relatedRequestId")
                     if related_id is not None:
-                        pending = self._pending_requests.get(str(related_id))
+                        pending = self._pending_requests.get(
+                            str(related_id)
+                        ) or self._cancelled_fids.get(str(related_id))
                         if pending is not None:
                             target_stub = pending.stub_uuid
             # Priority 2: single stub attached
@@ -3163,12 +3190,21 @@ class Backend:
                 )
                 return True
             if any(
-                p.stub_uuid == stub_uuid
+                (
+                    p.stub_uuid == stub_uuid
+                    or (
+                        p.stub_uuid == _RELEASE_STUB_SENTINEL
+                        and p.origin_stub == stub_uuid
+                    )
+                )
                 and p.method == _RESOURCES_UNSUBSCRIBE_METHOD
                 and p.resource_uri == uri
                 for p in self._pending_requests.values()
             ):
-                # This stub's own unsubscribe for the URI is still in flight.
+                # This stub's own unsubscribe for the URI is still in flight,
+                # under its own uuid or under the release sentinel after the
+                # stub cancelled it (``_hand_off_lease_request`` keeps the
+                # stub as ``origin_stub``; the release still settles).
                 # Its response may arrive AFTER a new grant (out-of-order
                 # server) and would then erase it — the releasing stub and the
                 # re-subscriber are the same uuid, so the per-stub discard
@@ -3896,7 +3932,7 @@ class Backend:
         if token is not None:
             owners = {
                 p.stub_uuid
-                for p in self._pending_requests.values()
+                for p in (*self._pending_requests.values(), *self._cancelled_fids.values())
                 if p.progress_token == token and p.stub_uuid != "__init__"
             }
             if len(owners) == 1:
@@ -3906,7 +3942,9 @@ class Backend:
         if isinstance(meta, dict):
             related_id = meta.get("relatedRequestId")
             if related_id is not None:
-                pending = self._pending_requests.get(str(related_id))
+                pending = self._pending_requests.get(
+                    str(related_id)
+                ) or self._cancelled_fids.get(str(related_id))
                 if pending is not None and pending.stub_uuid != "__init__":
                     return pending.stub_uuid
         return None
