@@ -722,6 +722,42 @@ def _positive_number(value: object) -> float:
     return number if math.isfinite(number) and number > 0 else 0
 
 
+#: The two persisted bounds a user types, in the order a log line names them.
+LOOP_BOUND_FIELDS = ("max_cycles", "max_runtime_secs")
+
+
+def stored_bound(value: object) -> int | None:
+    """The limit a STORED loop bound names, as an int >= 0, or None when it names none.
+
+    A lossless integer form is the limit the user typed: a non-negative int, a
+    whole finite float, or a string holding one (``"24"``, ``" 24 "``,
+    ``"24.0"``). Anything else -- ``null``, a negative or fractional number,
+    ``nan``, a bool, other text, a container -- cannot be read as a limit, and
+    reading it as 0 would quietly remove one, so it answers None.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = int(text) if text.isascii() and text.isdigit() else float(text)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and math.isfinite(value) and value >= 0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def unreadable_bound_field(loop: "NudgeLoop") -> str | None:
+    """The first bound of *loop* with no lossless integer reading, else None."""
+    for name in LOOP_BOUND_FIELDS:
+        if stored_bound(getattr(loop, name, 0)) is None:
+            return name
+    return None
+
+
 def nudge_cycle_header(loop: "NudgeLoop", now: float | None = None) -> str:
     """The ``[auto-nudge cycle N]`` tag, plus a budget line when the loop has a cap.
 
