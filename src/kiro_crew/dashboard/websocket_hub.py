@@ -19,11 +19,26 @@ SLOT_PATCH_CAPABILITY = "slot_patch"
 #: carries it; every other socket keeps receiving the full ``slots`` list.
 SLOT_PATCH_WS_FLAG = "_slot_patch"
 
-#: Unsent bytes a tab may hold before the hub drops it. asyncio pauses writing
-#: at 64 KiB, so a tab that reads stays far below this; one that stays connected
-#: but stops reading passes it after about 70 frames of 64 KiB. Dropping it makes
-#: the dashboard reconnect and resync from a fresh snapshot.
+#: Unsent bytes above which the hub checks whether a tab still reads. A fan-out
+#: send writes its whole frame into the transport before it waits on drain, and
+#: each send is its own task, so a burst can take a tab that still reads past
+#: this. A tab that stays connected but stops reading passes it after about 70
+#: frames of 64 KiB.
 WS_MAX_BUFFERED_BYTES = 4 * 1024 * 1024
+
+#: Seconds a tab may stay over ``WS_MAX_BUFFERED_BYTES`` with its buffer not
+#: shrinking before the hub drops it. A tab that reads drains between sends; one
+#: that stopped reading never does. Dropping it makes the dashboard reconnect and
+#: resync from a fresh snapshot.
+WS_STALL_SECONDS = 5.0
+
+#: Unsent bytes past which a tab is dropped at once, whatever its window, so the
+#: memory one tab can hold stays bounded.
+WS_HARD_MAX_BUFFERED_BYTES = 4 * WS_MAX_BUFFERED_BYTES
+
+#: Key on a tab's ``WebSocketResponse``: (when its window started, its buffer size
+#: at the last check), kept while the buffer is over ``WS_MAX_BUFFERED_BYTES``.
+_OVER_LIMIT_KEY = "_ws_over_limit"
 
 #: Seconds one awaited owner send (``deliver_ws_owners``) may take. A send waits
 #: only for its tab's buffer to drain, which never happens for a tab that stopped
@@ -160,19 +175,37 @@ class WebSocketHub:
         return True
 
     def _drop_if_stalled(self, ws: web.WebSocketResponse) -> bool:
-        """Drop a tab whose unsent bytes passed ``WS_MAX_BUFFERED_BYTES``.
+        """Drop a tab that stopped reading.
 
         Runs on the serving loop, before a send. A tab that stays connected but
-        stops reading keeps every frame in its transport's write buffer, so the
-        buffer size is the measure of how far it has fallen behind.
+        stops reading keeps every frame in its transport's write buffer, and that
+        buffer never shrinks. A tab that reads can pass ``WS_MAX_BUFFERED_BYTES``
+        after a burst, but its buffer shrinks as it reads. So a tab is dropped
+        when its buffer is over the limit and has not shrunk for
+        ``WS_STALL_SECONDS``, and at once when it passes
+        ``WS_HARD_MAX_BUFFERED_BYTES``. A shrink, or a buffer at or under the
+        limit, restarts the window.
         """
         size = _write_buffer_size(ws)
-        if size is None or size <= WS_MAX_BUFFERED_BYTES:
+        if size is None:
             return False
+        if size <= WS_MAX_BUFFERED_BYTES:
+            ws.pop(_OVER_LIMIT_KEY, None)
+            return False
+        now = time.monotonic()
+        mark = ws.get(_OVER_LIMIT_KEY)
+        if size <= WS_HARD_MAX_BUFFERED_BYTES:
+            if not isinstance(mark, tuple) or size < mark[1]:
+                ws[_OVER_LIMIT_KEY] = (now, size)
+                return False
+            ws[_OVER_LIMIT_KEY] = (mark[0], size)
+            if now - mark[0] < WS_STALL_SECONDS:
+                return False
         self._log.warning(
-            "WS client stopped reading: %d bytes buffered (limit %d); dropping it",
+            "WS client stopped reading: %d bytes buffered (limit %d, hard limit %d); dropping it",
             size,
             WS_MAX_BUFFERED_BYTES,
+            WS_HARD_MAX_BUFFERED_BYTES,
         )
         self._drop_ws(ws)
         return True

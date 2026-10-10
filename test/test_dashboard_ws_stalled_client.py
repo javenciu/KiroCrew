@@ -30,6 +30,7 @@ from kiro_crew.dashboard import revocation_gen, token_auth, websocket_hub
 from kiro_crew.dashboard.handlers import updates
 from kiro_crew.dashboard.state import _websocket_for
 from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_WS_FLAG
+from kiro_crew.testing.clock import ManualClock
 
 FRAME = 64 * 1024
 
@@ -46,6 +47,9 @@ def ws_state(tmp_path, monkeypatch):
     stopped = asyncio.Event()
     monkeypatch.setattr(updates, "shutdown_event", stopped)
     monkeypatch.setattr("kiro_crew.dashboard.ws.shutdown_event", stopped)
+    # A stalled tab is dropped at the first send that finds its buffer over the
+    # limit and not shrunk since the send before (no window in these tests).
+    monkeypatch.setattr(websocket_hub, "WS_STALL_SECONDS", 0.0, raising=False)
     return _make_state(tmp_path)
 
 
@@ -165,12 +169,80 @@ class _Transport:
 
 
 def _patch_capable_tab(buffered: int) -> MagicMock:
+    store: dict[str, object] = {SLOT_PATCH_WS_FLAG: True}
     ws = MagicMock()
     ws.closed = False
     ws.send_str = AsyncMock()
-    ws.get = MagicMock(side_effect=lambda key, default=None: key == SLOT_PATCH_WS_FLAG)
+    ws.get = MagicMock(side_effect=store.get)
+    ws.pop = MagicMock(side_effect=store.pop)
+    ws.__setitem__.side_effect = store.__setitem__
     ws._req.transport = _Transport(buffered)
     return ws
+
+
+def _hub_on_a_manual_clock(state, monkeypatch, window: float = 5.0):
+    """The hub, with its clock replaced by one the test advances, and a stall window."""
+    clock = ManualClock()
+    clock.install(monkeypatch, websocket_hub)
+    monkeypatch.setattr(websocket_hub, "WS_STALL_SECONDS", window, raising=False)
+    return _websocket_for(state), clock
+
+
+@pytest.mark.asyncio
+async def test_a_tab_over_the_limit_whose_buffer_shrinks_is_kept(ws_state, monkeypatch):
+    """Each send writes its whole frame before it waits on drain, so a burst can take a
+    tab that still reads over the limit. Its buffer shrinking restarts the window."""
+    hub, clock = _hub_on_a_manual_clock(ws_state, monkeypatch)
+    tab = _patch_capable_tab(websocket_hub.WS_MAX_BUFFERED_BYTES + 8 * FRAME)
+    ws_state.register_ws(tab, owner=True)
+    for _ in range(4):
+        hub._spawn_ws_send(tab, "{}")
+        clock.advance(4.0)
+        tab._req.transport.buffered -= FRAME  # it read a frame since that send
+    hub._spawn_ws_send(tab, "{}")
+    await asyncio.sleep(0)
+    assert tab in ws_state._ws_clients, "a tab whose buffer kept shrinking was dropped as stalled"
+    assert not tab._req.transport.aborted
+    assert tab.send_str.call_count == 5
+
+
+@pytest.mark.asyncio
+async def test_a_tab_whose_buffer_stops_shrinking_is_dropped_once_the_window_passes(
+    ws_state, monkeypatch
+):
+    hub, clock = _hub_on_a_manual_clock(ws_state, monkeypatch)
+    tab = _patch_capable_tab(websocket_hub.WS_MAX_BUFFERED_BYTES + FRAME)
+    ws_state.register_ws(tab, owner=True)
+    hub._spawn_ws_send(tab, "{}")  # over the limit: its window starts
+    clock.advance(4.0)
+    tab._req.transport.buffered += FRAME  # it read nothing, so that frame stays
+    hub._spawn_ws_send(tab, "{}")
+    assert tab in ws_state._ws_clients, "dropped 4 s into its 5 s window"
+    clock.advance(1.5)
+    hub._spawn_ws_send(tab, "{}")
+    await asyncio.sleep(0)
+    assert tab not in ws_state._ws_clients, "kept after its buffer went 5.5 s without shrinking"
+    assert tab._req.transport.aborted
+    assert tab.send_str.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_tab_past_the_hard_ceiling_is_dropped_at_once(ws_state, monkeypatch):
+    hub, _clock = _hub_on_a_manual_clock(ws_state, monkeypatch)
+    ceiling = 4 * websocket_hub.WS_MAX_BUFFERED_BYTES
+    at_ceiling = _patch_capable_tab(ceiling)
+    past = _patch_capable_tab(ceiling + 1)
+    ws_state.register_ws(at_ceiling, owner=True)
+    ws_state.register_ws(past, owner=True)
+    hub._spawn_ws_send(at_ceiling, "{}")
+    hub._spawn_ws_send(past, "{}")
+    await asyncio.sleep(0)
+    # Control: over the limit but not past the ceiling, its window has only started.
+    assert at_ceiling in ws_state._ws_clients, "a tab at the ceiling was dropped at once"
+    assert past not in ws_state._ws_clients, "a tab past the ceiling was kept for its window"
+    assert past._req.transport.aborted
+    past.send_str.assert_not_called()
+    assert websocket_hub.WS_HARD_MAX_BUFFERED_BYTES == ceiling
 
 
 @pytest.mark.asyncio
@@ -180,7 +252,9 @@ async def test_send_ws_slot_patch_does_not_count_a_dropped_tab(ws_state):
     reading = _patch_capable_tab(0)
     ws_state.register_ws(stalled, owner=True)
     ws_state.register_ws(reading, owner=True)
-    sent = _websocket_for(ws_state).send_ws_slot_patch('{"type": "slot_patch", "data": {}}')
+    hub = _websocket_for(ws_state)
+    assert hub._drop_if_stalled(stalled) is False  # first seen over the limit
+    sent = hub.send_ws_slot_patch('{"type": "slot_patch", "data": {}}')
     await asyncio.sleep(0)
     assert sent == 1, f"send_ws_slot_patch counted {sent} tabs; only the reading tab got the frame"
     assert stalled not in ws_state._ws_clients
@@ -213,7 +287,7 @@ async def test_a_stalled_log_subscriber_is_dropped_by_the_log_stream(ws_state):
             f"{FRAME // 1024} KiB, with {transport.get_write_buffer_size()} bytes buffered for it"
         )
         assert stalled not in state._ws_log_subscribers
-        assert peak <= websocket_hub.WS_MAX_BUFFERED_BYTES + 2 * FRAME, peak
+        assert peak <= websocket_hub.WS_MAX_BUFFERED_BYTES + 3 * FRAME, peak
         assert transport.is_closing()
         assert transport.get_write_buffer_size() == 0
         assert reading in state._ws_clients
@@ -273,7 +347,7 @@ async def test_a_stalled_tab_is_dropped_and_its_buffer_released(ws_state):
             f"for it (after 40 frames: {under_limit} bytes)"
         )
         assert stalled not in state._owner_ws_clients
-        assert peak <= websocket_hub.WS_MAX_BUFFERED_BYTES + 2 * FRAME, peak
+        assert peak <= websocket_hub.WS_MAX_BUFFERED_BYTES + 3 * FRAME, peak
         # abort() discards the buffer and ends every send waiting on its drain.
         assert transport.is_closing()
         assert transport.get_write_buffer_size() == 0
