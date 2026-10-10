@@ -31,7 +31,7 @@ import pytest
 
 from kiro_crew.deploy import engine
 from kiro_crew.instances import diagnostics, token_mint
-from kiro_crew.instances.ssh_tunnel_manager import _SshTunnel
+from kiro_crew.instances.ssh_tunnel_manager import _GROUP_KEEPER, _SshTunnel
 
 _TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln"
 _NOT_INSTALLED = (
@@ -96,8 +96,11 @@ def gui_gateway(monkeypatch, tmp_path):
     heads: list[str] = []
 
     async def exec_standin(*argv, **kw):
-        heads.append(argv[0])
-        return await real_exec(sys.executable, str(standin), *argv[1:], **kw)
+        # A POSIX plain ssh runs under the group keeper: record and re-point the ssh
+        # it starts, and keep the keeper itself, so the run goes through it.
+        keep = argv.index(_GROUP_KEEPER) + 3 if _GROUP_KEEPER in argv else 0
+        heads.append(argv[keep])
+        return await real_exec(*argv[:keep], sys.executable, str(standin), *argv[keep + 1 :], **kw)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_standin)
     return sysbin, install, heads

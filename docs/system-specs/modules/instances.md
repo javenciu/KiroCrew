@@ -488,9 +488,14 @@ recovery rather than reconnect intent: `connect()` records the spawned
 forwarder child's pid and its opaque `platform_compat.process_start_time`
 identity next to `local_port` (one write), and a successful self-heal rebuild
 moves both to the replacement child. A gateway hard-kill (SIGKILL/crash) never
-runs teardown, so the forwarder survives, reparented to init, still holding its
-port and its session to the remote. The next `connect()` reclaims exactly that
-child, best-effort (a failed reclaim never fails the connect). The registry is
+runs teardown. On POSIX a plain ssh forwarder is the group keeper
+(`_GROUP_KEEPER`), which leads a process group of its own, runs ssh and its
+ProxyCommand in it, and ends that group when its control pipe from the gateway
+reaches end of file; the kernel closes the gateway's end when the gateway dies,
+so that tunnel ends with it. An SSM or Windows forwarder, or a keeper that was
+itself SIGKILLed, survives, reparented to init, still holding its port and its
+session to the remote. The next `connect()` reclaims exactly that child,
+best-effort (a failed reclaim never fails the connect). The registry is
 agent-writable state, so a recorded claim is honored only when it
 authenticates: the record must carry `forwarder_sig`, the gateway's own HMAC
 over (instance id, pid, start time, port, and, when `forwarder_argv_sig` is
@@ -532,8 +537,12 @@ process has one command-line string rather than an argv vector, the live
 character for character). The signal is SIGTERM
 escalating to SIGKILL on a bounded grace, with the start-time identity
 **re-verified before the SIGKILL** (the grace window is exactly where a pid can
-exit and be recycled); pid-scoped for ssh, whose child shares the dead
-gateway's process group; group-scoped for SSM, whose child owns its group, with
+exit and be recycled); pid-scoped for ssh, where the recorded child is the
+keeper on POSIX, which ends its own group on that SIGTERM, and ssh itself on
+Windows (a keeper whose ssh still runs at the reclaim's SIGKILL, 2 s after the
+SIGTERM and so inside the keeper's own 5 s grace, is killed alone, and that ssh
+and its ProxyCommand run on); group-scoped for SSM, whose child owns its group,
+with
 completion judged by the whole group being gone and the port actually
 releasing. Every pid signal goes through `kill_pid_pinned`, which on Windows
 re-checks the recorded start time under an open process handle at the kill,

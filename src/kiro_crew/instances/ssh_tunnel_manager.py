@@ -50,7 +50,9 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -791,6 +793,81 @@ class _RecoverySuperseded(Exception):
     """
 
 
+#: Seconds the group keeper waits, after it sends SIGTERM to the group, for ssh to exit
+#: before it sends SIGKILL to the group: the time ssh gets to close its forward.
+_KEEPER_TERM_GRACE_SECS = 5.0
+
+#: The group keeper, run as ``python -I -S -c _GROUP_KEEPER <fd> <grace> <ssh argv...>``
+#: on POSIX for a plain ssh tunnel. It leads the tunnel's process group (the spawn gives
+#: it a session of its own) and runs ssh in that group, so ssh and the ProxyCommand ssh
+#: starts are both in it. It starts ssh only after the gateway writes ``g`` on the
+#: control pipe *fd*, so a spawn the gateway gave up on starts nothing.
+#:
+#: The keeper is the one place the group is ended, and it ends it once: SIGTERM to the
+#: group, then SIGKILL to the group if ssh still runs after *grace* seconds. It does this
+#: when ssh exits on its own, when the control pipe reaches end of file (the gateway
+#: closed it, or the gateway is gone) and on a SIGTERM of its own. It signals its own
+#: group while it is alive, so the group's number is its own pid and cannot name another
+#: group. It starts both of its threads before ssh, so a keeper that cannot start a
+#: thread exits before ssh exists. It exits with ssh's status, so the exit classifier
+#: reads ssh's.
+_GROUP_KEEPER = r"""
+import os, signal, subprocess, sys, threading
+ctrl, grace, argv = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3:]
+stop, reaped, lock, ended, child = threading.Event(), threading.Event(), threading.Lock(), [], []
+def end():
+    with lock:
+        if ended:
+            return
+        ended.append(True)
+        os.killpg(0, signal.SIGTERM)
+    if child and not reaped.wait(grace):
+        os.killpg(0, signal.SIGKILL)
+signal.signal(signal.SIGTERM, lambda *_: stop.set())
+if os.read(ctrl, 1) != b"g" or stop.is_set():
+    os._exit(0)
+def watch_ctrl():
+    try:
+        while os.read(ctrl, 1):
+            pass
+    except OSError:
+        pass
+    stop.set()
+def stopper():
+    stop.wait()
+    end()
+threading.Thread(target=watch_ctrl, daemon=True).start()
+threading.Thread(target=stopper, daemon=True).start()
+with lock:
+    if ended:
+        os._exit(0)
+    try:
+        child.append(subprocess.Popen(argv))
+    except OSError as e:
+        sys.stderr.write(f"failed to start {argv[0]}: {e}\n")
+        sys.stderr.flush()
+        os._exit(127)
+rc = child[0].wait()
+reaped.set()
+end()
+if rc < 0:
+    try:
+        signal.signal(-rc, signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass
+    os.kill(os.getpid(), -rc)
+os._exit(rc if rc >= 0 else 128 - rc)
+"""
+
+
+def _close_fds(*fds: int) -> None:
+    """Close each of *fds* that is open (``-1`` means none)."""
+    for fd in fds:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
 class _SshTunnel:
     """Supervises one instance's tunnel child process (SSH or SSM transport).
 
@@ -839,6 +916,10 @@ class _SshTunnel:
         self._aws_region = aws_region
 
         self._proc: asyncio.subprocess.Process | None = None
+        # Whether ``_proc`` is the group keeper (see _GROUP_KEEPER), and the write end of
+        # its control pipe while it is open: closing it is how the group is ended.
+        self._keeper = False
+        self._keeper_ctrl: int | None = None
         self._monitor_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._probe_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._stop_event = asyncio.Event()
@@ -912,8 +993,26 @@ class _SshTunnel:
         # Kept for the exit classifier: a ProxyCommand whose program is missing
         # is reported with the PATH this child actually searched.
         self._child_path = spawn_env.get("PATH", "")
+        ssm = self._transport == "ssm"
+        # On POSIX a plain ssh runs under the group keeper: ssh starts the user's
+        # ProxyCommand as a child, and the keeper is what ends the two together (see
+        # _GROUP_KEEPER). A keeper left by an earlier start is ended first.
+        keeper = platform_compat.IS_POSIX and not ssm and bool(sys.executable)
+        self._end_group()
+        ctrl_r = ctrl_w = -1
+        if keeper:
+            ctrl_r, ctrl_w = os.pipe()
+            argv = [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                _GROUP_KEEPER,
+                str(ctrl_r),
+                str(_KEEPER_TERM_GRACE_SECS),
+                *argv,
+            ]
         try:
-            ssm = self._transport == "ssm"
             self._proc = await asyncio.create_subprocess_exec(
                 *argv,
                 # SSM only: `aws ssm start-session` prints every session-close
@@ -927,14 +1026,17 @@ class _SshTunnel:
                 stderr=asyncio.subprocess.PIPE,
                 # SSM tunnels get process-group isolation (mirroring
                 # cloud.ssm.open_port_forward) so a later teardown can reap the aws
-                # wrapper's session-manager-plugin child too — see _terminate().
+                # wrapper's session-manager-plugin child too — see _terminate(). The
+                # group keeper of a POSIX plain ssh gets one for the same reason: ssh
+                # and its ProxyCommand run in the keeper's group, which it ends.
                 # Both kwargs are passed EXPLICITLY per the platform_compat spawn
                 # recipe: on POSIX start_new_session=True calls setsid (killpg reaps
                 # the group) and creationflags is 0; on Windows there is no setsid
                 # (start_new_session is silently ignored) and
                 # CREATE_NEW_PROCESS_GROUP is what makes the tree taskkill /T-reapable.
-                start_new_session=(ssm and platform_compat.IS_POSIX),
+                start_new_session=(platform_compat.IS_POSIX and (ssm or keeper)),
                 creationflags=(platform_compat.CREATE_NEW_PROCESS_GROUP if ssm else 0),
+                pass_fds=((ctrl_r,) if keeper else ()),
                 # Both transports: the argv head is resolved absolutely, but the
                 # child then looks a tool up BY NAME on its own PATH — aws finds
                 # session-manager-plugin that way, and ssh runs the user's
@@ -949,11 +1051,33 @@ class _SshTunnel:
                 env=spawn_env,
             )
         except OSError as e:
+            _close_fds(ctrl_r, ctrl_w)
             self.status.state = TunnelState.ERROR
             self.status.error = f"failed to spawn {self._transport} tunnel: {e}"
             logger.error("Tunnel spawn failed for %s: %s", self._id, e)
             return False
+        except BaseException:
+            # Cancelled mid-spawn: a keeper that was started reads end of file before
+            # its go byte and exits without starting ssh.
+            _close_fds(ctrl_r, ctrl_w)
+            raise
+        self._keeper = keeper
+        if keeper:
+            _close_fds(ctrl_r)
+            self._keeper_ctrl = ctrl_w
+            with contextlib.suppress(OSError):  # a keeper that died at once: seen below
+                os.write(ctrl_w, b"g")
+        try:
+            return await self._start_spawned()
+        except BaseException:
+            # A start that did not finish (cancelled, or an error while it waited)
+            # ends the tunnel it spawned.
+            self._end_group()
+            raise
 
+    async def _start_spawned(self) -> bool:
+        """:meth:`start`'s readiness wait and handover, once the child is spawned."""
+        assert self._proc is not None
         # Started BEFORE the readiness wait, so a child that closes during
         # startup still has its reason captured: _wait_until_ready can conclude
         # via _failed_on_child_exit, which classifies on this buffer.
@@ -1155,6 +1279,9 @@ class _SshTunnel:
             await proc.wait()
         except asyncio.CancelledError:
             raise
+        # A keeper exits only after it ended its group (see _GROUP_KEEPER): only its
+        # control pipe is left to release.
+        self._end_group()
         if self._stopping:
             return
         await self._finish_stdout_drain()
@@ -1455,7 +1582,20 @@ class _SshTunnel:
         kill.
         """
         proc = self._proc
-        if proc and proc.returncode is None:
+        if proc is not None and self._keeper:
+            # The keeper ends the group, ssh and its ProxyCommand together: SIGTERM,
+            # then SIGKILL after the grace if ssh still runs. If ssh already exited on
+            # its own, the keeper ended the group then. Nothing here signals the
+            # group's number, so how the tunnel reached this point does not matter.
+            self._end_group()
+            if proc.returncode is None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=_KEEPER_TERM_GRACE_SECS + 5)
+                except asyncio.TimeoutError:
+                    if proc.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.kill()  # the keeper alone, if it is stuck
+        elif proc and proc.returncode is None:
             group_signalled = False
             if self._transport == "ssm":
                 group_signalled = self._signal_group(proc.pid, platform_compat.SIGTERM)
@@ -1473,6 +1613,20 @@ class _SshTunnel:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()
         self._proc = None
+        self._keeper = False
+
+    def _end_group(self) -> None:
+        """End a plain ssh tunnel's process group: the one place it is asked for.
+
+        Closing the keeper's control pipe makes the keeper end its group, once (see
+        _GROUP_KEEPER). A keeper whose ssh exited on its own has ended it already, and
+        a second call finds the pipe closed, so every exit of :meth:`start`,
+        :meth:`_monitor` and :meth:`stop` may call it. No-op for a child that has no
+        keeper (SSM, and plain ssh on Windows).
+        """
+        fd, self._keeper_ctrl = self._keeper_ctrl, None
+        if fd is not None:
+            _close_fds(fd)
 
     @staticmethod
     def _signal_group(pid: int, sig: int) -> bool:
@@ -1495,7 +1649,7 @@ class _SshTunnel:
 
     @property
     def pid(self) -> int | None:
-        """PID of the live ssh child, or None if not running."""
+        """PID of the live tunnel child (plain ssh's group keeper on POSIX), or None."""
         proc = self._proc
         return proc.pid if proc is not None and proc.returncode is None else None
 
@@ -1536,11 +1690,13 @@ def _verify_and_reclaim_forwarder(
     reaped by SIGKILL time, the group cannot be re-addressed through the
     existing pid-keyed helpers; the TERM broadcast has already reached every
     member, and a member that ignores it keeps the port — reported truthfully
-    as not reclaimed (the port stays excluded from allocation). The ssh child
-    is spawned WITHOUT a new group: after a gateway hard-kill it sits in the
-    DEAD gateway's process group, where a group signal could hit unrelated
-    survivors — so it gets a pid-scoped signal only, which suffices because
-    ``ssh -N`` holds the forward itself and spawns no descendants of its own.
+    as not reclaimed (the port stays excluded from allocation). A plain ssh
+    forwarder gets a pid-scoped signal only. On POSIX that pid is its group
+    keeper, which ends its own group on SIGTERM, and which a gateway hard-kill
+    has usually ended already by closing its control pipe (see _GROUP_KEEPER).
+    On Windows ssh is spawned WITHOUT a new group: after a gateway hard-kill it
+    sits in the DEAD gateway's process group, where a group signal could hit
+    unrelated survivors.
 
     Returns one of: ``"reclaimed"`` (identity confirmed, process/group gone,
     port released), ``"identity_mismatch"`` (nothing was ever signalled),

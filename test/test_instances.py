@@ -7428,21 +7428,42 @@ class TestSsmTunnelProcessGroup:
         assert seen["creationflags"] == 0x200
 
     @pytest.mark.asyncio
-    async def test_ssh_spawn_gets_no_process_group(self, monkeypatch):
-        """Regression guard: the SSH transport's spawn is unchanged."""
+    async def test_ssh_spawn_runs_under_the_group_keeper_on_posix(self, monkeypatch):
+        """On POSIX the SSH transport runs ssh under the group keeper, in a session of
+        the keeper's own, with its control pipe passed; its Windows flags stay 0."""
         import kiro_crew.instances.ssh_tunnel_manager as mod
 
         seen = {}
 
         async def fake_exec(*argv, **kw):
-            seen.update(kw)
+            seen.update(kw, argv=argv)
             raise OSError("stop")
 
         monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
         monkeypatch.setattr(mod.platform_compat, "IS_POSIX", True)
         await self._tunnel("ssh").start()
-        assert seen["start_new_session"] is False
+        assert seen["start_new_session"] is True
         assert seen["creationflags"] == 0
+        assert seen["argv"][4] == mod._GROUP_KEEPER
+        assert seen["argv"][5] == str(seen["pass_fds"][0])
+
+    @pytest.mark.asyncio
+    async def test_ssh_spawn_on_windows_has_no_keeper(self, monkeypatch):
+        """Regression guard: off POSIX the SSH transport's spawn is unchanged."""
+        import kiro_crew.instances.ssh_tunnel_manager as mod
+
+        seen = {}
+
+        async def fake_exec(*argv, **kw):
+            seen.update(kw, argv=argv)
+            raise OSError("stop")
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(mod.platform_compat, "IS_POSIX", False)
+        await self._tunnel("ssh").start()
+        assert seen["start_new_session"] is False
+        assert seen["pass_fds"] == ()
+        assert mod._GROUP_KEEPER not in seen["argv"]
 
     @pytest.mark.asyncio
     async def test_ssm_and_ssh_children_get_the_same_plugin_search_path(
