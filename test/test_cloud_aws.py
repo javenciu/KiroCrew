@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import signal
@@ -366,6 +367,12 @@ def _reap_recorded_pid(pid_file):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group reproducer")
 class TestRunAwsTimeoutReapsHelpers:
+    @pytest.fixture(autouse=True)
+    def _children_run_in_tmp_path(self, tmp_path, _floor_monkeypatch):
+        """Every real child these tests start runs in ``tmp_path``, never in the checkout."""
+        real = aws.popen_limited
+        _floor_monkeypatch.setattr(aws, "popen_limited", functools.partial(real, cwd=tmp_path))
+
     def _run_in_thread(self, monkeypatch, args, *, timeout):
         monkeypatch.setattr(aws, "assert_chokepoint_allowed", lambda a: None)
         monkeypatch.setattr(aws, "_build_argv", lambda a, p, r: list(a))
@@ -440,6 +447,15 @@ class TestRunAwsTimeoutReapsHelpers:
         thread.join(_JOIN_BOUND_SECS)
         assert not thread.is_alive()
         assert captured["value"] == (0, "ok", "e")
+
+    def test_the_cli_runs_in_tmp_path_not_in_the_checkout(self, tmp_path, monkeypatch):
+        args = [sys.executable, "-c", "import os, sys; sys.stdout.write(os.getcwd())"]
+        thread, captured = self._run_in_thread(monkeypatch, args, timeout=30)
+        assert not thread.is_alive()
+        rc, out, _err = captured["value"]
+        assert rc == 0
+        ran_in = os.path.realpath(out)
+        assert ran_in == os.path.realpath(tmp_path), f"the CLI ran in {out}, not in {tmp_path}"
 
     def test_a_reaped_leaders_group_number_is_never_signalled(self, tmp_path, monkeypatch):
         # Another holder of the Popen (the deploy wizard's interrupt cleanup, through
