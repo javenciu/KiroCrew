@@ -43,6 +43,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
+    TurnUsage,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config import live
@@ -4846,6 +4847,89 @@ class TestRunChatRecoveryLadders:
         state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
         assert any("did not finish its answer" in err for err in _errors(slot)), _errors(slot)
         assert slot._queue == []
+
+    @pytest.mark.asyncio
+    async def test_a_transport_timeout_keeps_the_reply_it_streamed(self, tmp_path):
+        """Text the backend streamed before the deadline is in the slot only as
+        chunk rows, and a save writes no chunk row. The timeout must persist it
+        as the interrupted reply, or the saved history (what a resumed chat
+        loads) and the crew log lose what the user watched stream."""
+        from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+        from kiro_crew.dashboard.chat_utils import slot_history_key
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        partial = "Here is the first half of the answer"
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text=partial), _complete("timeout")])
+
+        with patch.object(chat_runner.crew_log_emit, "on_message_sent") as sent:
+            await _drive(state, slot)
+        slot._dirty = True
+        assert _save_slot_to_history(state, slot), "precondition: the save ran"
+
+        rows = state.conversation_log.read_messages(slot_history_key(slot))
+        saved = [(m.get("role"), m.get("content")) for m in rows]
+        assert saved, "precondition: the save wrote the turn"
+        replies = [i for i, (role, _) in enumerate(saved) if role == "assistant"]
+        streamed = [saved[i][1] for i in replies]
+        assert streamed == [partial], f"the saved history lost the streamed reply: {saved}"
+        notice = [i for i, (_, text) in enumerate(saved) if "did not finish" in str(text)]
+        assert notice and replies[0] < notice[0], f"the reply must precede the notice: {saved}"
+        assert [c.kwargs.get("text") for c in sent.call_args_list] == [partial]
+        assert sent.call_args.kwargs.get("interrupted") is True
+
+    @pytest.mark.asyncio
+    async def test_a_transport_timeout_bills_the_turn_once(self, tmp_path):
+        """The timeout's EVENT_COMPLETE carries the turn's stats, and the
+        complete branch writes the turn's one usage row from them. Persisting
+        the partial reply must not write a second."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                LLMEvent(kind=EVENT_TEXT_CHUNK, text="partway"),
+                _complete("timeout", usage=TurnUsage(credits=1.5)),
+            ],
+        )
+
+        with patch.object(chat_runner, "persist_token_record_async", AsyncMock()) as rows:
+            await _drive(state, slot)
+
+        assert rows.await_count == 1, f"{rows.await_count} usage rows were written for one turn"
+        assert rows.await_args.args[2].stop_reason == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_a_transport_timeout_keeps_the_cost_footer(self, tmp_path):
+        """A timed-out reply carries the footer a finished reply carries: the
+        elapsed time and credits from the timeout event's stats, and the time to
+        first visible output. The stream redactor holds a single word back until
+        the turn ends, so this reply first becomes visible at the turn's end; the
+        clock reads 250 ms whenever it is stopped."""
+        from kiro_crew.dashboard.chat_turn.turn_stats import _FirstVisibleClock
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                LLMEvent(kind=EVENT_TEXT_CHUNK, text="partway"),
+                _complete("timeout", usage=TurnUsage(credits=1.5, duration_ms=900)),
+            ],
+        )
+
+        def _clock_at_250_ms(*_args, **_kwargs):
+            return _FirstVisibleClock(0.0, clock=lambda: 0.25)
+
+        with patch.object(chat_runner, "_turn_clock", _clock_at_250_ms):
+            await _drive(state, slot)
+
+        replies = [m for m in slot.messages if m.get("role") == "assistant"]
+        assert [m.get("content") for m in replies] == ["partway"], slot.messages
+        footer = (replies[0].get("meta") or {}).get("turn_stats") or {}
+        shown = {key: footer.get(key) for key in ("elapsed_ms", "credits", "ttft_ms")}
+        expected = {"elapsed_ms": 900, "credits": 1.5, "ttft_ms": 250}
+        assert shown == expected, f"the timed-out reply lost its footer: {footer}"
 
     @pytest.mark.asyncio
     async def test_a_users_stop_does_not_reset_the_session(self, tmp_path):

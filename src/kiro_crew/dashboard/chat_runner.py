@@ -15960,6 +15960,35 @@ async def _run_chat(
         # to continue from, and the user decides what to send next.
         if _stop_reason == "timeout":
             needs_session_reset = True  # checked in finally block (reset + resume)
+            # The text the backend streamed before the deadline is in the slot
+            # only as chunk rows, and a save writes no chunk row. Persist it as
+            # the interrupted reply first, through the helper every other
+            # abnormal end uses, so the saved history and the crew log keep what
+            # the user watched stream. Its usage row needs nothing more: when the
+            # turn billed, the complete branch above wrote it from the same stats
+            # this event carries, and the helper finds it recorded.
+            await _persist_partial_reply("timeout")
+            # The reply keeps the footer the end-of-turn path gives a reply, with
+            # the same figures: this event's elapsed time, credits and cost, the
+            # served model, and the time to first visible output. The persisted
+            # reply is broadcast, so the clock stops there at the latest, as the
+            # turn-end flush stops it. Attaching edits the row's meta only and
+            # writes no usage row.
+            if assistant_text or _ttft_quiet_text:
+                _ttft_visible.mark("quiet")
+            if (
+                _attach_turn_stats(
+                    slot,
+                    _turn_elapsed_ms,
+                    _turn_credits,
+                    _turn_cost_usd,
+                    turn_boundary=_turn_msg_boundary,
+                    model=_turn_model,
+                    ttft_ms=_ttft_visible.ms,
+                )
+                and _prompt_depth == 0
+            ):
+                slot._carried_ttft_clock = None
             slot.append(
                 "error",
                 "⏱️ The agent did not finish its answer before this turn's time limit, "
