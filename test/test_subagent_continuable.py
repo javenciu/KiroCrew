@@ -3866,3 +3866,130 @@ class TestSuccessorClaim:
         assert second is not None and second.done
         assert second.error.startswith("conversation_busy")
         assert starts == ["x"]
+
+
+class TestContinuationClaimWithoutRegistryRecord:
+    """A conversation whose opening run is not in the registry (evicted after it
+    finished, or from before a restart) is claimed by its id, so two concurrent
+    continuations cannot both pass the conversation-busy lookup before either run
+    is registered."""
+
+    @staticmethod
+    async def _conversation(conv_id: str) -> None:
+        await asyncio.to_thread(create_agent_folder, conv_id, task="original")
+        await asyncio.to_thread(write_run_agent, conv_id, "")
+
+    @staticmethod
+    def _held_manager() -> tuple[SubagentManager, asyncio.Event]:
+        sessions = _mock_sessions(resumed=True)
+        release = asyncio.Event()
+        provider, _, _ = sessions.get_or_create.return_value
+
+        async def _held_get_or_create(*_a, **_k):
+            await asyncio.wait_for(release.wait(), timeout=10)
+            return provider, True, True
+
+        sessions.get_or_create.side_effect = _held_get_or_create
+        return _manager(sessions), release
+
+    @staticmethod
+    async def _drain(manager: SubagentManager, infos) -> None:
+        for info in infos:
+            task = manager._tasks.get(info.id) if info is not None else None
+            if task is not None:
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_continuations_start_one_run(self) -> None:
+        await self._conversation("evicted1")
+        manager, release = self._held_manager()
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    manager.continue_conversation_async("evicted1", "first follow-up"),
+                    manager.continue_conversation_async("evicted1", "second follow-up"),
+                ),
+                timeout=10,
+            )
+            started = [r for r in results if r is not None and not r.error]
+            refused = [r for r in results if r is not None and r.error]
+            assert len(started) == 1, f"started {len(started)} runs on one conversation"
+            assert len(refused) == 1 and refused[0].error.startswith("conversation_busy: ")
+            assert "is starting" in refused[0].error
+        finally:
+            release.set()
+            await self._drain(manager, results)
+
+    @pytest.mark.asyncio
+    async def test_one_continuation_starts_and_releases_the_claim(self) -> None:
+        await self._conversation("evicted2")
+        manager = _manager(_mock_sessions(resumed=True))
+        info = await manager.continue_conversation_async("evicted2", "follow up")
+        assert info is not None and not info.error, info and info.error
+        await self._drain(manager, [info])
+
+    @pytest.mark.asyncio
+    async def test_a_continuation_after_the_first_finishes_starts(self) -> None:
+        await self._conversation("evicted3")
+        manager = _manager(_mock_sessions(resumed=True))
+        first = await manager.continue_conversation_async("evicted3", "first")
+        assert first is not None and not first.error
+        await self._drain(manager, [first])
+        second = await manager.continue_conversation_async("evicted3", "second")
+        assert second is not None and not second.error, second and second.error
+        await self._drain(manager, [second])
+
+    @pytest.mark.parametrize("failure", [RuntimeError("store down"), asyncio.CancelledError()])
+    @pytest.mark.asyncio
+    async def test_a_start_that_raises_releases_the_claim(self, failure) -> None:
+        await self._conversation("evicted4")
+        manager = _manager(_mock_sessions(resumed=True))
+
+        async def raises(*_a, **_k):
+            raise failure
+
+        with (
+            patch.object(ContinuationCoordinator, "continue_conversation_async_impl", new=raises),
+            pytest.raises(type(failure)),
+        ):
+            await manager.continue_conversation_async("evicted4", "x")
+        # Not refused as "is starting": the failed start released its claim.
+        retry = await manager.continue_conversation_async("evicted4", "retry")
+        assert retry is not None and not retry.error, retry and retry.error
+        await self._drain(manager, [retry])
+
+    @pytest.mark.asyncio
+    async def test_the_claim_leaves_the_busy_lookup_unchanged(self) -> None:
+        # Release and the retention sweep read ``_conversation_busy``; the claim
+        # does not change what they see while a start is in flight.
+        manager = _manager()
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_continue(*_a, **_k):
+            entered.set()
+            await asyncio.wait_for(gate.wait(), timeout=10)
+            return SubagentInfo(id="cont0002", task="t")
+
+        with patch.object(
+            ContinuationCoordinator, "continue_conversation_async_impl", new=slow_continue
+        ):
+            task = asyncio.ensure_future(manager.continue_conversation_async("evicted5", "x"))
+            # The start is in flight, past its claim: the lookup below is read during it.
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert manager._conversation_busy("subagent:evicted5") is None
+            gate.set()
+            await asyncio.wait_for(task, timeout=10)
+
+    @pytest.mark.asyncio
+    async def test_a_registered_run_keeps_its_flag_claim(self) -> None:
+        # Control: a conversation whose opening run is registered is claimed by the
+        # run's own flag, as before; the id claim is not used for it.
+        manager = _manager()
+        original = SubagentInfo(id="registered1", task="t", done=True)
+        manager._agents["registered1"] = original
+        assert manager._claim_continuation("registered1", "x", "")[1] is None
+        second = manager._claim_continuation("registered1", "y", "")[1]
+        assert second is not None and "is starting" in str(second.error)
+        manager._settle_continuation(original, None)
+        assert manager._claim_continuation("registered1", "z", "")[1] is None
