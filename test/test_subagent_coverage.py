@@ -25,6 +25,11 @@ from conftest import absent_sysconf
 from kiro_crew import subagent as sa
 from kiro_crew.subagent import SubagentDelivery, SubagentInfo, SubagentManager
 
+# Ceiling for a wait on an announce task the test ends itself: far above what the
+# in-memory work needs, so a regression that keeps it running fails at the wait by
+# name instead of hanging the worker.
+_ANNOUNCE_WAIT_SECS = 60.0
+
 # ── Fixtures / builders ───────────────────────────────────────────────────
 
 
@@ -2247,7 +2252,7 @@ class TestAnnounceRejection:
         info = _info(done=True, error="rejected", batch_id="w1")
         mgr._announce_rejection(info)
         assert list(mgr._tasks) == [f"reject-{info.id}"]  # registered while in flight
-        await asyncio.gather(*mgr._tasks.values())
+        await asyncio.wait_for(asyncio.gather(*mgr._tasks.values()), _ANNOUNCE_WAIT_SECS)
         await asyncio.sleep(0)  # done callbacks run on the next loop pass
         assert mgr._tasks == {}
 

@@ -36,6 +36,12 @@ from kiro_crew.subagent import (
 )
 from kiro_crew.subagent_scale import SubagentEventCoalescer
 
+# Ceiling for a wait on an announce task that only the test ends (a release, a
+# cancel or ``cancel_all``). It is far above what the in-memory work needs, so a
+# regression that keeps an announce running fails at that wait by name instead
+# of hanging the worker.
+_ANNOUNCE_WAIT_SECS = 60.0
+
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
@@ -717,7 +723,7 @@ class TestBatchIdentity:
         release = asyncio.Event()
 
         async def _on_done(info):
-            await release.wait()
+            await asyncio.wait_for(release.wait(), _ANNOUNCE_WAIT_SECS)
             if exit_kind == "raises":
                 raise RuntimeError("delivery failed")
 
@@ -731,7 +737,7 @@ class TestBatchIdentity:
             task.cancel()
         else:
             release.set()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), _ANNOUNCE_WAIT_SECS)
         await asyncio.sleep(0)  # done callbacks run on the next loop pass
         assert mgr._tasks == {}
 
@@ -744,11 +750,11 @@ class TestBatchIdentity:
         mgr._waves._hold_announce_task("lost-x", first)
         newer = asyncio.ensure_future(asyncio.Event().wait())
         mgr._tasks["lost-x"] = newer
-        await first
+        await asyncio.wait_for(first, _ANNOUNCE_WAIT_SECS)
         await asyncio.sleep(0)  # done callbacks run on the next loop pass
         assert mgr._tasks == {"lost-x": newer}
         newer.cancel()
-        await asyncio.gather(newer, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(newer, return_exceptions=True), _ANNOUNCE_WAIT_SECS)
 
     @pytest.mark.asyncio
     async def test_reaper_stuck_wave_sweep_reconciles(self):
@@ -2237,7 +2243,7 @@ class TestDigestHoldDeadline:
                 mgr.force_digest_flush(f"wv{i}", "dashboard:main", 3, 200.0)
         tasks = list(mgr._tasks.values())
         assert len(tasks) == 3  # registered while pending, so shutdown can cancel them
-        await asyncio.gather(*tasks)
+        await asyncio.wait_for(asyncio.gather(*tasks), _ANNOUNCE_WAIT_SECS)
         await asyncio.sleep(0)  # done callbacks run on the next loop pass
         assert mgr._on_done.await_count == 3
         assert mgr._tasks == {}
@@ -2251,7 +2257,7 @@ class TestDigestHoldDeadline:
         release = asyncio.Event()
 
         async def _blocked(info):
-            await release.wait()
+            await asyncio.wait_for(release.wait(), _ANNOUNCE_WAIT_SECS)
 
         mgr._on_done = _blocked
         with patch("kiro_crew.subagent.sel"):
@@ -2259,7 +2265,7 @@ class TestDigestHoldDeadline:
         (task,) = mgr._tasks.values()
         await asyncio.sleep(0)
         assert not task.done()  # the announce is in flight
-        await mgr.cancel_all()
+        await asyncio.wait_for(mgr.cancel_all(), _ANNOUNCE_WAIT_SECS)
         assert task.cancelled()
         assert mgr._tasks == {}
 
