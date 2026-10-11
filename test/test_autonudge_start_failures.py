@@ -462,6 +462,9 @@ def _recording(svc: AutoNudgeService) -> list[str]:
         ("max_cycles", 24.0, 24),
         ("max_runtime_secs", "3600", 3600),
         ("max_runtime_secs", "3600.0", 3600),
+        # Read exactly: a float reading drops the last digit (9007199254740992).
+        ("max_cycles", "9007199254740993.0", 9007199254740993),
+        ("max_runtime_secs", "3.6e3", 3600),
     ],
 )
 @pytest.mark.asyncio
@@ -514,6 +517,11 @@ async def test_a_cycle_cap_stored_as_a_string_fires_and_stops_at_its_cap(store_d
         ("max_runtime_secs", "abc"),
         ("max_runtime_secs", None),
         ("max_runtime_secs", float("nan")),
+        # No exact whole reading, though a float reads them as 0 and 24.
+        ("max_cycles", "1e-400"),
+        ("max_runtime_secs", "24.0000000000000001"),
+        # Past the largest float, refused as a float reading refused it.
+        ("max_cycles", "1e400"),
     ],
 )
 @pytest.mark.asyncio
