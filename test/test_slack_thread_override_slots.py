@@ -27,6 +27,13 @@ def _slots():
     return thread_override_slots
 
 
+def _pin(handler, key: str, kind: str) -> bool:
+    """Pin *key* the way ``!ta`` and ``!project`` do, against the handler's containers."""
+    return _slots().pin(
+        key, kind, handler._hydrated_sessions, handler._thread_agents, handler._thread_projects
+    )
+
+
 @pytest.fixture(autouse=True)
 def _home(tmp_path, _floor_monkeypatch):
     """Pin the data home and workspace to ``tmp_path`` through the isolation
@@ -132,9 +139,9 @@ async def test_an_override_set_by_a_command_in_this_process_is_never_evicted(han
     await handler._hydrate_thread_overrides(chosen, _Log({}))
     # What !ta and !project do after resolving their argument.
     handler._thread_agents[chosen] = "reviewer"
-    slots.pin(chosen, "agent")
+    _pin(handler, chosen, "agent")
     handler._thread_projects[chosen] = str(tmp_path)
-    slots.pin(chosen, "project")
+    _pin(handler, chosen, "project")
     log = _Log({"agent": "other"})
     for i in range(1, 2 * THREAD_SLOTS):
         await handler._hydrate_thread_overrides(_key(i), log)
@@ -163,7 +170,7 @@ async def test_pinned_threads_count_inside_the_bound(handler, tmp_path):
         await handler._hydrate_thread_overrides(key, _Log({}))
         # What !ta does after resolving its argument.
         handler._thread_agents[key] = "reviewer"
-        slots.pin(key, "agent")
+        _pin(handler, key, "agent")
     log = _Log({"agent": "other"})
     for i in range(100, 100 + THREAD_SLOTS):
         await handler._hydrate_thread_overrides(_key(i), log)
@@ -184,7 +191,7 @@ async def test_a_command_past_the_bound_is_refused_out_loud_and_sets_nothing(han
     max_pinned = getattr(slots, "MAX_PINNED_THREADS", THREAD_SLOTS - 1)
     assert max_pinned == THREAD_SLOTS - 1
     for i in range(max_pinned):
-        assert slots.pin(_key(i), "agent"), f"pin {i} was refused below the bound"
+        assert _pin(handler, _key(i), "agent"), f"pin {i} was refused below the bound"
     monkeypatch.setattr(handler, "_resolve_agent_name", lambda name, project: "reviewer")
     slack = AsyncMock()
     late = _key(max_pinned)
@@ -209,7 +216,7 @@ async def test_hydration_with_every_pin_taken_keeps_no_untracked_row(handler, tm
     for i in range(THREAD_SLOTS):
         key = _key(i)
         await handler._hydrate_thread_overrides(key, _Log({}))
-        if not slots.pin(key, "agent"):
+        if not _pin(handler, key, "agent"):
             break
         handler._thread_agents[key] = "pinned"
         pinned += 1
@@ -242,6 +249,64 @@ def _path_of_length(base: str, n: int) -> str:
         path += "/" + "p" * min(199, room - 1) if room > 1 else "p"
     assert len(path) == n
     return path
+
+
+@pytest.mark.asyncio
+async def test_pinning_a_thread_evicted_during_its_command_keeps_the_bound(
+    handler, monkeypatch, tmp_path
+):
+    """``!ta`` awaits agent discovery while two other threads hydrate and evict its own.
+
+    Every slot but two is pinned by an earlier command, so the evicted thread's pin
+    must evict an unpinned thread from every shared container before ``!ta`` publishes
+    its override, and restore the thread's hydration guard so its next message does
+    not hydrate over that override.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    slots = _slots()
+    assert slots is not None, "the bound does not exist"
+    for i in range(THREAD_SLOTS - 2):
+        key = _key(i)
+        handler._hydrated_sessions.add(key)
+        handler._thread_agents[key] = "pinned"
+        slots._pinned.add((key, "agent"))
+    log = _Log({"agent": "reviewer", "project": str(tmp_path)})
+    chosen, other = _key(THREAD_SLOTS - 2), _key(THREAD_SLOTS - 1)
+    for key in (chosen, other):
+        await handler._hydrate_thread_overrides(key, log)
+    loop = asyncio.get_running_loop()
+
+    def resolve_while_two_threads_hydrate(name, project):
+        # Runs in the worker thread ``!ta`` awaits: both threads hydrate on the loop
+        # before agent discovery answers.
+        for i in (THREAD_SLOTS, THREAD_SLOTS + 1):
+            asyncio.run_coroutine_threadsafe(
+                handler._hydrate_thread_overrides(_key(i), log), loop
+            ).result(timeout=10)
+        return "chosen-agent"
+
+    monkeypatch.setattr(handler, "_resolve_agent_name", resolve_while_two_threads_hydrate)
+    await handler._bang_thread_agent(
+        "!ta chosen-agent", AsyncMock(), AsyncMock(), "C0SYNTH01", "t1", "m1", chosen, "U1", None
+    )
+    assert chosen not in slots._order and (chosen, "agent") in slots._pinned
+    assert handler._thread_agents.get(chosen) == "chosen-agent"
+    containers = {
+        "_hydrated_sessions": set(handler._hydrated_sessions),
+        "_thread_agents": set(handler._thread_agents),
+        "_thread_projects": set(handler._thread_projects),
+    }
+    over = {name: len(keys) for name, keys in containers.items() if len(keys) > THREAD_SLOTS}
+    kept = set().union(*containers.values())
+    assert not over and len(kept) <= THREAD_SLOTS, (
+        f"{len(kept)} threads keep state with {THREAD_SLOTS} slots after pinning a thread "
+        f"evicted during its command; over the bound: {over}"
+    )
+    assert (
+        chosen in handler._hydrated_sessions
+    ), "the pinned thread has no hydration guard, so its next message hydrates over the override"
 
 
 @pytest.mark.asyncio

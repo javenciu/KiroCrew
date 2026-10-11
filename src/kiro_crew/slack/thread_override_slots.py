@@ -114,6 +114,21 @@ def touch(session_key: str) -> None:
         _order.move_to_end(session_key)
 
 
+def _evict_over_bound(
+    hydrated: MutableSet[str], overrides: tuple[MutableMapping[str, str], ...]
+) -> None:
+    """Evict the oldest unpinned threads until the pins and the rest fit :data:`THREAD_SLOTS`.
+
+    An evicted thread leaves the guard and every map in *overrides* at once.
+    """
+    evictable = max(THREAD_SLOTS - _pinned_threads(), 0)
+    while len(_order) > evictable:
+        oldest, _ = _order.popitem(last=False)
+        hydrated.discard(oldest)
+        for mapping in overrides:
+            mapping.pop(oldest, None)
+
+
 def note_hydrated(
     session_key: str,
     hydrated: MutableSet[str],
@@ -129,24 +144,32 @@ def note_hydrated(
     if not _is_pinned(session_key):
         _order[session_key] = None
         _order.move_to_end(session_key)
-    evictable = max(THREAD_SLOTS - _pinned_threads(), 0)
-    while len(_order) > evictable:
-        oldest, _ = _order.popitem(last=False)
-        hydrated.discard(oldest)
-        for mapping in overrides:
-            mapping.pop(oldest, None)
+    _evict_over_bound(hydrated, overrides)
 
 
-def pin(session_key: str, kind: str) -> bool:
+def pin(
+    session_key: str,
+    kind: str,
+    hydrated: MutableSet[str],
+    *overrides: MutableMapping[str, str],
+) -> bool:
     """Keep a thread whose *kind* override a command set from being evicted.
 
     Refused (False) for a thread not pinned yet when :data:`MAX_PINNED_THREADS` threads
     already are: the command then sets nothing and says why (:func:`refusal_text`).
+
+    The command awaits before it pins, and other threads hydrating meanwhile can evict
+    this one. So the pin puts the thread back in the guard *hydrated*, which keeps its
+    next message from hydrating over the override, and evicts the oldest unpinned
+    threads from the guard and *overrides* until the pins and the rest fit
+    :data:`THREAD_SLOTS` again, before the caller publishes the override.
     """
     if not _is_pinned(session_key) and _pinned_threads() >= MAX_PINNED_THREADS:
         return False
     _pinned.add((session_key, kind))
     _order.pop(session_key, None)
+    hydrated.add(session_key)
+    _evict_over_bound(hydrated, overrides)
     return True
 
 

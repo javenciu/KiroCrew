@@ -31,6 +31,7 @@ if TYPE_CHECKING:
         _dashboard_state,
         _discover_project_agents,
         _get_default_agent,
+        _hydrated_sessions,
         _is_slack_restricted,
         _list_all_agent_names,
         _mark_titled,
@@ -721,7 +722,9 @@ async def _bang_thread_agent(
         return ""
     # Pinned: hydration might not read this choice back (see thread_override_slots).
     # Pinned first: a refused thread gets no override row at all.
-    if not thread_override_slots.pin(session_key, "agent"):
+    if not thread_override_slots.pin(
+        session_key, "agent", _hydrated_sessions, _thread_agents, _thread_projects
+    ):
         logger.warning("!ta refused for %s: every thread slot is pinned", session_key)
         await slack.post_message(channel, thread_override_slots.refusal_text(), reply_ts)
         return ""
@@ -839,7 +842,9 @@ async def _bang_project(
         return ""
     # Pinned: hydration might not read this choice back (see thread_override_slots).
     # Pinned first: a refused thread gets no override row at all.
-    if not thread_override_slots.pin(session_key, "project"):
+    if not thread_override_slots.pin(
+        session_key, "project", _hydrated_sessions, _thread_agents, _thread_projects
+    ):
         logger.warning("!project refused for %s: every thread slot is pinned", session_key)
         await slack.post_message(channel, thread_override_slots.refusal_text(), reply_ts)
         return ""
