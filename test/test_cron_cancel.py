@@ -884,7 +884,7 @@ class TestCancelledOneShotIsParked:
     async def test_cancel_against_a_busy_store_still_keeps_the_next_tick_off(
         self, tmp_path
     ) -> None:
-        """The park lands on the live job before the store write, so a busy store does not reopen it."""
+        """The hold lands on the live job before the store write, so a busy store does not reopen it."""
         runs: list[str] = []
         started = asyncio.Event()
         release = asyncio.Event()
@@ -922,6 +922,69 @@ class TestCancelledOneShotIsParked:
             release.set()
             await svc.stop()
         assert runs == [job.id], f"cancelled one-shot ran {len(runs)} times"
+
+    @pytest.mark.asyncio
+    async def test_a_park_the_store_did_not_save_is_not_reported_and_is_retried(
+        self, tmp_path
+    ) -> None:
+        """A cancel whose save fails holds the one-shot off the schedule, but does not
+        report it paused: ``user_paused`` stays off in memory and on disk, the run's
+        history entry says the pause was not saved, and the next tick that reaches the
+        store saves the park."""
+        runs: list[str] = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def on_job(job: CronJob) -> None:
+            runs.append(job.id)
+            started.set()
+            await asyncio.wait_for(release.wait(), timeout=5.0)
+
+        svc = CronService(base_dir=tmp_path, on_job=on_job)
+        await _start_without_timer(svc)
+        job = await svc.add_job_async("remind-once", "msg", at_ts=time.time() - 1)
+        real_lock = svc._file_lock
+        busy = False
+
+        @contextlib.contextmanager
+        def _lock(*args: Any, **kwargs: Any):
+            if busy:
+                raise CronStoreBusy("cron store busy")
+            with real_lock(*args, **kwargs):
+                yield
+
+        def _on_disk() -> tuple[bool, bool]:
+            fresh = CronService(base_dir=tmp_path, on_job=on_job)
+            fresh._load()
+            stored = fresh.get_job(job.id)
+            assert stored is not None
+            return stored.enabled, stored.user_paused
+
+        svc._file_lock = _lock  # type: ignore[method-assign]
+        try:
+            with patch("kiro_crew.cron.admission_check", return_value=_ADMITTED):
+                await svc._on_timer()
+                await asyncio.wait_for(started.wait(), timeout=5.0)
+                busy = True
+                assert await svc.cancel(job.id) is True
+                live = svc.get_job(job.id)
+                assert live is not None
+                assert live.user_paused is False, "a pause the store did not save is reported"
+                assert _on_disk() == (True, False), "the failed save parked the job on disk"
+                history, _total = await svc._history.get_job_history(job.id)
+                assert "pause was not saved" in history[0]["error"], history[0]["error"]
+                await svc._on_timer()  # the store is still busy: the hold keeps the job off
+                _assert_not_redispatched(svc, job.id)
+                busy = False
+                await svc._on_timer()  # this tick reaches the store and saves the park
+                _assert_not_redispatched(svc, job.id)
+                parked = svc.get_job(job.id)
+                assert parked is not None and parked.user_paused is True
+        finally:
+            release.set()
+            await svc.stop()
+        assert runs == [job.id], f"cancelled one-shot ran {len(runs)} times"
+        assert _on_disk() == (False, True)
 
     @pytest.mark.asyncio
     async def test_cancelled_recurring_job_keeps_its_schedule(self, tmp_path) -> None:
