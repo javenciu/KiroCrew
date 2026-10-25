@@ -448,6 +448,15 @@ async def _handle_resource_subscription(
                 subscribers.discard(stub_uuid)
                 if not subscribers:
                     del self._resource_subscriptions[uri]
+                    # The caller's subscription is still live upstream
+                    # while the release waits on the in-flight subscribe,
+                    # so an update for the URI routes nowhere. Orphan-mark
+                    # it, as detach does, so that update is not charged to
+                    # the server as a hazard; a grant or a confirmed
+                    # release clears the mark.
+                    while len(self._orphaned_leases) >= _ORPHANED_LEASES_MAX:
+                        self._orphaned_leases.pop()
+                    self._orphaned_leases.add(uri)
             await self._reply_locally(stub_uuid, original_id, result={})
             return True
         # Sole holder (or unknown grant): forward, and mutate routing on

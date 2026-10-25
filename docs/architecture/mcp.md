@@ -5040,6 +5040,9 @@ same-caller subscribe in flight inherits the release
 because the caller's one upstream subscription now serves that stub, whose own
 departure releases it. A refusal, an unknown verdict or a grant that routes no
 stub has the gateway send it as that caller, unless the rule still holds.
+When the unsubscribing stub was the last one routed for the URI, the URI is
+orphan-marked while the release waits, as detach does, so an update the
+server sends for the still-live subscription is dropped without a hazard.
 
 ### Checklist for a new tool
 

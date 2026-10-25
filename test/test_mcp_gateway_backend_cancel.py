@@ -531,3 +531,58 @@ class TestIdentityReleaseHold:
         assert backend._resource_subscriptions == {uri: {"sb"}}
         assert backend._grant_callers == {(uri, "sb"): caller_b}
         assert inboxb.empty()
+
+    @pytest.mark.asyncio
+    async def test_an_update_while_the_held_release_waits_is_not_a_hazard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """s1 holds a URI as caller A, s2's subscribe as A is in flight, and s1
+        unsubscribes, so routing for the URI empties while A's subscription is
+        still live upstream. An update the server sends before s2's verdict
+        routes nowhere, and is dropped without charging the server a hazard.
+        A refusal of s2's subscribe sends the held release, whose success
+        clears the orphan mark; an update after that is a hazard again."""
+        recorded: list[str] = []
+
+        def _capture(name: str, code: str, identity: Any) -> bool:
+            recorded.append(code)
+            return True
+
+        monkeypatch.setattr(backend_mod.hazards, "record_observed", _capture)
+        backend = _make_backend()
+        backend.supports_caller_identity = True
+        inbox1 = await backend.attach_stub("s1")
+        inbox2 = await backend.attach_stub("s2")
+        caller_a = CallerContext(session_key="dashboard:aaa")
+        uri = "file:///watched.txt"
+        await backend.forward_from_stub(
+            "s1",
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/subscribe", "params": {"uri": uri}},
+            caller=caller_a,
+        )
+        await _settle_lease(backend)
+        await _drain(inbox1)
+        await backend.forward_from_stub(
+            "s2",
+            {"jsonrpc": "2.0", "id": 9, "method": "resources/subscribe", "params": {"uri": uri}},
+            caller=caller_a,
+        )
+        await backend.forward_from_stub(
+            "s1",
+            {"jsonrpc": "2.0", "id": 2, "method": "resources/unsubscribe", "params": {"uri": uri}},
+            caller=caller_a,
+        )
+        assert await _drain(inbox1) == {"jsonrpc": "2.0", "id": 2, "result": {}}
+        assert uri not in backend._resource_subscriptions
+        assert uri in backend._orphaned_leases
+        update = {"method": "notifications/resources/updated", "params": {"uri": uri}}
+        await backend._route_backend_line(_line(update))
+        assert inbox1.empty() and inbox2.empty()
+        assert recorded == []
+        await _answer(backend, _fid_of(backend, "s2"), refuse=True)
+        assert (await _drain(inbox2))["id"] == 9
+        assert len(_releases(backend)) == 1
+        await _answer(backend, _releases(backend)[0]["id"])
+        assert uri not in backend._orphaned_leases
+        await backend._route_backend_line(_line(update))
+        assert recorded == [backend_mod.hazards.HAZARD_UNATTRIBUTABLE_NOTIFICATION]
